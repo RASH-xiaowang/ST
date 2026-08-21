@@ -1,0 +1,142 @@
+[package]
+name = "st-control"
+version = "1.0.0"
+description = "ST Control - Remote control server for ST Agent"
+authors = ["ST Team"]
+edition = "2021"
+
+[lib]
+name = "st_control_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+regex = "1"
+sysinfo = "0.33"
+# tokio 锁 1.48.0：1.53.x 在 Tauri async runtime 下 channel await
+# （watch.changed / broadcast.recv）会出现病态空转，实测空闲 CPU 3.2 核；
+# 1.48.0 下稳定为 0.00x 核。升级 tokio 前请先复测空闲 CPU。
+tokio = { version = "=1.48.0", features = ["full"] }
+# rustls-tls-native-roots：QQ 官方机器人网关（wss://api.bot.qq.com）
+# 需要系统证书库验证；此前只用于 accept_async 服务端（无 TLS）
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+env_logger = "0.11"
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+dirs = "5"
+bcrypt = "0.15"
+libloading = "0.8"
+
+# ── 加解密 (SQLCipher 4) ──
+aes = "0.8"
+cbc = "0.1"
+ecb = "0.1"
+cipher = { version = "0.4", features = ["block-padding"] }
+pbkdf2 = { version = "0.12", features = ["simple"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+md-5 = "0.10"
+sha1 = "0.10"
+serde_repr = "0.1"
+urlencoding = "2"
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
+qrcode = "0.14"
+winreg = "0.52"
+
+# ── 文件监控 ──
+notify = { version = "6", features = ["macos_fsevent"] }
+
+# ── 知识库：docx 解析（zip） ──
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+# ── 知识库：多格式文档解析（doc/ppt/xls/odt/rtf/epub/pdf → GFM Markdown，MIT） ──
+anydoc = "0.1"
+
+# ── 图文识别：开源 OCR 预检（RapidOCR PP-OCRv6，Apache-2.0；模型首启自动下载缓存） ──
+rapidocr-core = { version = "0.2", optional = true }
+
+# ── zstd 解压 (微信消息压缩) ──
+zstd = "0.13"
+
+# ── XML 解析 (富媒体消息) ──
+quick-xml = "0.36"
+
+# ── 中文编码 (GBK 解码) ──
+encoding_rs = "0.8"
+
+# ── JPEG 编码（wxgf/HEVC 转码输出，纯 Rust） ──
+jpeg-encoder = "0.6"
+
+# ── HTTP API 服务（对外数据接口） ──
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "multipart", "rustls-tls"] }
+base64 = "0.22"
+rand = "0.8"
+silk-decoder-rs = "0.1.0"
+
+# ── 本地离线语音转写（whisper.cpp，MIT 开源，多语言自动识别） ──
+whisper-rs = { version = "0.16", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# Windows Media Foundation：wxgf/HEVC 硬件/系统解码（纯 Rust 绑定，无 C 构建依赖）
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Performance",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Kernel",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_Media_MediaFoundation",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
+] }
+
+# onnx-ocr：内置开源 OCR 预检引擎（默认开启）。
+# 关闭该特性可大幅缩小依赖面，并在某些 Windows 环境下规避 ort/DirectML
+# 导致的测试二进制启动失败（0xc0000139）。
+[features]
+default = ["onnx-ocr", "local-stt"]
+# custom-protocol：发布版 exe 使用内置前端资源（frontendDist），不再依赖
+# devUrl（localhost:1420）。不带此 feature 的 cargo build 仍按 dev 模式编译，
+# 独立运行 release exe 时会因 WebView2 无法连接 Vite 而白屏/布局错乱。
+custom-protocol = ["tauri/custom-protocol"]
+onnx-ocr = ["dep:rapidocr-core"]
+# local-stt：内置离线语音转写引擎（默认开启；编译 whisper.cpp 需 cmake，
+# 本项目通过 .cargo/config.toml 的 CMAKE 环境变量指向 VS 自带 cmake）
+local-stt = ["dep:whisper-rs"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

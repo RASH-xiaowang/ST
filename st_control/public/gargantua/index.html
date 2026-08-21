@@ -1,0 +1,102 @@
+<!DOCTYPE html><html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"/>
+<title>GARGANTUA — Schwarzschild Black Hole Raytracer</title>
+<meta name="description" content="Real-time relativistic raytracing of a Schwarzschild black hole: null-geodesic integration, gravitational lensing, relativistic accretion disk."/>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=&#39;http://www.w3.org/2000/svg&#39; viewBox=&#39;0 0 32 32&#39;%3E%3Ccircle cx=&#39;16&#39; cy=&#39;16&#39; r=&#39;13&#39; fill=&#39;none&#39; stroke=&#39;%23ffb454&#39; stroke-width=&#39;2.5&#39;/%3E%3Ccircle cx=&#39;16&#39; cy=&#39;16&#39; r=&#39;8&#39; fill=&#39;%23000&#39; stroke=&#39;%237fdcff&#39; stroke-width=&#39;1&#39;/%3E%3C/svg%3E"/>
+<link rel="stylesheet" href="css/style.css"/>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./vendor/three.module.js",
+    "three/addons/": "./vendor/jsm/"
+  }
+}
+</script></head>
+<body>
+<canvas id="view"></canvas>
+
+<div id="fx"></div>
+
+<div id="hud">
+  <div class="corner tl"></div>
+  <div class="corner tr"></div>
+  <div class="corner bl"></div>
+  <div class="corner br"></div>
+
+  <div id="title-block">
+    <h1>GARGANTUA</h1>
+    <div class="sub">SUPERMASSIVE BLACK HOLE · 1.0 × 10⁸ M☉</div>
+    <div class="sub2">SCHWARZSCHILD METRIC // NULL-GEODESIC RAYTRACING</div>
+  </div>
+
+  <div id="clock-block">
+    <div class="label">MISSION ELAPSED</div>
+    <div id="clock-val">00:00:00</div>
+  </div>
+
+  <div id="telemetry">
+    <div class="row"><span class="k">OBSERVER DISTANCE</span><span class="v" id="t-dist">—</span></div>
+    <div class="row"><span class="k">DISK INCLINATION</span><span class="v" id="t-inc">—</span></div>
+    <div class="row"><span class="k">GEODESIC STEPS</span><span class="v" id="t-steps">—</span></div>
+    <div class="row"><span class="k">RENDER PROFILE</span><span class="v" id="t-prof">—</span></div>
+    <div class="row"><span class="k">FRAME RATE</span><span class="v" id="t-fps">—</span></div>
+  </div>
+
+  <div id="deck" class="ctl">
+    <div class="deck-title"><span id="deck-mode">CINEMATIC SEQUENCE</span><span class="deck-dot"></span></div>
+    <button id="btn-cine" class="btn wide active" aria-label="Toggle cinematic sequence" aria-pressed="true">▶ CINEMATIC SEQUENCE</button>
+    <div class="grid2">
+      <button id="btn-poster" class="btn" aria-label="Fly to poster view">POSTER 38°</button>
+      <button id="btn-edge" class="btn" aria-label="Fly to edge-on view">EDGE-ON</button>
+      <button id="btn-polar" class="btn" aria-label="Fly to polar view">POLAR</button>
+      <button id="btn-close" class="btn" aria-label="Fly to close pass view">CLOSE PASS</button>
+    </div>
+    <div class="grid4">
+      <button id="btn-orbit" class="btn" aria-label="Toggle auto orbit" aria-pressed="false">AUTO-ORBIT</button>
+      <button id="btn-quality" class="btn" aria-label="Cycle render quality">CINE</button>
+      <button id="btn-params" class="btn" aria-label="Toggle parameters panel" aria-pressed="false">PARAMS</button>
+      <button id="btn-hud" class="btn active" aria-label="Toggle HUD" aria-pressed="true">HUD</button>
+    </div>
+    <button id="btn-sound" class="btn wide" aria-label="Toggle sound" aria-pressed="false">🔇 SOUND: OFF</button>
+    <div id="deck-hint">1-4 VIEWS · C CINE · R ORBIT · P PARAMS · M SOUND · H HUD</div>
+  </div>
+
+  <div id="hint">DRAG ORBIT · SCROLL/PINCH ZOOM · C CINEMATIC · M SOUND · 1-4 VIEWS · P PARAMS · H HUD</div>
+</div>
+
+<div id="params" class="hidden ctl">
+  <div class="p-head">
+    <span class="p-title">PARAMETERS</span>
+    <button id="btn-reset" class="btn" aria-label="Reset all parameters">RESET</button>
+  </div>
+  <div id="p-rows"></div>
+</div>
+
+<div id="intro">
+  <div class="intro-card">
+    <div class="intro-tag">REAL-TIME RELATIVISTIC RAYTRACING</div>
+    <div class="intro-title">GARGANTUA</div>
+    <div class="intro-quote">“Do not go gentle into that good night.”</div>
+  </div>
+</div>
+
+<div id="toast" role="status"></div>
+
+<div id="fatal">
+  <div class="fatal-card">
+    <div class="fatal-title" id="fatal-title">SIGNAL LOST</div>
+    <div class="fatal-msg" id="fatal-msg"></div>
+    <div class="fatal-btns">
+      <button id="fatal-lower" class="btn">▼ LOWER QUALITY</button>
+      <button id="fatal-retry" class="btn">↻ RETRY</button>
+    </div>
+  </div>
+</div>
+
+<noscript><div style="position:fixed;inset:0;background:#000;color:#7fdcff;display:flex;align-items:center;justify-content:center;font-family:monospace;letter-spacing:.2em;">JAVASCRIPT REQUIRED</div></noscript>
+
+<script type="module" src="js/main.js"></script>
+
+
+</body></html>

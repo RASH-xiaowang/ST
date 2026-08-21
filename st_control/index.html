@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/icon.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+    <meta name="color-scheme" content="light" />
+    <title>ST 控制台</title>
+    <script>
+      // 首帧前应用用户个性化主题（与 App.svelte 的 BG_THEMES / FG_THEMES 保持一致，
+      // 若在 App.svelte 增删主题请同步本表），避免启动页/首屏与主题色不一致。
+      (function () {
+        try {
+          var BG = {
+            bench: "#ecebe7", "bench-dark": "#16181d", herb: "#f2f7f4", oled: "#020617", mojin: "#0a0f1e", deep: "#061228", darkp: "#120f24", darkc: "#061a1c",
+            graph: "#141518", warmb: "#1a130c", burg: "#1a0e14", fore: "#071410", mid: "#030710"
+          };
+          var FG = {
+            ink: "#26282e", warmw: "#e8dcc8", moon: "#dce0e8", su: "#e0e0dc", apri: "#ecd8d4", thin: "#d4e0dc",
+            lotus: "#e0d8e4", frost: "#d8dce0", rock: "#ccc8c0"
+          };
+          // 与 PreferencesPanel 的 BG_THEMES 保持一致：主题 → 卡片面
+          var CARD = {
+            bench: "#f7f6f2", "bench-dark": "#1f2229", herb: "#ffffff", oled: "#0d1525", mojin: "#141c2e", deep: "#0f1f3a",
+            darkp: "#1f1a35", darkc: "#0f2628", graph: "#1f2124", warmb: "#2a1f14", burg: "#2a1820", fore: "#0f2018", mid: "#0c1422"
+          };
+          var raw = localStorage.getItem("st_control_prefs");
+          var p = raw ? JSON.parse(raw) : {};
+          // 旧默认主题迁移到新默认（仪表台/墨青）：墨金/暖白（v1 旧默认）与标本纸/墨青（上一版默认）
+          // 均视为旧默认组合；其他主题（深色等）保持用户选择。与 PreferencesPanel 保持一致。
+          if ((p.bgTheme === "mojin" && p.fgTheme === "warmw") || (p.bgTheme === "herb" && p.fgTheme === "ink")) {
+            p.bgTheme = "bench";
+            p.fgTheme = "ink";
+          }
+          var bg = BG[p.bgTheme] || "#ecebe7";
+          var fg = FG[p.fgTheme] || "#26282e";
+          var card = CARD[p.bgTheme] || "#f7f6f2";
+          // 明暗配对：深底配深字 / 浅底配浅字时自动换到对侧默认（与 PreferencesPanel 保持一致）
+          function lum(hex) {
+            var c = hex.replace("#", "");
+            return (0.2126 * parseInt(c.substring(0, 2), 16) + 0.7152 * parseInt(c.substring(2, 4), 16) + 0.0722 * parseInt(c.substring(4, 6), 16)) / 255;
+          }
+          var bgDark = lum(bg) < 0.45;
+          var fgDark = lum(fg) < 0.5;
+          if (bgDark === fgDark) fg = bgDark ? FG.moon : FG.ink;
+          var bgA = Math.max(0, Math.min(100, p.bgOpacity ?? 100)) / 100;
+          var fgA = Math.max(0, Math.min(100, p.fgOpacity ?? 100)) / 100;
+          function rgba(hex, a) {
+            var c = hex.replace("#", "");
+            return "rgba(" + parseInt(c.substring(0, 2), 16) + "," +
+              parseInt(c.substring(2, 4), 16) + "," +
+              parseInt(c.substring(4, 6), 16) + "," + a + ")";
+          }
+          var root = document.documentElement;
+          root.style.setProperty("--app-bg-color", rgba(bg, bgA));
+          root.style.setProperty("--app-font-color", rgba(fg, fgA));
+          root.style.setProperty("--app-color-card-bg", card);
+        } catch (e) { /* 读取失败时回退默认主题 */ }
+      })();
+    </script>
+    <!-- 启动即渲染机台灰底，避免 WebView 首帧白屏（与 app.css / 个性化默认主题一致） -->
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: var(--app-bg-color, #ecebe7);
+      }
+      #app {
+        min-height: 100vh;
+        background: var(--app-bg-color, #ecebe7);
+      }
+      /* 启动页：纯 HTML/CSS，JS 加载前即显示，杜绝白屏/空白等待 */
+      #app-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        background: var(--app-bg-color, #ecebe7);
+        color: var(--app-font-color, #26282e);
+        font-family: "Microsoft YaHei", "PingFang SC", "Segoe UI", sans-serif;
+        transition: opacity 0.4s ease, visibility 0.4s ease;
+      }
+      #app-splash.splash-hidden {
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+      }
+      .splash-logo {
+        width: 74px;
+        height: 74px;
+        border-radius: 18px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 30px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+        color: #062a31;
+        background: linear-gradient(135deg, #22d3ee, #0ea5e9);
+        box-shadow: 0 12px 34px rgba(13, 147, 165, 0.22), inset 0 1px 0 rgba(255, 255, 255, 0.35);
+      }
+      .splash-title {
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: 2px;
+        color: var(--app-font-color, #26282e);
+      }
+      .splash-sub {
+        font-size: 12px;
+        color: color-mix(in srgb, var(--app-font-color, #26282e) 55%, transparent);
+        letter-spacing: 3px;
+      }
+      .splash-dots {
+        display: flex;
+        gap: 6px;
+        margin-top: 6px;
+      }
+      .splash-dots span {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background: #22d3ee;
+        animation: splash-bounce 1.2s infinite ease-in-out;
+      }
+      .splash-dots span:nth-child(2) { animation-delay: 0.15s; }
+      .splash-dots span:nth-child(3) { animation-delay: 0.3s; }
+      @keyframes splash-bounce {
+        0%, 60%, 100% { transform: translateY(0); opacity: 0.45; }
+        30% { transform: translateY(-5px); opacity: 1; }
+      }
+      .splash-tip {
+        font-size: 12px;
+        color: color-mix(in srgb, var(--app-font-color, #26282e) 45%, transparent);
+      }
+    </style>
+  </head>
+  <body>
+    <!-- 启动页：应用挂载后由 main.ts 淡出移除 -->
+    <div id="app-splash" role="status" aria-label="ST 控制台 正在启动">
+      <div class="splash-logo">ST</div>
+      <div class="splash-title">ST 控制台</div>
+      <div class="splash-sub">v1.0 · 专业版</div>
+      <div class="splash-dots"><span></span><span></span><span></span></div>
+      <div class="splash-tip">正在初始化…</div>
+    </div>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

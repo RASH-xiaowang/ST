@@ -1,0 +1,8 @@
+e:\ST\st_control\src\lib\wechat\components\WeChatPanel.svelte:3591:33
+Error: 'profileData' is possibly 'null'. (ts)
+
+e:\ST\st_control\src\lib\wechat\components\WeChatPanel.svelte:3600:61
+Error: 'profileData' is possibly 'null'. (ts)
+
+====================================
+svelte-check found 2 errors and 0 warnings in 1 file

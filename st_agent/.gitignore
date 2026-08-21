@@ -1,0 +1,9 @@
+# 依赖
+node_modules/
+
+# 构建产物
+src-tauri/target/
+
+# 运行时数据与日志
+data/
+*.log

@@ -1,0 +1,170 @@
+@import "tailwindcss";
+@import "fancy-ui-svelte/tailwind.css";
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 6px);
+  --radius-3xl: calc(var(--radius) + 8px);
+  --font-sans: var(--app-font-family, ui-sans-serif, system-ui, "Microsoft YaHei", sans-serif);
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+:root {
+  --radius: 0.75rem;
+  /* 品牌主色：青蓝（仪表台世界，明暗两态共用；浅底用深青蓝、深底用亮青蓝保证对比） */
+  --brand: oklch(0.66 0.12 205);
+  --brand-strong: oklch(0.52 0.12 205);
+  /* 语义状态色（仪表台世界，明暗两态共用；经 color-mix 派生低透明底） */
+  --app-success: #16a34a;
+  --app-warning: #d97706;
+  --app-danger: #dc2626;
+  /* 模块品牌强调色：微信数据管理（微信品牌蓝，命名语义令牌） */
+  --app-wc-accent: #576b95;
+  /* shadcn 令牌映射到应用个性化变量（applyPrefs 动态写入，未设置时用仪表台浅色兜底） */
+  --background: var(--app-bg-color, #ecebe7);
+  --foreground: var(--app-font-color, #26282e);
+  --card: var(--app-color-card-bg, #f7f6f2);
+  --card-foreground: var(--foreground);
+  /* 浮层跟随卡片：浅色=骨白，深色=深面板，避免“白底亮字” */
+  --popover: var(--card);
+  --popover-foreground: var(--foreground);
+  --primary: var(--brand-strong);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: color-mix(in oklab, var(--card) 88%, var(--brand) 5%);
+  --secondary-foreground: var(--foreground);
+  /* 中性表面一律在“主题自身 bg ↔ card ↔ fg”之间插值，保持同色系，不混入固定灰 */
+  --muted: color-mix(in oklab, var(--card) 88%, var(--background));
+  /* 次要文字由文字色本身派生（同色系于正文，不随背景色调漂移） */
+  --muted-foreground: color-mix(in oklab, var(--foreground) 60%, transparent);
+  --accent: color-mix(in oklab, var(--brand) 13%, var(--card));
+  --accent-foreground: var(--foreground);
+  --destructive: oklch(0.56 0.2 25);
+  --border: color-mix(in oklab, var(--foreground) 13%, transparent);
+  --input: color-mix(in oklab, var(--foreground) 27%, transparent);
+  --ring: var(--brand);
+  /* 侧栏：背景与卡片之间的同色系中间调（浅色下比台面略深、比卡深；深色下比台面略亮、比卡深） */
+  --sidebar: color-mix(in oklab, var(--card) 45%, var(--background));
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--brand);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: color-mix(in oklab, var(--brand) 11%, var(--sidebar));
+  --sidebar-accent-foreground: var(--foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+}
+
+.dark {
+  /* 深色兜底：夜航仪表台（无个性化变量时跟随系统深色） */
+  --background: var(--app-bg-color, #16181d);
+  --foreground: var(--app-font-color, #dce0e8);
+  --card: var(--app-color-card-bg, #1f2229);
+  --card-foreground: var(--foreground);
+  --popover: var(--card);
+  --popover-foreground: var(--foreground);
+  --primary: var(--brand-strong);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: color-mix(in oklab, var(--card) 90%, var(--brand) 4%);
+  --secondary-foreground: var(--foreground);
+  --muted: color-mix(in oklab, var(--card) 88%, var(--background));
+  --muted-foreground: color-mix(in oklab, var(--foreground) 64%, transparent);
+  --accent: color-mix(in oklab, var(--brand) 13%, var(--card));
+  --accent-foreground: var(--foreground);
+  --destructive: oklch(0.62 0.2 25);
+  --border: color-mix(in oklab, var(--foreground) 18%, transparent);
+  --input: color-mix(in oklab, var(--foreground) 32%, transparent);
+  --ring: var(--brand);
+  --sidebar: color-mix(in oklab, var(--card) 45%, var(--background));
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--brand);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: color-mix(in oklab, var(--brand) 13%, var(--sidebar));
+  --sidebar-accent-foreground: var(--foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply bg-background text-foreground;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-sans);
+    font-size: var(--app-font-size, 14px);
+    -webkit-font-smoothing: antialiased;
+  }
+  /* lucide/phosphor 图标参与行内排版：Tailwind v4 preflight 默认 svg{display:block}，
+     会让“图标+文字”按钮标签换行并被固定高度裁切；inline + preflight 的
+     vertical-align:middle 在文本行内保持垂直对齐，flex/grid 容器内不受影响。 */
+  svg {
+    display: inline;
+  }
+}
+
+/* 滚动条：细刻线风格，与仪表台刻线语言一致 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::selection {
+  background: color-mix(in oklab, var(--brand) 26%, transparent);
+}
+
+/* 原生下拉框（ui/native-select）弹出面板跟随主题令牌 */
+select[data-slot="native-select"] option {
+  background-color: var(--popover);
+  color: var(--foreground);
+}
+select[data-slot="native-select"] optgroup {
+  background-color: var(--card);
+  color: var(--foreground);
+}
+select[data-slot="native-select"] optgroup option {
+  background-color: var(--popover);
+}

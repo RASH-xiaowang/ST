@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+    cargo test 专用的 Windows 清单。
+    原因：tauri-plugin-dialog(rfd) 会静态导入 comctl32!TaskDialogIndirect，
+    该函数只存在于 Common Controls v6（WinSxS）；主程序由 tauri-build 嵌入
+    v6 清单，但测试二进制没有，导致加载器绑定到 System32 的 v5.82 后报
+    STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139)。
+    本文件由 build.rs 通过 rustc-link-arg-tests 只对测试目标嵌入。
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>
