@@ -389,7 +389,7 @@
 
   // ─── 高亮分段（前端本地计算） ───
   function fmtTime(t: string): string {
-    return formatIsoTime(t, { showYear: false });
+    return formatIsoTime(t, { showYear: false, utc: true });
   }
   // 侧边栏「历史对话」点击：进入问答模式并打开对应会话
   $effect(() => {

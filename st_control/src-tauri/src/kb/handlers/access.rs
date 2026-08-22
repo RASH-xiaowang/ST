@@ -638,6 +638,141 @@ pub async fn kb_list(
     Ok(rows.filter_map(|r| r.ok()).collect())
 }
 
+/// 删除知识库（原子事务 + 全表清理），供 tauri 命令与集成测试复用。
+/// 逐表显式清理（不依赖外键级联），保证删除后不残留任何关联数据。
+pub(crate) fn delete_kb_clean(db: &KbDatabase, kb_id: i64) -> Result<(), String> {
+    let mut conn = db.conn_lock();
+    // 整体包在事务里：任何一步失败都整体回滚，绝不留下“删了一半”的知识库残留。
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+
+    // 1) 先收集该知识库的文档 id 与版本引用的 file_object_id（供删除后清理孤儿 BLOB）
+    let doc_ids: Vec<i64> = {
+        let mut stmt = tx
+            .prepare("SELECT id FROM documents WHERE kb_id = ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![kb_id], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let fo_ids: Vec<i64> = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT DISTINCT dv.file_object_id FROM document_versions dv
+                 JOIN documents d ON d.id = dv.doc_id WHERE d.kb_id = ?1",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![kb_id], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // 2) 显式清理全部关联表（依赖顺序：先子后父；FTS 表无外键必须手动清理）
+    //    即使外键级联已开启，显式删除也更稳、更快、不依赖 FK 配置。
+    for doc_id in &doc_ids {
+        tx.execute(
+            "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
+            rusqlite::params![doc_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.execute(
+        "DELETE FROM wiki_pages_fts WHERE rowid IN (SELECT id FROM wiki_pages WHERE kb_id = ?1)",
+        rusqlite::params![kb_id],
+    )
+    .map_err(|e| e.to_string())?;
+    // 子表（无 kb_id 的按 doc_id / job_id / page_id 关联）
+    tx.execute(
+        "DELETE FROM qa_messages WHERE session_id IN (SELECT id FROM qa_sessions WHERE kb_id = ?1)",
+        rusqlite::params![kb_id],
+    )
+    .map_err(|e| e.to_string())?;
+    tx.execute(
+        "DELETE FROM processing_logs WHERE job_id IN (
+            SELECT j.id FROM processing_jobs j JOIN documents d ON d.id = j.doc_id WHERE d.kb_id = ?1)",
+        rusqlite::params![kb_id],
+    )
+    .map_err(|e| e.to_string())?;
+    // 直接带 kb_id 的表
+    for table in [
+        "kb_metric_events",
+        "wiki_page_entities",
+        "wiki_links",
+        "faq_entries",
+        "search_logs",
+        "qa_sessions",
+        "kb_acl",
+        "kb_members",
+        "kb_directories",
+        "documents",
+    ] {
+        let sql = format!("DELETE FROM {} WHERE kb_id = ?1", table);
+        tx.execute(&sql, rusqlite::params![kb_id])
+            .map_err(|e| e.to_string())?;
+    }
+    // 无 kb_id 列、需按 doc_id 关联的表
+    for table in [
+        "processing_jobs",
+        "kb_doc_tags",
+        "document_chunks",
+        "document_versions",
+    ] {
+        let sql = format!(
+            "DELETE FROM {} WHERE doc_id IN (SELECT id FROM documents WHERE kb_id = ?1)",
+            table
+        );
+        tx.execute(&sql, rusqlite::params![kb_id])
+            .map_err(|e| e.to_string())?;
+    }
+
+    // 3) 删除知识库本体
+    tx.execute(
+        "DELETE FROM knowledge_bases WHERE id = ?1",
+        rusqlite::params![kb_id],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 4) 清理不再被任何版本引用的孤儿原始文件（去重 BLOB）
+    cleanup_orphan_file_objects(&tx, &fo_ids)?;
+
+    // 5) 清理残留的批量取消标记（generate_cancel_{kb_id}，位于全局键值表）
+    tx.execute(
+        "DELETE FROM kb_chunk_settings WHERE key = ?1",
+        rusqlite::params![format!("generate_cancel_{}", kb_id)],
+    )
+    .map_err(|e| e.to_string())?;
+
+    // 6) 复位受影响 AUTOINCREMENT 表的序列，避免删除后新数据从旧 id 继续（不留痕迹）
+    for table in [
+        "documents",
+        "document_chunks",
+        "document_versions",
+        "kb_acl",
+        "kb_directories",
+        "file_objects",
+        "processing_jobs",
+        "processing_logs",
+        "qa_sessions",
+        "qa_messages",
+        "faq_entries",
+        "kb_metric_events",
+        "wiki_pages",
+        "wiki_page_entities",
+        "wiki_links",
+        "search_logs",
+    ] {
+        let sql = format!(
+            "UPDATE sqlite_sequence SET seq = COALESCE((SELECT MAX(id) FROM {}), 0) WHERE name = ?1",
+            table
+        );
+        let _ = tx.execute(&sql, rusqlite::params![table]);
+    }
+
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn kb_delete(
     db: State<'_, KbDatabase>,
@@ -651,55 +786,7 @@ pub async fn kb_delete(
     if is_system_kb(&db, kb_id) {
         return Err("系统知识库不可删除".to_string());
     }
-    let conn = db.conn_lock();
-    // 先清理该知识库的检索日志（search_logs.kb_id 无级联删除，残留会导致外键约束失败）
-    conn.execute(
-        "DELETE FROM search_logs WHERE kb_id = ?1",
-        rusqlite::params![kb_id],
-    )
-    .map_err(|e| e.to_string())?;
-    // 清理 Wiki 页面 FTS 索引（wiki_pages 由外键级联删除，但普通 FTS 表不会自动清理）
-    conn.execute(
-        "DELETE FROM wiki_pages_fts WHERE rowid IN (SELECT id FROM wiki_pages WHERE kb_id = ?1)",
-        rusqlite::params![kb_id],
-    )
-    .map_err(|e| e.to_string())?;
-    // 先清理该知识库全部文档的 FTS 索引（chunks/versions 由外键级联删除），
-    // 并收集其引用的 file_object_id 供删除后清理孤儿 BLOB
-    let doc_ids: Vec<i64> = {
-        let mut stmt = conn
-            .prepare("SELECT id FROM documents WHERE kb_id = ?1")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![kb_id], |r| r.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    let fo_ids: Vec<i64> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT DISTINCT dv.file_object_id FROM document_versions dv
-                 JOIN documents d ON d.id = dv.doc_id WHERE d.kb_id = ?1",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map(rusqlite::params![kb_id], |r| r.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?;
-        rows.filter_map(|r| r.ok()).collect()
-    };
-    for doc_id in &doc_ids {
-        conn.execute(
-            "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
-            rusqlite::params![doc_id],
-        ).map_err(|e| e.to_string())?;
-    }
-    conn.execute(
-        "DELETE FROM knowledge_bases WHERE id = ?1",
-        rusqlite::params![kb_id],
-    )
-    .map_err(|e| e.to_string())?;
-    cleanup_orphan_file_objects(&conn, &fo_ids)?;
-    Ok(())
+    delete_kb_clean(&db, kb_id)
 }
 
 /// 编辑知识库（名称/描述；仅 owner/admin）
@@ -762,4 +849,216 @@ pub async fn kb_set_pin(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kb::db::KbDatabase;
+
+    /// 删除知识库后，所有关联表不得残留任何数据（含 FTS、孤儿 BLOB、取消标记）。
+    #[test]
+    fn delete_kb_leaves_no_residue() {
+        let dir = std::env::temp_dir().join(format!(
+            "kb_del_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let db_path = dir.join("test.db");
+        let db = KbDatabase::open_at(db_path.clone()).expect("open kb db");
+        {
+            let conn = db.conn_lock();
+            conn.execute_batch(
+                "INSERT INTO users (id, username, is_admin) VALUES (1, 'tester', 1);
+                 INSERT INTO knowledge_bases (id, name, description, owner_id, is_system) VALUES (77,'测试库','',1,0);
+                 INSERT INTO kb_directories (kb_id, parent_id, name) VALUES (77, NULL, '目录A');
+                 INSERT INTO kb_members (kb_id, user_id, role) VALUES (77, 1, 'owner');
+                 INSERT INTO kb_acl (scope, doc_id, dir_id, kb_id, grantee_type, effect) VALUES ('kb', NULL, NULL, 77, 'public', 'allow');
+                 INSERT INTO documents (id, kb_id, title, source, status, process_status) VALUES (101, 77, 'doc1.md', 'upload', 'ready', 'ready');
+                 INSERT INTO file_objects (id, hash, ext, size, blob_data) VALUES (201, 'abc123', 'md', 10, x'0102');
+                 INSERT INTO document_versions (id, doc_id, version_no, file_object_id) VALUES (301, 101, 1, 201);
+                 INSERT INTO documents (id, kb_id, title, source, status) VALUES (102, 77, 'doc2.md', 'upload', 'ready');
+                 INSERT INTO file_objects (id, hash, ext, size, blob_data) VALUES (202, 'def456', 'md', 10, x'0304');
+                 INSERT INTO document_versions (id, doc_id, version_no, file_object_id) VALUES (302, 102, 1, 202);
+                 INSERT INTO document_chunks (id, kb_id, doc_id, version_id, seq, content) VALUES (401, 77, 101, 301, 1, 'hello chunk');
+                 INSERT INTO chunks_fts (rowid, content) VALUES (401, 'hello chunk');
+                 INSERT INTO kb_doc_tags (doc_id, tag) VALUES (101, 'tag1');
+                 INSERT INTO processing_jobs (id, doc_id, version_id, stage) VALUES (501, 101, 301, 'done');
+                 INSERT INTO processing_logs (job_id, level, message) VALUES (501, 'info', 'ok');
+                 INSERT INTO search_logs (kb_id, user_id, query) VALUES (77, 1, 'q1');
+                 INSERT INTO wiki_pages (id, kb_id, doc_id, title, slug, status) VALUES (601, 77, 101, '页面A', 'a', 'published');
+                 INSERT INTO wiki_page_entities (kb_id, page_id, name) VALUES (77, 601, '实体A');
+                 INSERT INTO wiki_links (kb_id, from_page_id, to_page_id, link_type) VALUES (77, 601, 601, 'related');
+                 INSERT INTO wiki_pages_fts (rowid, title) VALUES (601, '页面A');
+                 INSERT INTO qa_sessions (id, user_id, kb_id, title) VALUES (701, 1, 77, '会话');
+                 INSERT INTO qa_messages (session_id, role, content) VALUES (701, 'user', 'hi');
+                 INSERT INTO faq_entries (kb_id, question, answer) VALUES (77, 'q', 'a');
+                 INSERT INTO kb_metric_events (kb_id, doc_id, event_type) VALUES (77, 101, 'doc_view');
+                 INSERT INTO kb_chunk_settings (key, value) VALUES ('generate_cancel_77', '1');
+                 INSERT INTO kb_chunk_settings (key, value) VALUES ('strategy', 'recursive');
+                 -- 另一个知识库 78 引用 file_object 203：删除 77 时不得误删共享文件
+                 INSERT INTO knowledge_bases (id, name, is_system) VALUES (78, '保留库', 0);
+                 INSERT INTO documents (id, kb_id, title, source, status) VALUES (103, 78, 'shared.md', 'upload', 'ready');
+                 INSERT INTO file_objects (id, hash, ext, size, blob_data) VALUES (203, 'shared', 'md', 1, x'00');
+                 INSERT INTO document_versions (id, doc_id, version_no, file_object_id) VALUES (303, 103, 1, 203);
+                 INSERT INTO documents (id, kb_id, title, source, status) VALUES (104, 77, 'doc3.md', 'upload', 'ready');
+                 INSERT INTO document_versions (id, doc_id, version_no, file_object_id) VALUES (304, 104, 1, 203);",
+            )
+            .expect("seed data");
+        }
+
+        delete_kb_clean(&db, 77).expect("delete kb should succeed");
+
+        let conn = db.conn_lock();
+        let checks: &[(&str, &str)] = &[
+            (
+                "knowledge_bases",
+                "SELECT COUNT(*) FROM knowledge_bases WHERE id = 77",
+            ),
+            (
+                "documents",
+                "SELECT COUNT(*) FROM documents WHERE kb_id = 77",
+            ),
+            (
+                "document_chunks",
+                "SELECT COUNT(*) FROM document_chunks WHERE kb_id = 77",
+            ),
+            (
+                "document_versions",
+                "SELECT COUNT(*) FROM document_versions WHERE doc_id IN (101,102,104)",
+            ),
+            (
+                "processing_jobs",
+                "SELECT COUNT(*) FROM processing_jobs WHERE doc_id IN (101,102,104)",
+            ),
+            (
+                "processing_logs",
+                "SELECT COUNT(*) FROM processing_logs WHERE job_id = 501",
+            ),
+            (
+                "kb_doc_tags",
+                "SELECT COUNT(*) FROM kb_doc_tags WHERE doc_id IN (101,102,104)",
+            ),
+            (
+                "kb_directories",
+                "SELECT COUNT(*) FROM kb_directories WHERE kb_id = 77",
+            ),
+            (
+                "kb_members",
+                "SELECT COUNT(*) FROM kb_members WHERE kb_id = 77",
+            ),
+            ("kb_acl", "SELECT COUNT(*) FROM kb_acl WHERE kb_id = 77"),
+            (
+                "search_logs",
+                "SELECT COUNT(*) FROM search_logs WHERE kb_id = 77",
+            ),
+            (
+                "faq_entries",
+                "SELECT COUNT(*) FROM faq_entries WHERE kb_id = 77",
+            ),
+            (
+                "kb_metric_events",
+                "SELECT COUNT(*) FROM kb_metric_events WHERE kb_id = 77",
+            ),
+            (
+                "wiki_pages",
+                "SELECT COUNT(*) FROM wiki_pages WHERE kb_id = 77",
+            ),
+            (
+                "wiki_page_entities",
+                "SELECT COUNT(*) FROM wiki_page_entities WHERE kb_id = 77",
+            ),
+            (
+                "wiki_links",
+                "SELECT COUNT(*) FROM wiki_links WHERE kb_id = 77",
+            ),
+            (
+                "qa_sessions",
+                "SELECT COUNT(*) FROM qa_sessions WHERE kb_id = 77",
+            ),
+            (
+                "qa_messages",
+                "SELECT COUNT(*) FROM qa_messages WHERE session_id = 701",
+            ),
+            (
+                "chunks_fts",
+                "SELECT COUNT(*) FROM chunks_fts WHERE rowid = 401",
+            ),
+            (
+                "wiki_pages_fts",
+                "SELECT COUNT(*) FROM wiki_pages_fts WHERE rowid = 601",
+            ),
+        ];
+        for (name, sql) in checks {
+            let n: i64 = conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1);
+            assert_eq!(n, 0, "删除后残留: {} count={}", name, n);
+        }
+        // 孤儿 file_objects（201/202）被清理；共享文件（203）仍被 78 引用 → 保留
+        let orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_objects WHERE id IN (201,202)",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan, 0, "孤儿 file_objects 应被清理");
+        let shared: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM file_objects WHERE id = 203",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared, 1, "仍被其他库引用的 file_object 应保留");
+        // 取消标记清理，全局设置保留
+        let flag: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kb_chunk_settings WHERE key='generate_cancel_77'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, 0, "批量取消标记应清理");
+        let strategy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM kb_chunk_settings WHERE key='strategy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(strategy, 1, "全局分块设置应保留");
+        // 序列复位：documents 已清空 → seq=0；仍有关联数据的表不重置到 0 以下
+        let seq: i64 = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='documents'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        assert_eq!(
+            seq, 103,
+            "documents 序列应复位为现存最大 id（保留库 doc 103 仍在）"
+        );
+        let kb_seq: i64 = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name='knowledge_bases'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(-1);
+        assert!(kb_seq >= 78, "knowledge_bases 序列不得低于现存最大 id 78");
+        // 保留库 78 的文档仍在
+        let keep: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents WHERE id = 103", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(keep, 1, "其他知识库数据不受影响");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

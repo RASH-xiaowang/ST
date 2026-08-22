@@ -42,7 +42,9 @@
     const out: Record<ModelRole, ModelInfo[]> = { inference: [], parsing: [], embedding: [], rerank: [] };
     for (const r of MODEL_ROLES) {
       const marked = models.filter(r.filter);
-      out[r.role] = marked.length > 0 ? marked : models;
+      // 推理角色允许未标记类型的模型（对话模型可能未打标）；嵌入/解析/重排序
+      // 必须命中类型标记，避免把对话模型当嵌入模型选择（向量化接口不支持）。
+      out[r.role] = r.role === 'inference' ? (marked.length > 0 ? marked : models) : marked;
     }
     return out;
   });
@@ -176,6 +178,12 @@
           </SelectRoot>
         </div>
       {/each}
+      {#if roleUsable.embedding.length === 0}
+        <div style="display:flex;gap:8px;align-items:flex-start;font-size:12.5px;color:var(--kb-warn);border:1px solid color-mix(in srgb, var(--app-warning) 40%, var(--kb-border));border-radius:8px;padding:8px 10px;line-height:1.6">
+          <span style="flex:none;margin-top:1px"><KbIcon name="warn" size={14} /></span>
+          <span>未配置任何 Embeddings 模型：上传的文档只能解析与全文检索，无法进行语义向量检索。请先在「大模型管理」中添加支持 Embedding 的模型（如 text-embedding 系列），再回到这里为「Embeddings」角色选择模型，并到文档列表对已上传文档执行「重处理」。</span>
+        </div>
+      {/if}
       <p style="font-size:11.5px;color:var(--kb-text-3);margin:0;line-height:1.6">
         推理模型用于问答生成与 Wiki 提炼；Embeddings 用于文档向量化；Rerank 用于检索重排序；
         文档解析当前版本仍走内置解析与系统 OCR。

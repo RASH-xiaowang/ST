@@ -102,12 +102,16 @@ import PlatformOverview from './lib/components/PlatformOverview.svelte';
   // 请求微信数据面板打开「设置」页（启动页「去配置」等入口）
   let wechatConfigTick = $state(0);
 
-  let sidebarCollapsed = $state(false);
+  /** 折叠 rail 模式：启动即自动折叠，悬浮展开、移开自动折叠 */
+  let sidebarCollapsed = $state(true);
   let sidebarDrawerOpen = $state(false);
   /** 悬浮展开（折叠 rail 模式：鼠标移入临时展开、移出自动折叠） */
   let sidebarHover = $state(false);
-  /** 实际展开：手动展开 或（手动折叠且悬浮中）；移动端抽屉不受影响 */
-  const sidebarExpanded = $derived(sidebarCollapsed ? sidebarHover : true);
+  /** 实际展开：手动展开 或（手动折叠且悬浮中）；移动端抽屉打开时强制全宽，
+   *  避免折叠宽度把抽屉压成窄条 */
+  const sidebarExpanded = $derived(
+    sidebarDrawerOpen ? true : sidebarCollapsed ? sidebarHover : true,
+  );
 
   function toggleSidebar() {
     if (window.innerWidth <= 768) {
@@ -319,8 +323,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         </div>
       </div>
       <nav class="nav-list">
-        <!-- 快捷：全局搜索（弹窗） -->
-        <div class="nav-section-label">快捷</div>
+        <!-- 全局搜索（弹窗）：快捷入口置顶，不设分区标题 -->
         <button class="nav-item nav-item-search" onclick={() => searchOpen = true} title="全局搜索 (Ctrl+K)">
           <svg class="nav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none"><circle cx="6.5" cy="6.5" r="4" stroke="currentColor" stroke-width="1.5"/><line x1="9.5" y1="9.5" x2="13" y2="13" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
           <span class="nav-text">搜索</span>
@@ -409,17 +412,11 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         </button>
       </div>
 
-      <!-- 折叠按钮栏 -->
+      <!-- 折叠按钮栏：单条 chevron 用 CSS 旋转 180° 过渡，避免 {#if} 硬切两个图形 -->
       <div class="sidebar-collapse-bar">
-        <button class="collapse-btn" onclick={toggleSidebar} title={sidebarExpanded ? '折叠侧边栏 (Ctrl+B)' : '展开侧边栏 (Ctrl+B)'}>
-          <svg viewBox="0 0 16 16" width="14" height="14" fill="none">
-            {#if sidebarExpanded}
-              <line x1="6" y1="4" x2="10" y2="8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-              <line x1="6" y1="12" x2="10" y2="8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-            {:else}
-              <line x1="10" y1="4" x2="6" y2="8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-              <line x1="10" y1="12" x2="6" y2="8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
-            {/if}
+        <button class="collapse-btn" onclick={toggleSidebar} title={sidebarExpanded ? '折叠侧边栏 (Ctrl+B)' : '展开侧边栏 (Ctrl+B)'} aria-label={sidebarExpanded ? '折叠侧边栏' : '展开侧边栏'}>
+          <svg class="collapse-icon" viewBox="0 0 16 16" width="14" height="14" fill="none" aria-hidden="true">
+            <path d="M6.2 4L10 8l-3.8 4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </button>
       </div>
@@ -712,7 +709,12 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   }
 
   /* ---------- 侧边栏 ---------- */
+  /* 展开/折叠过渡统一走 Material ease-in-out 曲线：两端缓冲、中间最快，方向反转也不生硬。
+     文字/徽章等不再用 display:none 硬切，而是跟随宽度收敛 + 淡入淡出：
+     折叠时立即淡出，展开时略延迟淡入（等面板打开一点再露字） */
   .sidebar {
+    --sidebar-ease: cubic-bezier(0.4, 0, 0.2, 1);
+    --sidebar-dur: 0.26s;
     width: 232px;
     flex: none;
     display: flex;
@@ -720,7 +722,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     min-height: 0;
     background: var(--sidebar);
     border-right: 1px solid var(--sidebar-border);
-    transition: width 0.18s ease;
+    transition: width var(--sidebar-dur) var(--sidebar-ease);
     overflow: hidden;
   }
   .sidebar-collapsed { width: 64px; }
@@ -744,15 +746,18 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     flex: none;
     border-bottom: 1px solid var(--sidebar-border);
     background: color-mix(in srgb, var(--sidebar) 96%, var(--brand) 2%);
+    transition: padding-inline var(--sidebar-dur) var(--sidebar-ease);
   }
   .sidebar-brand {
     display: flex;
     align-items: center;
-    gap: 11px;
+    justify-content: center;
   }
   .brand-icon-wrap {
     position: relative;
     flex: none;
+    margin-right: 11px;
+    transition: margin-right var(--sidebar-dur) var(--sidebar-ease);
   }
   .brand-icon-led {
     position: absolute;
@@ -782,9 +787,16 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   }
   .brand-text {
     min-width: 0;
+    max-width: 176px;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
     gap: 4px;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.18s ease 0.06s,
+      transform var(--sidebar-dur) var(--sidebar-ease) 0.06s,
+      visibility 0s linear 0.06s;
   }
   .navbar-title {
     font-size: 15px;
@@ -797,6 +809,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   .brand-meta {
     display: flex;
     align-items: center;
+    justify-content: center;
     gap: 6px;
     white-space: nowrap;
   }
@@ -815,15 +828,20 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     font-size: 11.5px;
     color: var(--muted-foreground);
   }
-  .sidebar-collapsed .brand-text,
-  .sidebar-collapsed .nav-text,
-  .sidebar-collapsed .nav-section-label,
-  .sidebar-collapsed .footer-action-text,
-  .sidebar-collapsed .footer-status-text,
-  .sidebar-collapsed .nav-badge,
-  .sidebar-collapsed .footer-divider { display: none; }
-  .sidebar-collapsed .sidebar-header { padding-inline: 15px; }
-  .sidebar-collapsed .nav-item { justify-content: center; padding-inline: 0; }
+  /* 折叠 rail：宽度收敛 + 淡出 + 轻微左移，跟随面板一起收拢 */
+  .sidebar-collapsed .brand-text {
+    max-width: 0;
+    opacity: 0;
+    transform: translateX(-8px);
+    visibility: hidden;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.16s ease,
+      transform 0.22s var(--sidebar-ease),
+      visibility 0s linear var(--sidebar-dur);
+  }
+  .sidebar-collapsed .sidebar-header { padding-inline: 0; }
+  .sidebar-collapsed .brand-icon-wrap { margin-right: 0; }
 
   .nav-list {
     flex: 1;
@@ -839,13 +857,32 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     font-size: 11.5px;
     font-weight: 600;
     letter-spacing: 0.16em;
+    text-align: center;
     color: var(--muted-foreground);
     padding: 14px 10px 5px;
+    max-height: 60px;
+    overflow: hidden;
+    transition:
+      max-height var(--sidebar-dur) var(--sidebar-ease),
+      padding-block var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.18s ease 0.06s,
+      visibility 0s linear 0.06s;
+  }
+  .sidebar-collapsed .nav-section-label {
+    max-height: 0;
+    padding-block: 0;
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      max-height var(--sidebar-dur) var(--sidebar-ease),
+      padding-block var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.16s ease,
+      visibility 0s linear var(--sidebar-dur);
   }
   .nav-item {
     display: flex;
     align-items: center;
-    gap: 10px;
+    justify-content: center;
     width: 100%;
     padding: 8px 10px;
     border: none;
@@ -853,7 +890,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     background: transparent;
     color: var(--sidebar-foreground);
     font-size: 13px;
-    text-align: left;
+    text-align: center;
     cursor: pointer;
     position: relative;
     transition: background 0.12s, color 0.12s;
@@ -876,13 +913,30 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   }
   .nav-icon {
     flex: none;
+    margin-right: 10px;
     color: currentColor;
     opacity: 0.9;
+    transition: margin-right var(--sidebar-dur) var(--sidebar-ease);
   }
-  .nav-text { flex: 1; min-width: 0; white-space: nowrap; }
+  .nav-text {
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 150px;
+    overflow: hidden;
+    white-space: nowrap;
+    text-align: center;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.18s ease 0.06s,
+      transform var(--sidebar-dur) var(--sidebar-ease) 0.06s,
+      visibility 0s linear 0.06s;
+  }
   .nav-badge {
+    flex: none;
     min-width: 18px;
+    max-width: 60px;
     height: 18px;
+    margin-left: 10px;
     padding: 0 5px;
     border-radius: 9px;
     background: var(--primary);
@@ -891,6 +945,14 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     font-weight: 700;
     display: grid;
     place-items: center;
+    overflow: hidden;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      padding-inline var(--sidebar-dur) var(--sidebar-ease),
+      margin-left var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.18s ease 0.06s,
+      transform var(--sidebar-dur) var(--sidebar-ease) 0.06s,
+      visibility 0s linear 0.06s;
   }
   .nav-item-search {
     margin: 0 0 2px;
@@ -915,7 +977,42 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     font-weight: 600;
     font-family: var(--font-mono);
   }
-  .nav-list-divider { height: 1px; background: var(--sidebar-border); margin: 8px 6px; }
+  .nav-list-divider {
+    height: 1px;
+    background: var(--sidebar-border);
+    margin: 8px 6px;
+    opacity: 1;
+    transition: opacity 0.18s ease;
+  }
+  .sidebar-collapsed .nav-icon { margin-right: 0; }
+  .sidebar-collapsed .nav-text {
+    max-width: 0;
+    opacity: 0;
+    transform: translateX(-8px);
+    visibility: hidden;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.16s ease,
+      transform 0.22s var(--sidebar-ease),
+      visibility 0s linear var(--sidebar-dur);
+  }
+  .sidebar-collapsed .nav-badge {
+    max-width: 0;
+    min-width: 0;
+    padding-inline: 0;
+    margin-left: 0;
+    opacity: 0;
+    transform: translateX(6px);
+    visibility: hidden;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      padding-inline var(--sidebar-dur) var(--sidebar-ease),
+      margin-left var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.16s ease,
+      transform 0.22s var(--sidebar-ease),
+      visibility 0s linear var(--sidebar-dur);
+  }
+  .sidebar-collapsed .nav-list-divider { opacity: 0; }
 
   /* ---------- 侧边栏底部 ---------- */
   .sidebar-spacer { flex: 0 0 auto; height: 0; }
@@ -930,7 +1027,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   .footer-status-row {
     display: flex;
     align-items: center;
-    gap: 8px;
+    justify-content: center;
     padding: 5px 10px 7px;
     font-size: 12px;
     color: var(--muted-foreground);
@@ -939,9 +1036,11 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     position: relative;
     width: 8px;
     height: 8px;
+    margin-right: 8px;
     border-radius: 50%;
     background: var(--app-success, #52c41a);
     box-shadow: 0 0 8px var(--app-success, #52c41a);
+    transition: margin-right var(--sidebar-dur) var(--sidebar-ease);
   }
   .footer-status-row.tag-success .footer-status-dot::after {
     content: '';
@@ -959,11 +1058,19 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
   .tag-warn .footer-status-dot, .footer-status-row.tag-warn .footer-status-dot { background: #f5b301; box-shadow: 0 0 8px #f5b301; }
   .tag-danger .footer-status-dot, .footer-status-row.tag-danger .footer-status-dot { background: #ff5f56; box-shadow: 0 0 8px #ff5f56; }
   .tag-default .footer-status-dot, .footer-status-row.tag-default .footer-status-dot { background: #8a93a5; box-shadow: none; }
-  .footer-divider { height: 1px; background: var(--sidebar-border); margin: 6px 4px; }
+  .footer-divider {
+    height: 1px;
+    background: var(--sidebar-border);
+    margin: 6px 4px;
+    transition:
+      height var(--sidebar-dur) var(--sidebar-ease),
+      margin-block var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.18s ease;
+  }
   .footer-action {
     display: flex;
     align-items: center;
-    gap: 10px;
+    justify-content: center;
     padding: 8px 10px;
     border: none;
     border-radius: 8px;
@@ -971,15 +1078,63 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     color: var(--sidebar-foreground);
     font-size: 13px;
     cursor: pointer;
-    text-align: left;
+    text-align: center;
   }
   .footer-action:hover { background: var(--sidebar-accent); }
-  .footer-action-text { white-space: nowrap; }
+  .footer-action-text {
+    white-space: nowrap;
+    max-width: 140px;
+    overflow: hidden;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.18s ease 0.06s,
+      transform var(--sidebar-dur) var(--sidebar-ease) 0.06s,
+      visibility 0s linear 0.06s;
+  }
+  .footer-status-text {
+    white-space: nowrap;
+    max-width: 120px;
+    overflow: hidden;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.18s ease 0.06s,
+      visibility 0s linear 0.06s;
+  }
+  .sidebar-collapsed .footer-status-text {
+    max-width: 0;
+    opacity: 0;
+    visibility: hidden;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.16s ease,
+      visibility 0s linear var(--sidebar-dur);
+  }
+  .sidebar-collapsed .footer-action-text {
+    max-width: 0;
+    opacity: 0;
+    transform: translateX(-8px);
+    visibility: hidden;
+    transition:
+      max-width var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.16s ease,
+      transform 0.22s var(--sidebar-ease),
+      visibility 0s linear var(--sidebar-dur);
+  }
+  .sidebar-collapsed .footer-status-dot { margin-right: 0; }
+  .sidebar-collapsed .footer-divider {
+    height: 0;
+    margin-block: 0;
+    opacity: 0;
+    transition:
+      height var(--sidebar-dur) var(--sidebar-ease),
+      margin-block var(--sidebar-dur) var(--sidebar-ease),
+      opacity 0.16s ease;
+  }
 
   .sidebar-collapse-bar {
     flex: none;
     display: flex;
-    justify-content: flex-end;
+    justify-content: center;
     padding: 6px 8px 10px;
   }
   .collapse-btn {
@@ -992,8 +1147,40 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     background: transparent;
     color: var(--muted-foreground);
     cursor: pointer;
+    transition: background-color 0.18s ease, color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
   }
-  .collapse-btn:hover { background: var(--muted); color: var(--foreground); }
+  .collapse-btn:hover {
+    background: var(--muted);
+    color: var(--foreground);
+    border-color: color-mix(in oklab, var(--brand) 35%, var(--border));
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--brand) 12%, transparent);
+  }
+  .collapse-icon {
+    transition: transform 0.32s var(--sidebar-ease);
+  }
+  .sidebar-collapsed .collapse-icon { transform: rotate(180deg); }
+
+  /* 系统预设减少动效时，折叠过渡退化为瞬间切换 */
+  @media (prefers-reduced-motion: reduce) {
+    .sidebar,
+    .sidebar-header,
+    .brand-icon-wrap,
+    .brand-text,
+    .nav-section-label,
+    .nav-icon,
+    .nav-text,
+    .nav-badge,
+    .nav-list-divider,
+    .footer-status-dot,
+    .footer-status-text,
+    .footer-divider,
+    .footer-action-text,
+    .collapse-btn,
+    .collapse-icon {
+      transition-duration: 0.01ms !important;
+      transition-delay: 0s !important;
+    }
+  }
 
   /* ---------- 通用卡片 ---------- */
   /* :global：.card 是全站共享语义类（子组件也直接 class="card"），

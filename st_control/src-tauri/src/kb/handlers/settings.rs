@@ -45,6 +45,28 @@ pub async fn kb_list_models() -> Result<Vec<KbModelInfo>, String> {
     Ok(out)
 }
 
+/// 判断模型是否被明确标记为「非嵌入」类型（model_meta 存在且类型不是嵌入）。
+/// 用于拦截把对话/其他类型模型当作向量化模型调用（如 DeepSeek 对话模型无嵌入接口，
+/// 误用会导致全部文档上传后向量化 404 失败）。model_meta 缺失时无法判定，放行。
+fn is_definitely_not_embedding_in(
+    cfg: &crate::llm::types::LlmConfig,
+    provider: &str,
+    model: &str,
+) -> bool {
+    cfg.providers
+        .iter()
+        .find(|p| p.id == provider)
+        .and_then(|p| p.model_meta.get(model))
+        .and_then(|meta| meta.model_type.as_deref())
+        .map(|t| !(t == "嵌入" || t.eq_ignore_ascii_case("embedding")))
+        .unwrap_or(false)
+}
+
+fn is_definitely_not_embedding(provider: &str, model: &str) -> bool {
+    let cfg = crate::llm::config::load_config();
+    is_definitely_not_embedding_in(&cfg, provider, model)
+}
+
 /// 判断模型是否被标记为「嵌入」类型（兼容中文「嵌入」与英文 embedding）
 fn is_embedding_model(provider: &crate::llm::types::ProviderConfig, model: &str) -> bool {
     provider
@@ -93,18 +115,14 @@ fn default_embedding_model_from_cfg(
             }
         }
     }
-    // 上次嵌入调用使用的模型
+    // 上次嵌入调用使用的模型（仅当仍是嵌入模型时沿用，避免误用对话模型）
     if let (Some(pid), Some(model)) = (&cfg.last_embedding_provider_id, &cfg.last_embedding_model) {
-        if !pid.is_empty() && !model.is_empty() {
+        if !pid.is_empty() && !model.is_empty() && !is_definitely_not_embedding(pid, model) {
             return Some((pid.clone(), model.clone()));
         }
     }
-    // 兜底：首个启用提供方的默认模型
-    for p in &cfg.providers {
-        if p.enabled && !p.default_model.is_empty() {
-            return Some((p.id.clone(), p.default_model.clone()));
-        }
-    }
+    // 注意：绝不回退到「默认/对话模型」当嵌入模型——向量化接口不支持对话模型，
+    // 误用会导致全部文档上传后向量化失败。未配置嵌入模型时返回 None，由调用方跳过向量化。
     None
 }
 
@@ -170,20 +188,53 @@ pub(crate) fn read_model_setting(
     .filter(|(p, m)| !p.is_empty() && !m.is_empty())
 }
 
-/// 嵌入模型解析：优先使用调用方显式传入的（前端选择），否则用「模型设置」中的 embedding 配置
+/// 嵌入模型解析：优先使用调用方显式传入的（前端选择），否则用「模型设置」中的 embedding 配置。
+/// 显式传入或已保存的模型若被明确标记为非嵌入类型（如对话模型），一律忽略并回退，
+/// 避免把不支持的模型当作向量化模型调用导致上传全部失败。
 pub(crate) fn resolve_embedding_pair(
     db: &KbDatabase,
     passed_provider: Option<String>,
     passed_model: Option<String>,
 ) -> (Option<String>, Option<String>) {
-    if passed_provider.is_some() || passed_model.is_some() {
-        (passed_provider, passed_model)
-    } else {
-        let conn = db.conn_lock();
-        read_model_setting(&conn, "embedding")
-            .map(|(p, m)| (Some(p), Some(m)))
-            .unwrap_or((None, None))
+    if let (Some(p), Some(m)) = (&passed_provider, &passed_model) {
+        if !is_definitely_not_embedding(p, m) {
+            return (passed_provider, passed_model);
+        }
+        log::warn!(
+            "忽略被标记为非嵌入类型的向量化模型: provider={} model={}",
+            p,
+            m
+        );
     }
+    let conn = db.conn_lock();
+    read_model_setting(&conn, "embedding")
+        .filter(|(p, m)| !is_definitely_not_embedding(p, m))
+        .map(|(p, m)| (Some(p), Some(m)))
+        .unwrap_or((None, None))
+}
+
+/// 推理模型解析：优先显式传入 → kb_model_settings(inference) → 全局默认对话模型。
+/// Wiki 提炼 / 摘要实体提取等 LLM 流程共用，避免「未在设置页保存推理模型时提炼必失败」。
+pub(crate) fn resolve_inference_pair(
+    db: &KbDatabase,
+    passed_provider: Option<String>,
+    passed_model: Option<String>,
+) -> (Option<String>, Option<String>) {
+    if let (Some(p), Some(m)) = (&passed_provider, &passed_model) {
+        if !p.is_empty() && !m.is_empty() {
+            return (passed_provider, passed_model);
+        }
+    }
+    if let Some((p, m)) = {
+        let conn = db.conn_lock();
+        read_model_setting(&conn, "inference")
+    } {
+        return (Some(p), Some(m));
+    }
+    let cfg = crate::llm::config::load_config();
+    default_chat_model_from_cfg(&cfg)
+        .map(|(p, m)| (Some(p), Some(m)))
+        .unwrap_or((None, None))
 }
 
 /// 读取四类模型设置；未手动配置时返回按类型推导的默认值
@@ -326,4 +377,90 @@ pub async fn kb_get_default_chat_model(
     }
     let cfg = crate::llm::config::load_config();
     default_chat_model_from_cfg(&cfg).ok_or_else(|| "未找到可用的对话模型".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::types::{LlmConfig, ModelMeta, ProviderConfig};
+
+    fn provider(
+        id: &str,
+        models: &[&str],
+        default_model: &str,
+        types: &[(&str, &str)],
+    ) -> ProviderConfig {
+        let mut p = ProviderConfig::default();
+        p.id = id.to_string();
+        p.name = id.to_string();
+        p.default_model = default_model.to_string();
+        p.enabled = true;
+        p.models = models.iter().map(|m| m.to_string()).collect();
+        for (m, t) in types {
+            p.model_meta.insert(
+                m.to_string(),
+                ModelMeta {
+                    model_type: Some(t.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        p
+    }
+
+    #[test]
+    fn rejects_chat_model_as_embedding() {
+        let cfg = LlmConfig {
+            providers: vec![provider(
+                "deepseek",
+                &["deepseek-v4-flash"],
+                "deepseek-v4-flash",
+                &[("deepseek-v4-flash", "对话")],
+            )],
+            ..Default::default()
+        };
+        // 被明确标记为对话的模型不能当作嵌入模型
+        assert!(is_definitely_not_embedding_in(
+            &cfg,
+            "deepseek",
+            "deepseek-v4-flash"
+        ));
+        // model_meta 缺失（未打标）时无法判定，放行
+        assert!(!is_definitely_not_embedding_in(
+            &cfg,
+            "deepseek",
+            "unknown-model"
+        ));
+        // 未配置嵌入模型时，默认嵌入不得回退到对话模型
+        assert_eq!(default_embedding_model_from_cfg(&cfg), None);
+    }
+
+    #[test]
+    fn accepts_embedding_model() {
+        let cfg = LlmConfig {
+            providers: vec![provider("sf", &["bge-m3"], "bge-m3", &[("bge-m3", "嵌入")])],
+            ..Default::default()
+        };
+        assert!(!is_definitely_not_embedding_in(&cfg, "sf", "bge-m3"));
+        assert_eq!(
+            default_embedding_model_from_cfg(&cfg),
+            Some(("sf".to_string(), "bge-m3".to_string()))
+        );
+    }
+
+    #[test]
+    fn default_embedding_never_falls_back_to_chat_default() {
+        // 只有对话模型的提供方：即便设置了默认模型，也不能用作嵌入
+        let cfg = LlmConfig {
+            default_provider_id: Some("deepseek".to_string()),
+            providers: vec![provider(
+                "deepseek",
+                &["deepseek-v4-flash", "deepseek-v4-pro"],
+                "deepseek-v4-flash",
+                &[("deepseek-v4-flash", "对话"), ("deepseek-v4-pro", "对话")],
+            )],
+            ..Default::default()
+        };
+        assert_eq!(default_embedding_model_from_cfg(&cfg), None);
+    }
 }

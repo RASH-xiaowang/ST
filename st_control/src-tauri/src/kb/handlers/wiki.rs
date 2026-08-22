@@ -7,7 +7,7 @@
 use crate::kb::db::KbDatabase;
 use tauri::State;
 
-use super::read_model_setting;
+use super::resolve_inference_pair;
 use super::{log_metric_event, MetricEvent};
 
 /// 列出知识库全部页面（按标题排序）
@@ -209,12 +209,7 @@ pub async fn kb_wiki_update_page(
 
 /// 后台提交单页的摘要/实体提取（复用推理模型设置）
 fn spawn_wiki_extract(db: &KbDatabase, uid: i64, page_id: i64) {
-    let (provider, model) = {
-        let conn = db.conn_lock();
-        read_model_setting(&conn, "inference")
-            .map(|(p, m)| (Some(p), Some(m)))
-            .unwrap_or((None, None))
-    };
+    let (provider, model) = resolve_inference_pair(db, None, None);
     let db_task = db.clone();
     tauri::async_runtime::spawn(async move {
         let _ = crate::kb::wiki::extract_page_meta(
@@ -247,12 +242,7 @@ pub(crate) fn refresh_wiki_for_doc(db: &KbDatabase, doc_id: i64) {
     if pages.is_empty() {
         return;
     }
-    let (provider, model) = {
-        let conn = db.conn_lock();
-        read_model_setting(&conn, "inference")
-            .map(|(p, m)| (Some(p), Some(m)))
-            .unwrap_or((None, None))
-    };
+    let (provider, model) = resolve_inference_pair(db, None, None);
     let db_task = db.clone();
     tauri::async_runtime::spawn(async move {
         for pid in pages {
@@ -314,12 +304,7 @@ pub async fn kb_wiki_extract_all(
     if submitted == 0 {
         return Ok(serde_json::json!({ "submitted": 0 }));
     }
-    let (provider, model) = {
-        let conn = db.conn_lock();
-        read_model_setting(&conn, "inference")
-            .map(|(p, m)| (Some(p), Some(m)))
-            .unwrap_or((None, None))
-    };
+    let (provider, model) = resolve_inference_pair(&db, None, None);
     let db_task = (*db).clone();
     tauri::async_runtime::spawn(async move {
         for pid in pages {
@@ -377,15 +362,17 @@ pub async fn kb_wiki_generate(
     }
     let db_task = (*db).clone();
     let kb_id = input.kb_id;
-    // 未显式指定模型时，使用「模型设置」中的推理模型（Wiki 提炼）
-    let (provider, model) = if input.provider_id.is_none() && input.model.is_none() {
+    // 新批量提交：清除历史取消标记，避免上次「停止处理」残留标记让新批量直接终止
+    {
         let conn = db.conn_lock();
-        read_model_setting(&conn, "inference")
-            .map(|(p, m)| (Some(p), Some(m)))
-            .unwrap_or((input.provider_id.clone(), input.model.clone()))
-    } else {
-        (input.provider_id.clone(), input.model.clone())
-    };
+        let _ = conn.execute(
+            "DELETE FROM kb_chunk_settings WHERE key = ?1",
+            rusqlite::params![format!("generate_cancel_{}", kb_id)],
+        );
+    }
+    // 未显式指定模型时：kb_model_settings(inference) → 全局默认对话模型（Wiki 提炼）
+    let (provider, model) =
+        resolve_inference_pair(&db, input.provider_id.clone(), input.model.clone());
     tauri::async_runtime::spawn(async move {
         let _ = crate::kb::wiki::generate_with_jobs(
             db_task,

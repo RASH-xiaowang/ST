@@ -181,8 +181,10 @@ export const kbApi = {
   getAnalyticsSettings: () => invoke<AnalyticsSetting[]>('kb_get_analytics_settings'),
   setAnalyticsSettings: (input: { key: string; label: string; visible: boolean }) =>
     invoke<void>('kb_set_analytics_settings', { input }),
-  listJobs: (kbId: number | null, limit: number) => invoke<JobItem[]>('kb_list_jobs', { kbId, limit }),
+  listJobs: (kbId: number | null, limit: number) => invoke<{ items: JobItem[]; total: number }>('kb_list_jobs', { kbId, limit }),
   getJobLogs: (jobId: number) => invoke<JobLogItem[]>('kb_get_job_logs', { jobId }),
+  clearActivity: (scope: 'jobs' | 'logs' | 'history') => invoke<{ jobs?: number; logs?: number; history?: number }>('kb_clear_activity', { scope }),
+  stopProcessing: (kbId: number | null) => invoke<{ stopped: number }>('kb_stop_processing', { kbId }),
   housekeeping: () => invoke<HousekeepingResult>('kb_housekeeping'),
 
   // ── Wiki ──

@@ -88,11 +88,17 @@ pub async fn delete_llm_provider<R: tauri::Runtime>(
     id: String,
 ) -> Result<(), String> {
     let mut cfg = config::load_config();
+    // 目标提供方不存在（例如并发下读到了空配置）：直接返回、不落盘，
+    // 避免用空配置覆盖磁盘上已有的提供方列表。
+    if !cfg.providers.iter().any(|p| p.id == id) {
+        return Ok(());
+    }
     cfg.providers.retain(|p| p.id != id);
     if cfg.default_provider_id.as_deref() == Some(&id) {
         cfg.default_provider_id = cfg.providers.first().map(|p| p.id.clone());
     }
-    config::save_config(&cfg)?;
+    // 删除最后一个提供方会得到空列表，属用户明确操作，使用允许空列表的写盘
+    config::save_config_allow_empty(&cfg)?;
     notify_llm_config_changed(&app);
     Ok(())
 }

@@ -140,7 +140,10 @@ pub async fn kb_housekeeping(
         let db_block = (*db).clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<(usize, usize), String> {
             let conn = db_block.conn_lock();
-            // 1) 超时任务标记失败（Wiki 批量提炼 stage='generating' 可能持续很久，不按 10 分钟判死）
+            // 1) 超时任务标记失败。普通阶段（解析/分片/向量化）10 分钟无进展即判死；
+            //    Wiki 提炼（generating）单文档要串行执行 1 次提炼 + N 次页面摘要/实体提取，
+            //    每次 LLM 调用上限 90s，最坏约 20 分钟，故放宽到 30 分钟——超过即视为被中断
+            //    （如应用重启杀掉后台任务），标记失败让用户可重新提炼，避免永久卡在“处理中”。
             let jobs = conn
                 .execute(
                     "UPDATE processing_jobs SET stage='failed', progress=1.0,
@@ -149,6 +152,16 @@ pub async fn kb_housekeeping(
                     [],
                 )
                 .map_err(|e| e.to_string())?;
+            let generating = conn
+                .execute(
+                    "UPDATE processing_jobs SET stage='failed', progress=1.0,
+                            error='Wiki 提炼超时（超过 30 分钟无进展，可能因应用重启中断），已自动标记失败，可重新提炼',
+                            updated_at=datetime('now')
+                     WHERE stage='generating' AND updated_at < datetime('now','-30 minutes')",
+                    [],
+                )
+                .map_err(|e| e.to_string())?;
+            let jobs = jobs + generating;
             // 2) 无活跃任务但仍 processing 的文档 → failed
             let docs = conn
                 .execute(

@@ -85,6 +85,13 @@ pub fn load_config() -> LlmConfig {
         Err(e) => {
             if path.exists() {
                 set_load_error(format!("读取大模型配置失败（{}）: {}", path.display(), e));
+            } else {
+                // 主文件缺失（被删除/移动，或并发实例原子替换瞬间读到空窗）：
+                // 若有可解析的备份则自动恢复，避免后续“读-改-写”把空配置写回
+                let reason = format!("大模型配置文件不存在（{}）", path.display());
+                if let Some(restored) = try_restore_from_backup(&reason) {
+                    return restored;
+                }
             }
             LlmConfig::default()
         }
@@ -116,6 +123,41 @@ fn try_restore_from_backup(reason: &str) -> Option<LlmConfig> {
 pub fn save_config(cfg: &LlmConfig) -> Result<(), String> {
     let _guard = WRITE_LOCK.lock().unwrap();
     // 配置解析失败时拒绝保存，避免“读-改-写”把空配置覆盖回原文件
+    if let Some(err) = take_load_error() {
+        return Err(format!(
+            "{}；已中止保存，原配置文件未改动。可手工修复该文件或删除后重新配置。",
+            err
+        ));
+    }
+    // 防并发实例互相覆盖：磁盘上已有提供方，而本次要写入的是空列表，
+    // 几乎可以肯定是某个实例在异常状态下读到了空配置（另一实例原子替换
+    // 瞬间、文件被删等），此时拒绝保存，避免把用户配置清空。
+    if cfg.providers.is_empty() {
+        if let Some(existing) = peek_disk_config() {
+            if !existing.providers.is_empty() {
+                return Err(format!(
+                    "拒绝保存空提供方列表：磁盘上已有 {} 个提供方配置，疑似并发实例互相覆盖，已中止，原文件未改动。",
+                    existing.providers.len()
+                ));
+            }
+        }
+    }
+    write_config_atomic(cfg, true)
+}
+
+/// 读取磁盘当前配置用于“空覆盖”比较：不触发备份恢复、不改变加载错误状态。
+fn peek_disk_config() -> Option<LlmConfig> {
+    let s = std::fs::read_to_string(config_path()).ok()?;
+    if s.trim().is_empty() {
+        return None;
+    }
+    serde_json::from_str(&s).ok()
+}
+
+/// 显式写盘（绕过“空配置覆盖”保护）。
+/// 用于用户主动删除最后一个提供方等明确操作——此时清空列表是用户本意。
+pub fn save_config_allow_empty(cfg: &LlmConfig) -> Result<(), String> {
+    let _guard = WRITE_LOCK.lock().unwrap();
     if let Some(err) = take_load_error() {
         return Err(format!(
             "{}；已中止保存，原配置文件未改动。可手工修复该文件或删除后重新配置。",

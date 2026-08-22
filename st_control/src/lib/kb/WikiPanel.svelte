@@ -1,16 +1,16 @@
 <script lang="ts">
   import { kbApi } from './services/ipc';
-  import { tick, untrack } from 'svelte';
+  import { untrack } from 'svelte';
   import { formatIsoTime } from '../format';
-  import type { WikiPageItem, WikiPageDetail, WikiGraph, WikiDir } from './kbTypes';
-  import { radialTreeLayout } from './graphLayout';
-  import { edgeLinkTypes, graphNeighborSet, nodeDegreeMap, visibleNodeIds } from './graphUtils';
+  import type { WikiPageItem, WikiPageDetail, WikiGraph, WikiGraphNode, WikiDir } from './kbTypes';
+  import { edgeLinkTypes, nodeDegreeMap, visibleNodeIds } from './graphUtils';
+  import { buildWikiGraph, communityColor, type BuiltWikiGraph, type WEdge, type WNode } from './wikiGraphModel';
+  import WikiGraphCanvas from './WikiGraphCanvas.svelte';
   import { buildDirSubtree, buildDirTree, filterPagesByDir } from './dirTreeUtils';
   import { renderMd } from './markdown';
   import { lsGet, lsSet } from '../storage';
   import {
     NODE_TYPE_COLORS,
-    colorSlug,
     edgeColor,
     nodeColor,
     nodeTypeName,
@@ -28,16 +28,6 @@
   // ─── 视图状态 ───
   type View = 'list' | 'detail' | 'edit' | 'graph';
   let view = $state<View>('list');
-  // Wiki 页子菜单：Wiki图谱 / 目录树
-  // 记住用户上次使用的子视图（localStorage 持久化），切换知识库时保持不重置
-  function loadWikiSub(): 'graph' | 'tree' {
-    return lsGet('kb_wiki_sub') === 'tree' ? 'tree' : 'graph';
-  }
-  let wikiSub = $state<'graph' | 'tree'>(loadWikiSub());
-  function setWikiSub(v: 'graph' | 'tree') {
-    wikiSub = v;
-    lsSet('kb_wiki_sub', v);
-  }
   // 详情/编辑的返回目标：从图谱工作区进入时回到图谱，避免误跳回列表
   let detailBack = $state<'list' | 'graph'>('list');
   let editBack = $state<'list' | 'graph'>('list');
@@ -104,25 +94,7 @@
   // ─── 图谱 ───
   let graph = $state<WikiGraph | null>(null);
   let graphBusy = $state(false);
-  // 位置数据仅用于命令式 DOM 更新，不进入 Svelte 响应式渲染（避免每帧重建整个 SVG）
-  let nodePos: Record<number, { x: number; y: number }> = {};
-  let nodeBase: Record<number, { x: number; y: number }> = {};
-  let nodeTarget = $state<Record<number, { x: number; y: number }>>({});
-  let driftPhase: Record<number, number> = {};
-  let svgEl = $state<SVGSVGElement | null>(null);
-  let nodeEls = new Map<number, SVGGElement>();
-  let lineEls: { el: SVGLineElement; from: number; to: number }[] = [];
   let graphSelect = $state<number | null>(null);
-  let graphZoom = $state(1);
-  let graphPan = $state({ x: 0, y: 0 });
-  // 画布尺寸跟随容器（ResizeObserver 更新），保证图谱占满剩余空间
-  let graphBox = $state({ w: 760, h: 520 });
-  let graphWrapEl = $state<HTMLElement | null>(null);
-  let draggingNode = $state<number | null>(null);
-  // 拖拽起点：只有移动超过阈值才算拖拽（普通点击选中节点时节点绝不移动）
-  let dragStart = $state<{ x: number; y: number; moved: boolean } | null>(null);
-  let panning = $state(false);
-  let panStart = $state({ x: 0, y: 0 });
   const COLOR_PALETTE = ['#5b8ff9', '#5ad8a6', '#f6bd16', '#b37feb', '#4fd1c5', '#ff7a7a', '#ff9f43', '#8d99ae'];
   // 图谱可配置参数（持久化到本地，重启后保留）
   let graphCfgOpen = $state(false);
@@ -134,8 +106,9 @@
     showLabels: true,                       // 显示节点标签
     showArrows: true,                       // 显示连线箭头
     labelOpacity: 0.9,                      // 文本透明度
-    motion: true,                           // 灵动动画（布局过渡 + 漂浮漂移）
+    motion: true,                           // 灵动动画（力导向布局演化）
     showImplicit: true,                     // 显示隐含关系（共享实体）
+    colorByCommunity: true,                 // 按社区着色（与社交图谱观感一致）
     // ── 筛选 ──
     showOrphans: true,                      // 显示孤立文件（无链接的笔记）
     createdOnly: true,                      // 仅显示已创建的笔记
@@ -159,24 +132,13 @@
       }
     } catch { /* 忽略损坏配置 */ }
   }
-  let relayoutTimer: ReturnType<typeof setTimeout> | null = null;
-  $effect(() => {
-    // 参数 / 画布尺寸变化时自动重排（防抖 120ms：拖动滑杆时不每帧全量重算布局）
-    const p = graphParams;
-    void p.forceRepulsion; void p.forceAttraction; void p.forceCentripetal; void p.forceEdgeLength;
-    void graphBox.w; void graphBox.h;
-    const g = graph;
-    if (!g || g.nodes.length === 0) return;
-    if (relayoutTimer) clearTimeout(relayoutTimer);
-    relayoutTimer = setTimeout(() => runForceLayout(g), 120);
-  });
   function saveGraphParams() {
     lsSet('kb_wiki_graph_params', JSON.stringify(graphParams));
   }
   function resetGraphParams() {
     graphParams = {
       nodeScale: 1, edgeWidth: 1.5, edgeOpacity: 0.85, showLabels: true, showArrows: true, labelOpacity: 0.9, motion: true,
-      showImplicit: true, showOrphans: true, createdOnly: true, ignorePatterns: '', colorGroups: [],
+      showImplicit: true, colorByCommunity: true, showOrphans: true, createdOnly: true, ignorePatterns: '', colorGroups: [],
       forceRepulsion: 2600, forceAttraction: 0.04, forceCentripetal: 0.02, forceEdgeLength: 1,
     };
     localOnly = false;
@@ -185,17 +147,6 @@
   }
   loadGraphParams();
   const graphLinkTypes = $derived(edgeLinkTypes(graph));
-  const graphNeighbors = $derived(
-    graphSelect === null
-      ? new Set<number>()
-      : graphNeighborSet(graph?.edges ?? [], graphSelect)
-  );
-  let hoverNode = $state<number | null>(null);
-  const graphHoverNeighbors = $derived(
-    hoverNode === null
-      ? new Set<number>()
-      : graphNeighborSet(graph?.edges ?? [], hoverNode)
-  );
   let graphFilter = $state('');
   let localOnly = $state(false);
   // 每个节点的总连接度（显式 + 隐含，用于「孤立文件」判断）
@@ -213,7 +164,6 @@
     localOnly,
     anchorId: graphSelect,
   }));
-  const graphEdgeColors = $derived([...new Set((graph?.edges ?? []).map((e) => edgeColor(e.linkType)))]);
   const nodeTypeStats = $derived.by(() => {
     const m: Record<string, number> = {};
     if (graph) for (const nd of graph.nodes) { const t = nodeTypeName(nd); m[t] = (m[t] ?? 0) + 1; }
@@ -227,17 +177,33 @@
     graphParams.colorGroups = (graphParams.colorGroups ?? []).filter((_, x) => x !== i);
     saveGraphParams();
   }
-  // 各节点的显示半径（用于连线端点缩进，避免箭头被节点遮挡）
-  const nodeRadii = $derived.by(() => {
-    const m: Record<number, number> = {};
-    if (graph) {
-      for (const nd of graph.nodes) {
-        m[nd.id] = (7 + Math.min(nd.inDegree + nd.outDegree, 6)) * graphParams.nodeScale;
-      }
+  // Canvas 图谱：由可见节点 + 布局参数构建力导向模型（力度/外观参数由画布组件读取）
+  let graphCanvasRef = $state<{ resetView: () => void; relayout: () => void } | undefined>();
+  const builtGraph: BuiltWikiGraph = $derived(buildWikiGraph(graph, graphVisible, {
+    nodeScale: graphParams.nodeScale,
+    forceEdgeLength: graphParams.forceEdgeLength,
+    showImplicit: graphParams.showImplicit,
+  }));
+  // 着色模式/颜色组变化时递增，触发画布立即重绘（仿真关闭时也能即时生效）
+  const graphRedrawKey = $derived(`${graphParams.colorByCommunity}:${JSON.stringify(graphParams.colorGroups ?? [])}`);
+  // 选中节点被筛选隐藏时清除选中，避免画布整图置灰
+  $effect(() => {
+    if (graphSelect !== null && !builtGraph.nodes.some((n) => n.pageId === graphSelect)) {
+      graphSelect = null;
     }
-    return m;
   });
-
+  function wikiNodeColor(n: WNode): string {
+    if (graphParams.colorByCommunity) return communityColor(n.community);
+    const pseudo = { title: n.label, docTitle: n.docTitle, dirName: n.dirName } as WikiGraphNode;
+    return nodeColor(n.status, pseudo, graphParams.colorGroups ?? []);
+  }
+  function tooltipFor(n: WNode): string {
+    const parts: string[] = [nodeTypeName({ title: n.label, docTitle: n.docTitle, dirName: n.dirName } as WikiGraphNode)];
+    parts.push(n.status === 'missing' ? '尚未创建' : n.status === 'draft' ? '草稿' : '已创建');
+    if (n.docTitle) parts.push('来源：' + n.docTitle);
+    parts.push(`入链 ${n.inDegree} · 出链 ${n.outDegree}`);
+    return parts.join(' · ');
+  }
   // ─── LLM 提炼 ───
   let genBusy = $state(false);
   let genMsg = $state('');
@@ -281,7 +247,9 @@
   $effect(() => {
     const id = kbId;
     if (id !== null) {
-      view = 'graph'; detail = null; graph = null; genMsg = ''; err = '';
+      // 进入 Wiki 默认落在「页面列表」，避免直接停在空图谱/图谱详情造成困惑；
+      // 图谱由列表页「图谱」按钮或图谱视图内部进入。
+      view = 'list'; detail = null; graph = null; genMsg = ''; err = '';
       dirFilter = '';
       // untrack：loadGraphData 内部读写 graphBusy，若被跟踪会导致
       // 「加载完成 → graphBusy 变化 → 副作用重跑 → 再次加载」的无限循环
@@ -325,7 +293,7 @@
   }
 
   function fmtTime(t: string): string {
-    return formatIsoTime(t, { showYear: true });
+    return formatIsoTime(t, { showYear: true, utc: true });
   }
 
   // ─── 详情 ───
@@ -424,21 +392,13 @@
     if (kbId === null || graphBusy) return;
     graphBusy = true; err = '';
     try {
-    graph = await kbApi.wikiGraph(kbId);
-      runForceLayout(graph);
+      graph = await kbApi.wikiGraph(kbId);
       graphSelect = null;
-      hoverNode = null;
-      graphZoom = 1;
-      graphPan = { x: 0, y: 0 };
     } catch (e: unknown) {
       err = '加载图谱失败：' + e;
     } finally {
       graphBusy = false;
     }
-  }
-  async function openGraphView() {
-    await loadGraphData();
-    if (graph) view = 'graph';
   }
   // 列表页自动加载图谱数据，供「Wiki 图谱」面板展示缩略图
   $effect(() => {
@@ -447,224 +407,6 @@
     }
   });
 
-  // 图谱布局引擎：层级放射树 —— 根节点居中，子节点围绕父节点形成圆，
-  // 每个子节点再作为父节点让孙节点环绕自己，依次向外展开。
-  // 子节点按子树规模分配角度楔形（叶子等分圆周），保证节点互不遮挡。
-  function runForceLayout(g: WikiGraph) {
-    const w = graphBox.w, h = graphBox.h;
-    if (g.nodes.length === 0) { nodePos = {}; return; }
-    const pos = radialTreeLayout(g, w, h, graphParams);
-    nodeTarget = pos;
-    if (!graphParams.motion) {
-      // 关闭动画：直接吸附到目标位置
-      nodeBase = { ...pos };
-      nodePos = { ...pos };
-      applyPositions();
-      return;
-    }
-    // 动画开启：新节点从画布中心飞出，旧节点从当前位置平滑过渡到新位置
-    const cx = w / 2, cy = h / 2;
-    const nb = { ...nodeBase };
-    for (const key of Object.keys(pos)) {
-      const id = Number(key);
-      if (!nb[id]) nb[id] = { x: cx, y: cy };
-    }
-    for (const key of Object.keys(nb)) {
-      if (!pos[Number(key)]) delete nb[Number(key)];
-    }
-    nodeBase = nb;
-  }
-
-  // 收集 SVG 中已渲染的节点/连线元素引用（结构变化后重新收集）
-  function collectGraphEls() {
-    nodeEls = new Map();
-    lineEls = [];
-    if (!svgEl) return;
-    svgEl.querySelectorAll<SVGGElement>('[data-gnode]').forEach((g) => {
-      const id = Number(g.getAttribute('data-gnode'));
-      if (Number.isFinite(id)) nodeEls.set(id, g);
-    });
-    svgEl.querySelectorAll<SVGLineElement>('[data-gline]').forEach((l) => {
-      const from = Number(l.getAttribute('data-gfrom'));
-      const to = Number(l.getAttribute('data-gto'));
-      if (Number.isFinite(from) && Number.isFinite(to)) lineEls.push({ el: l, from, to });
-    });
-  }
-
-  // 命令式更新节点位置与连线端点（不经过 Svelte 响应式，避免每帧全量重建 SVG）
-  function applyPositions(display?: Record<number, { x: number; y: number }>) {
-    const src = display ?? nodePos;
-    for (const [id, el] of nodeEls) {
-      const p = src[id];
-      if (p) el.setAttribute('transform', `translate(${p.x.toFixed(2)} ${p.y.toFixed(2)})`);
-    }
-    for (const le of lineEls) {
-      const a = src[le.from], b = src[le.to];
-      if (!a || !b) continue;
-      const dx = b.x - a.x, dy = b.y - a.y;
-      const len = Math.hypot(dx, dy) || 1;
-      const r1 = (nodeRadii[le.from] ?? 12) + 6;
-      const r2 = (nodeRadii[le.to] ?? 12) + 6;
-      le.el.setAttribute('x1', (a.x + (dx / len) * r1).toFixed(2));
-      le.el.setAttribute('y1', (a.y + (dy / len) * r1).toFixed(2));
-      le.el.setAttribute('x2', (b.x - (dx / len) * r2).toFixed(2));
-      le.el.setAttribute('y2', (b.y - (dy / len) * r2).toFixed(2));
-    }
-  }
-
-  // 画布尺寸跟随容器（ResizeObserver），图谱始终占满剩余空间
-  $effect(() => {
-    const el = graphWrapEl;
-    // 目录树子页可见时图谱被隐藏，暂停监听（避免 0 尺寸触发无意义重排）
-    if (!el || view !== 'graph' || wikiSub !== 'graph') return;
-    const update = () => {
-      const r = el.getBoundingClientRect();
-      if (r.width > 4 && r.height > 4) {
-        const nw = Math.round(r.width), nh = Math.round(r.height);
-        if (nw !== graphBox.w || nh !== graphBox.h) {
-          graphBox = { w: nw, h: nh };
-        }
-      }
-    };
-    update();
-    const ro = new ResizeObserver(update);
-    ro.observe(el);
-    return () => ro.disconnect();
-  });
-
-  // 灵动动画：布局过渡 + 节点缓慢漂浮漂移（rAF 循环；离开图谱视图或关闭动画时停止）
-  $effect(() => {
-    // 切到目录树子页时暂停动画，切回图谱时恢复（DOM 常驻，位置不丢）
-    if (view !== 'graph' || wikiSub !== 'graph' || !graph || graph.nodes.length === 0 || !graphParams.motion) return;
-    const reduced = typeof window !== 'undefined'
-      && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    let rafId = 0;
-    let last = performance.now();
-    const tick = (now: number) => {
-      const dt = Math.min(0.05, (now - last) / 1000);
-      last = now;
-      const t = now / 1000;
-      // 每帧只构建纯数据并直接写 SVG 属性，不触发 Svelte 重渲染
-      const display: Record<number, { x: number; y: number }> = {};
-      for (const key of Object.keys(nodeTarget)) {
-        const id = Number(key);
-        if (draggingNode === id) {
-          const dp = nodePos[id];
-          if (dp) display[id] = dp;
-          continue;
-        }
-        const tg = nodeTarget[id];
-        const base = nodeBase[id] ?? tg;
-        // 平滑追逐目标（指数缓动）
-        const k = 1 - Math.exp(-dt * 5.5);
-        base.x += (tg.x - base.x) * k;
-        base.y += (tg.y - base.y) * k;
-        // 微小漂浮漂移（尊重系统「减少动态效果」设置）
-        let dx = 0, dy = 0;
-        if (!reduced) {
-          let ph = driftPhase[id];
-          if (ph === undefined) { ph = Math.random() * Math.PI * 2; driftPhase[id] = ph; }
-          const amp = 3.2;
-          dx = Math.sin(t * 0.9 + ph) * amp;
-          dy = Math.cos(t * 0.62 + ph * 1.3) * amp;
-        }
-        display[id] = { x: base.x + dx, y: base.y + dy };
-      }
-      applyPositions(display);
-      nodePos = display;
-      rafId = requestAnimationFrame(tick);
-    };
-    rafId = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafId);
-  });
-
-  // 关闭灵动动画时：节点直接吸附到目标布局位置
-  $effect(() => {
-    if (!graphParams.motion && graph && graph.nodes.length > 0) {
-      nodeBase = { ...nodeTarget };
-      nodePos = { ...nodeTarget };
-      applyPositions();
-    }
-  });
-
-  // 结构 / 外观参数变化后：重新收集节点、连线元素引用，并立即同步一次位置
-  $effect(() => {
-    if (view !== 'graph' || !graph || graph.nodes.length === 0) return;
-    const v = graphVisible;
-    const sel = graphSelect;
-    const p = graphParams;
-    void v; void sel; void p.nodeScale; void p.showLabels; void p.labelOpacity;
-    void p.showArrows; void p.edgeWidth; void p.edgeOpacity; void p.showImplicit;
-    void p.showOrphans; void p.createdOnly; void p.ignorePatterns; void p.colorGroups;
-    void nodeTarget; void nodeRadii;
-    tick().then(() => {
-      collectGraphEls();
-      applyPositions();
-    });
-  });
-
-  function onNodeDown(ev: PointerEvent, id: number) {
-    ev.stopPropagation();
-    draggingNode = id;
-    dragStart = { x: ev.clientX, y: ev.clientY, moved: false };
-    (ev.currentTarget as Element).setPointerCapture?.(ev.pointerId);
-  }
-  // 精确换算：屏幕坐标 → 图谱世界坐标。
-  // 直接求 SVG 实时变换矩阵（含 viewBox 缩放、边框、子像素、平移缩放）的逆矩阵，
-  // 避免手工估算缩放比造成的分辨率偏差。
-  function screenToGraph(clientX: number, clientY: number): { x: number; y: number } {
-    if (!svgEl) return { x: 0, y: 0 };
-    const g = svgEl.querySelector<SVGGraphicsElement>('g[data-graph-canvas]');
-    const ctm = g?.getScreenCTM();
-    if (!ctm) return { x: 0, y: 0 };
-    const pt = new DOMPoint(clientX, clientY).matrixTransform(ctm.inverse());
-    return { x: pt.x, y: pt.y };
-  }
-  function onPointerMove(ev: PointerEvent) {
-    if (draggingNode !== null) {
-      // 点击与拖拽分离：移动距离未超过阈值时保持节点原位，仅作选中
-      if (dragStart && !dragStart.moved) {
-        if (Math.hypot(ev.clientX - dragStart.x, ev.clientY - dragStart.y) < 4) return;
-        dragStart.moved = true;
-      }
-      const p = screenToGraph(ev.clientX, ev.clientY);
-      const x = p.x, y = p.y;
-      nodePos[draggingNode] = { x, y };
-      nodeBase[draggingNode] = { x, y };
-      applyPositions();
-    } else if (panning) {
-      const cur = screenToGraph(ev.clientX, ev.clientY);
-      const start = screenToGraph(panStart.x, panStart.y);
-      graphPan = { x: graphPan.x + (cur.x - start.x), y: graphPan.y + (cur.y - start.y) };
-      panStart = { x: ev.clientX, y: ev.clientY };
-    }
-  }
-  function onPointerUp() {
-    draggingNode = null;
-    dragStart = null;
-    panning = false;
-  }
-  function onSvgDown(ev: PointerEvent) {
-    panning = true;
-    panStart = { x: ev.clientX, y: ev.clientY };
-  }
-  function onWheel(ev: WheelEvent) {
-    ev.preventDefault();
-    const p = screenToGraph(ev.clientX, ev.clientY);
-    const oldZoom = graphZoom;
-    const newZoom = Math.max(0.3, Math.min(3, oldZoom * (ev.deltaY < 0 ? 1.08 : 0.92)));
-    if (newZoom === oldZoom) return;
-    // 缩放锚点 = 鼠标位置：缩放前后，鼠标所指的世界坐标保持在同一屏幕位置
-    const wx = (p.x - graphPan.x) / oldZoom;
-    const wy = (p.y - graphPan.y) / oldZoom;
-    graphZoom = newZoom;
-    graphPan = { x: p.x - wx * newZoom, y: p.y - wy * newZoom };
-  }
-  function onNodeClick(ev: MouseEvent, id: number) {
-    ev.stopPropagation();
-    graphSelect = graphSelect === id ? null : id;
-    if (id > 0) track('wiki_graph_click', { kbId, pageId: id });
-  }
 
   // ─── LLM 提炼 ───
   async function doGenerate() {
@@ -720,7 +462,20 @@
 
 {#if kbId === null}
   <div class="kb-wiki-empty">请先在顶栏选择一个知识库</div>
-{:else if view === 'list'}
+{:else}
+  <div style="flex:1;min-height:0;display:flex;flex-direction:column;gap:10px">
+  {#if view === 'list' || view === 'graph'}
+    <!-- Wiki 工作区子页：页面 / 图谱（进入默认落在页面，图谱由子页签进入） -->
+    <div style="display:flex;align-items:center;gap:10px;flex:none">
+      <div class="kb-seg kb-seg-tabs">
+        <button class="kb-seg-item" class:active={view === 'list'} onclick={() => view = 'list'}><KbIcon name="list" size={14} />页面（{pages.length}）</button>
+        <button class="kb-seg-item" class:active={view === 'graph'} onclick={() => { view = 'graph'; if (!graph && !graphBusy) loadGraphData(); }}><KbIcon name="graph" size={14} />图谱</button>
+      </div>
+      <div style="flex:1"></div>
+      <span style="font-size:12px;color:var(--kb-text-3)">{view === 'list' ? 'Wiki 页面：由文档提炼或手动创建，支持双链与知识图谱' : '图谱：拖动平移 · 滚轮缩放 · 双击打开页面'}</span>
+    </div>
+  {/if}
+  {#if view === 'list'}
   <div style="display:flex;gap:14px;flex:1;min-height:0">
   <!-- 左：目录树 -->
   <div style="flex:none;width:264px;display:flex;flex-direction:column;gap:14px;min-height:0">
@@ -746,7 +501,6 @@
   <div class="kb-wiki-head">
     <span class="kb-wiki-title"><KbIcon name="wiki" size={17} color="var(--kb-accent-bright)" />Wiki 页面</span>
     <div class="kb-wiki-head-btns">
-      <button class="kb-btn-sm" onclick={openGraphView} disabled={graphBusy} title="知识图谱"><KbIcon name="graph" size={13} />图谱</button>
       <button class="kb-btn-sm" onclick={doGenerate} disabled={genBusy}><KbIcon name="sparkle" size={13} />{genBusy ? '提炼中…' : '提炼'}</button>
       <button class="kb-btn-sm" onclick={doExtractAll} disabled={extractBusy}><KbIcon name="list" size={13} />{extractBusy ? '提取中…' : '摘要/实体'}</button>
       <button class="kb-btn-sm kb-wiki-new" onclick={startCreate}><KbIcon name="plus" size={13} weight="bold" />新建</button>
@@ -949,19 +703,12 @@
   </div>
 {:else if view === 'graph'}
   <div style="flex:1;min-height:0;display:flex;flex-direction:column">
-  <!-- 子菜单：Wiki图谱 / 目录树 -->
-  <div style="display:flex;align-items:center;gap:10px;flex:none;margin-bottom:10px">
-    <div class="kb-seg kb-seg-tabs">
-      <button class="kb-seg-item" class:active={wikiSub === 'graph'} onclick={() => setWikiSub('graph')}><KbIcon name="graph" size={14} />Wiki图谱</button>
-      <button class="kb-seg-item" class:active={wikiSub === 'tree'} onclick={() => setWikiSub('tree')}><KbIcon name="folder" size={14} />目录树</button>
-    </div>
-  </div>
-  <div class="kb-wiki-graph-view" style="flex:1;min-width:0" style:display={wikiSub === 'graph' ? 'flex' : 'none'}>
+  <div class="kb-wiki-graph-view" style="flex:1;min-width:0">
     <div class="kb-wiki-graph-head">
-      <button class="kb-btn-sm" onclick={() => { view = 'list'; graph = null; }}><KbIcon name="arrowLeft" size={13} />返回列表</button>
       <div style="display:flex;gap:6px;align-items:center">
         {#if graph && graph.nodes.length > 0}
-          <button class="kb-btn-sm" onclick={() => graph && runForceLayout(graph)}><KbIcon name="refresh" size={13} />重新布局</button>
+          <button class="kb-btn-sm" onclick={() => graphCanvasRef?.relayout()} title="按社区重新布局"><KbIcon name="refresh" size={13} />重新布局</button>
+          <button class="kb-btn-sm" onclick={() => graphCanvasRef?.resetView()} title="重置视图"><KbIcon name="arrowsOut" size={12} /></button>
           <button class="kb-btn-sm" class:kb-graph-cfg-on={graphCfgOpen} onclick={() => graphCfgOpen = !graphCfgOpen} title="图谱设置"><KbIcon name="settings" size={15} /></button>
         {/if}
         <button class="kb-btn-sm" onclick={startCreate}><KbIcon name="plus" size={13} weight="bold" />新建</button>
@@ -970,21 +717,31 @@
     {#if err}<div class="kb-wiki-err">{err}</div>{/if}
     {#if graph && graph.nodes.length > 0}
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;flex:none">
-        <span class="kb-wiki-graph-stats">显示 {graphVisible.size} / {graph.nodes.length} 个页面 · {graph.edges.length} 条链接</span>
-        <!-- 节点类型图例 -->
-        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          {#each nodeTypeStats as [t, c]}
-            <span style="display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--kb-text-3)" title="节点类型：{t}">
-              <span style="width:9px;height:9px;border-radius:50%;background:{NODE_TYPE_COLORS[t] ?? '#8d99ae'};display:inline-block"></span>{t} {c}
-            </span>
-          {/each}
-        </div>
+        <span class="kb-wiki-graph-stats">显示 {graphVisible.size} / {graph.nodes.length} 个页面 · {builtGraph.edges.length} 条链接</span>
+        <!-- 图例：按社区着色时展示社区簇，否则展示节点类型 -->
+        {#if graphParams.colorByCommunity}
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            {#each Array.from({ length: builtGraph.communityCount }, (_, i) => i) as c}
+              <span style="display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--kb-text-3)" title="社区簇 {c + 1}">
+                <span style="width:9px;height:9px;border-radius:50%;background:{communityColor(c)};display:inline-block"></span>簇 {c + 1}
+              </span>
+            {/each}
+            {#if builtGraph.nodes.some((n) => n.community < 0)}
+              <span style="display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--kb-text-3)" title="未分组节点（无连接）">
+                <span style="width:9px;height:9px;border-radius:50%;background:{communityColor(-1)};display:inline-block"></span>未分组
+              </span>
+            {/if}
+          </div>
+        {:else}
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+            {#each nodeTypeStats as [t, c]}
+              <span style="display:inline-flex;align-items:center;gap:4px;font-size:11.5px;color:var(--kb-text-3)" title="节点类型：{t}">
+                <span style="width:9px;height:9px;border-radius:50%;background:{NODE_TYPE_COLORS[t] ?? '#8d99ae'};display:inline-block"></span>{t} {c}
+              </span>
+            {/each}
+          </div>
+        {/if}
         <div style="flex:1"></div>
-        <div style="display:flex;gap:4px;align-items:center">
-          <button class="kb-btn-sm" onclick={() => graphZoom = Math.min(3, graphZoom * 1.2)} title="放大"><KbIcon name="plus" size={12} /></button>
-          <button class="kb-btn-sm" onclick={() => graphZoom = Math.max(0.3, graphZoom / 1.2)} title="缩小"><KbIcon name="minus" size={12} /></button>
-          <button class="kb-btn-sm" onclick={() => { graphZoom = 1; graphPan = { x: 0, y: 0 }; }} title="重置视图"><KbIcon name="arrowsOut" size={12} /></button>
-        </div>
         {#if graphLinkTypes.length > 0}
           <div style="display:flex;gap:10px;align-items:center">
             {#each graphLinkTypes as lt}
@@ -997,61 +754,38 @@
         {/if}
       </div>
       <div style="flex:1;display:flex;gap:10px;min-height:0">
-        <div style="flex:1;min-width:0;min-height:0;position:relative" bind:this={graphWrapEl}>
-          <svg class="kb-wiki-graph" viewBox="0 0 {graphBox.w} {graphBox.h}" preserveAspectRatio="none" bind:this={svgEl}
-            role="application" aria-label="知识图谱"
-            onpointerdown={onSvgDown} onpointermove={onPointerMove} onpointerup={onPointerUp} onpointerleave={onPointerUp}
-            onwheel={onWheel}>
-            <defs>
-              {#each graphEdgeColors as c}
-                <marker id={`kb-arrow-${colorSlug(c)}`} viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-                  <path d="M0,0 L10,5 L0,10 z" fill={c} />
-                </marker>
-              {/each}
-            </defs>
-            <g data-graph-canvas transform="translate({graphPan.x} {graphPan.y}) scale({graphZoom})">
-              {#each graph.edges as e (e.from + ':' + e.to + ':' + e.linkType)}
-                {#if graphVisible.has(e.from) && graphVisible.has(e.to) && (graphParams.showImplicit || e.linkType !== 'entity')}
-                  {@const ec = edgeColor(e.linkType)}
-                  {@const isImpl = e.linkType === 'entity'}
-                  <line data-gline data-gfrom={e.from} data-gto={e.to}
-                    class="kb-wiki-graph-line" class:kb-edge-implicit={isImpl}
-                    class:kb-graph-dim={(graphSelect !== null && e.from !== graphSelect && e.to !== graphSelect) || (hoverNode !== null && hoverNode !== graphSelect && e.from !== hoverNode && e.to !== hoverNode)}
-                    stroke={ec} stroke-width={graphParams.edgeWidth} stroke-opacity={graphParams.edgeOpacity}
-                    stroke-dasharray={isImpl ? '6 4' : undefined}
-                    marker-end={graphParams.showArrows ? `url(#kb-arrow-${colorSlug(ec)})` : undefined} />
-                {/if}
-              {/each}
-              {#each graph.nodes as nd (nd.id)}
-                {@const deg = nd.inDegree + nd.outDegree}
-                {@const nr = (7 + Math.min(deg, 6)) * graphParams.nodeScale}
-                {#if graphVisible.has(nd.id)}
-                  <g data-gnode={nd.id}
-                    role="button" tabindex="0"
-                    class="kb-wiki-graph-node"
-                    class:kb-graph-dim={(graphSelect !== null && !graphNeighbors.has(nd.id)) || (hoverNode !== null && hoverNode !== graphSelect && !graphHoverNeighbors.has(nd.id))}
-                    class:kb-graph-sel={graphSelect === nd.id}
-                    transform="translate(0 0)"
-                    onpointerenter={() => hoverNode = nd.id}
-                    onpointerleave={() => hoverNode = null}
-                    onpointerdown={(ev) => onNodeDown(ev, nd.id)}
-                    onkeydown={(ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); (ev.currentTarget as SVGElement).dispatchEvent(new MouseEvent('click', { bubbles: true })); } }}
-                    onclick={(ev) => onNodeClick(ev, nd.id)}
-                    ondblclick={(ev) => {
-                      ev.stopPropagation();
-                      if (nd.status === 'missing') { graphCfgOpen = false; startCreateWithTitle(nd.title); }
-                      else openDetail(nd.pageId);
-                    }}>
-                    {#if deg >= 4}<circle class="kb-wiki-graph-hub" r={nr + 5} fill="none" />{/if}
-                    <circle class="kb-wiki-graph-circle" class:kb-node-ghost={nd.status === 'missing'} r={nr} fill={nodeColor(nd.status, nd, graphParams.colorGroups ?? [])} />
-                    {#if graphParams.showLabels}
-                      <text class="kb-wiki-graph-label" opacity={graphParams.labelOpacity} y={-nr - 6} text-anchor="middle">{nd.title.length > 14 ? nd.title.slice(0, 14) + '…' : nd.title}</text>
-                    {/if}
-                  </g>
-                {/if}
-              {/each}
-            </g>
-          </svg>
+        <div style="flex:1;min-width:0;min-height:0;position:relative">
+          <WikiGraphCanvas
+            bind:this={graphCanvasRef}
+            graph={builtGraph}
+            selectedId={graphSelect}
+            onSelect={(n) => {
+              graphSelect = n ? n.pageId : null;
+              if (n && n.pageId > 0) track('wiki_graph_click', { kbId, pageId: n.pageId });
+            }}
+            onOpen={(n) => {
+              if (n.status === 'missing') { graphCfgOpen = false; startCreateWithTitle(n.label); }
+              else openDetail(n.pageId);
+            }}
+            settings={{
+              nodeScale: graphParams.nodeScale,
+              edgeWidth: graphParams.edgeWidth,
+              edgeOpacity: graphParams.edgeOpacity,
+              showLabels: graphParams.showLabels,
+              labelOpacity: graphParams.labelOpacity,
+              motion: graphParams.motion,
+              showArrows: graphParams.showArrows,
+              forceCentripetal: graphParams.forceCentripetal,
+              forceRepulsion: graphParams.forceRepulsion,
+              forceAttraction: graphParams.forceAttraction,
+              forceEdgeLength: graphParams.forceEdgeLength,
+            }}
+            nodeColor={wikiNodeColor}
+            edgeColor={(e: WEdge) => edgeColor(e.linkType)}
+            edgeDash={(e: WEdge) => e.linkType === 'entity'}
+            tooltip={tooltipFor}
+            redrawKey={graphRedrawKey}
+          />
           {#if graphCfgOpen}
             <div style="position:absolute;top:0;right:0;bottom:0;z-index:4;width:300px;background:var(--kb-surface-2);border-left:1px solid var(--kb-border-strong);display:flex;flex-direction:column">
               <div style="display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--kb-border);flex:none">
@@ -1123,6 +857,8 @@
                       onCheckedChange={(c) => { graphParams.showLabels = !!c; saveGraphParams(); }} />显示标签</label>
                     <label class="kb-check"><Checkbox checked={graphParams.motion}
                       onCheckedChange={(c) => { graphParams.motion = !!c; saveGraphParams(); }} />播放动画</label>
+                    <label class="kb-check" title="按社区簇着色（与微信社交图谱观感一致）"><Checkbox checked={graphParams.colorByCommunity}
+                      onCheckedChange={(c) => { graphParams.colorByCommunity = !!c; saveGraphParams(); }} />按社区着色</label>
                   </div>
                 </div>
                 <!-- 力度 -->
@@ -1183,47 +919,10 @@
       </div>
     {/if}
   </div>
-  <!-- 目录树视图 -->
-  <div style="flex:1;min-height:0;display:flex;gap:14px" style:display={wikiSub === 'graph' ? 'none' : 'flex'}>
-    <div class="kb-card" style="flex:none;width:300px;display:flex;flex-direction:column;min-height:0">
-      <div class="kb-card-hd"><KbIcon name="folder" size={15} color="var(--kb-accent-bright)" />目录树</div>
-      <div class="kb-scroll" style="flex:1;overflow:auto;padding:8px">
-        <button class="kb-dir-item" class:active={dirFilter === ''} onclick={() => dirFilter = ''}>
-          <KbIcon name="folderOpen" size={13} />全部页面（{pages.length}）
-        </button>
-        {#each dirTree as d}
-          <button class="kb-dir-item" style="padding-left:{10 + d.depth * 16}px" class:active={dirFilter === d.id} onclick={() => dirFilter = d.id}>
-            <KbIcon name="folder" size={13} />{d.name}（{d.count}）
-          </button>
-        {/each}
-        {#if wikiDirs.length === 0}
-          <div style="font-size:11.5px;color:var(--kb-text-3);text-align:center;padding:12px">暂无目录</div>
-        {/if}
-      </div>
-    </div>
-    <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:8px">
-      {#if filteredPages.length === 0}
-        <div class="kb-empty" style="flex:1"><span>该目录下暂无页面</span></div>
-      {:else}
-        {#each filteredPages as p}
-          <button class="kb-wiki-item" type="button" onclick={() => openDetail(p.id)}>
-            <div class="kb-wiki-item-title">
-              <span class="kb-wiki-item-name">{p.title}</span>
-              <span class="kb-wiki-item-status" class:draft={p.status === 'draft'}>{statusLabel(p.status)}</span>
-            </div>
-            {#if p.summary}<div class="kb-wiki-item-summary">{p.summary}</div>{/if}
-            <div class="kb-wiki-item-meta">
-              {#if p.docTitle}<span class="kb-wiki-item-doc"><KbIcon name="file" size={12} />{p.docTitle}</span>{/if}
-              <span><KbIcon name="link" size={12} />{p.outLinks}</span>
-              <span><KbIcon name="arrowLeft" size={12} />{p.inLinks}</span>
-              <span class="kb-wiki-item-time">{fmtTime(p.updatedAt)}</span>
-            </div>
-          </button>
-        {/each}
-      {/if}
-    </div>
   </div>
+  {/if}
   </div>
+
 {/if}
 
 <style>
@@ -1455,54 +1154,4 @@
   .kb-graph-slider-label { display: flex; flex-direction: column; gap: 8px; }
   .kb-graph-slider-label :global([data-slot="slider"]) { flex: none; }
   .kb-btn-sm.kb-graph-cfg-on { background: var(--kb-hover-strong); border-color: var(--kb-accent); color: var(--kb-accent-bright); }
-  .kb-wiki-graph {
-    width: 100%; height: 100%; display: block; touch-action: none;
-    border: 1px solid var(--kb-border);
-    border-radius: var(--kb-radius-sm, 6px);
-    background:
-      radial-gradient(circle, color-mix(in srgb, var(--app-accent) 7%, transparent) 1px, transparent 1px),
-      var(--kb-surface);
-    background-size: 22px 22px;
-  }
-  .kb-wiki-graph-line {
-    fill: none;
-    stroke-linecap: round;
-    transition: opacity .12s;
-  }
-  .kb-wiki-graph-circle {
-    fill-opacity: .92;
-    stroke: color-mix(in srgb, var(--app-bg-color) 55%, #ffffff);
-    stroke-width: 1.5;
-    cursor: grab; transition: fill .15s, r .15s;
-  }
-  .kb-wiki-graph-circle.kb-node-ghost {
-    stroke-dasharray: 3 3;
-    opacity: .82;
-  }
-  .kb-wiki-graph-hub {
-    stroke: color-mix(in srgb, var(--app-accent) 50%, transparent);
-    stroke-width: 1.2;
-    stroke-dasharray: 3 3;
-    pointer-events: none;
-  }
-  .kb-wiki-graph-node:hover .kb-wiki-graph-circle {
-    fill: var(--kb-accent-hover);
-    filter: drop-shadow(0 0 5px color-mix(in srgb, var(--app-accent) 55%, transparent));
-  }
-  .kb-wiki-graph-node:active { cursor: grabbing; }
-  .kb-wiki-graph-node.kb-graph-sel .kb-wiki-graph-circle {
-    stroke: color-mix(in srgb, var(--app-bg-color) 45%, #ffffff);
-    stroke-width: 2.4;
-    animation: kb-node-pulse 1.8s ease-in-out infinite;
-  }
-  @keyframes kb-node-pulse {
-    0%, 100% { filter: drop-shadow(0 0 4px color-mix(in srgb, var(--app-accent) 50%, transparent)); }
-    50% { filter: drop-shadow(0 0 12px color-mix(in srgb, var(--app-accent) 82%, transparent)); }
-  }
-  .kb-wiki-graph-node.kb-graph-dim, .kb-wiki-graph-line.kb-graph-dim {
-    opacity: .12;
-  }
-  .kb-wiki-graph-label {
-    font-size: 11.5px; fill: var(--kb-text-2); pointer-events: none;
-  }
 </style>

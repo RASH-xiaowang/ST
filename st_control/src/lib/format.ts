@@ -38,6 +38,8 @@ export interface FormatDateTimeOptions {
   invalidPlaceholder?: string;
   /** 仅输出日期（YYYY-MM-DD / MM-DD），不含时间（日期刻度场景） */
   dateOnly?: boolean;
+  /** 输入为无时区的 UTC 字符串（如 SQLite datetime('now')），按 UTC 解析并转为本地展示 */
+  utc?: boolean;
 }
 
 /** 字节格式化（0 → '0 B'；null/undefined 按 nullPlaceholder 处理） */
@@ -92,14 +94,21 @@ export function formatDate(d: Date, options: FormatDateTimeOptions = {}): string
 /** ISO 字符串 → 展示字符串（' ' 分隔的日期时间兼容解析；非法返回原文） */
 export function formatIsoTime(iso: string, options: FormatDateTimeOptions = {}): string {
   if (!iso) return '';
-  const d = new Date(iso.includes('T') ? iso : iso.replace(' ', 'T'));
+  const { utc = false } = options;
+  const normalized = iso.includes('T') ? iso : iso.replace(' ', 'T');
+  // 数据库时间大多为 SQLite datetime('now')（UTC，无时区后缀）；utc=true 时补 Z，
+  // 由 Date 转为本地时区展示，避免显示成“比本地慢 8 小时”的原始 UTC。
+  const parsed = utc && !/(Z|[+-]\d{2}:?\d{2})$/i.test(normalized) ? normalized + 'Z' : normalized;
+  const d = new Date(parsed);
   return isNaN(d.getTime()) ? iso : formatDate(d, options);
 }
 
 /** ISO 字符串 → YYYY-MM-DD（仅日期；' ' 分隔兼容；非法返回原文） */
-export function formatDateOnly(iso: string): string {
+export function formatDateOnly(iso: string, utc = false): string {
   if (!iso) return '';
-  const d = new Date(iso.replace(' ', 'T'));
+  const normalized = iso.replace(' ', 'T');
+  const parsed = utc && !/(Z|[+-]\d{2}:?\d{2})$/i.test(normalized) ? normalized + 'Z' : normalized;
+  const d = new Date(parsed);
   if (isNaN(d.getTime())) return iso;
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }

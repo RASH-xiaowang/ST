@@ -584,15 +584,25 @@ pub async fn harness_fs_delete(path: String) -> Result<(), String> {
 /// 防重解释），其他平台 xdg-open。
 #[tauri::command]
 pub async fn harness_open_path(path: String) -> Result<(), String> {
-    let p = std::path::PathBuf::from(path.trim());
+    // 与读/写同一套路径解析：相对路径锚定当前沙箱根（默认工作区 = 应用项目根），
+    // 否则产物相对路径（如「广西今日天气_2026-08-21.csv」）会按进程 CWD 解析
+    // 而报「路径不存在」。
+    let svc = crate::harness::registry::get::<FsService>("harness.fs")
+        .ok_or_else(|| "Harness 运行时未初始化".to_string())?;
+    let policy = FsPolicy::current();
+    let p = svc.resolve(path.trim(), &policy)?;
     if !p.exists() {
         return Err(format!("路径不存在: {}", p.display()));
     }
     // L3：沙箱校验——非越界模式下仅允许打开工作区（含附件，复制进工作区）
-    // 内的路径，防止模型/用户输入打开任意系统路径（cmd /c start 任意目标）
-    let policy = FsPolicy::current();
+    // 内的路径，防止模型/用户输入打开任意系统路径（cmd /c start 任意目标）；
+    // resolve 已按策略锚定并校验，这里防御性复核。
     if !policy.allow_workspace_escape {
-        let root = crate::harness::workspace::sandbox_root();
+        // sandbox_root() 可能含非规范成分（dev 下由 exe 目录上溯定位），
+        // 先规范化再比较，避免与已 canonicalize 的目标路径前缀不匹配而误拒。
+        let root = crate::harness::workspace::sandbox_root()
+            .canonicalize()
+            .map_err(|e| format!("工作区解析失败: {}", e))?;
         let canon = p
             .canonicalize()
             .map_err(|e| format!("路径解析失败: {}", e))?;
@@ -637,6 +647,26 @@ mod tests {
         let list = svc.list_dir("", &policy).unwrap();
         assert!(list.iter().any(|e| e.name == "hfs_test.txt"));
         svc.delete("hfs_test.txt", &policy).unwrap();
+    }
+    #[test]
+    fn open_path_resolves_relative_produced_files() {
+        // 回归：产物以相对路径写入（如「广西今日天气_2026-08-21.csv」），
+        // harness_open_path 必须与读/写同一套 resolve 锚定沙箱根，
+        // 否则按进程 CWD 解析会报「路径不存在」。
+        let svc = FsService;
+        let policy = FsPolicy {
+            allow_workspace_escape: false,
+        };
+        svc.write_text("hfs_open_test.csv", "data", &policy)
+            .unwrap();
+        let resolved = svc.resolve("hfs_open_test.csv", &policy).unwrap();
+        assert!(resolved.is_absolute(), "相对路径应锚定为绝对路径");
+        assert!(resolved.exists(), "解析后的路径必须存在");
+        let root = crate::harness::workspace::sandbox_root()
+            .canonicalize()
+            .unwrap();
+        assert!(resolved.starts_with(&root), "解析结果必须在沙箱根内");
+        svc.delete("hfs_open_test.csv", &policy).unwrap();
     }
 
     #[test]

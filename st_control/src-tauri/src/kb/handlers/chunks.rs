@@ -215,52 +215,77 @@ pub async fn kb_reprocess_document(
     for (idx, id) in chunk_ids.iter().enumerate() {
         id_chunk_pairs.push((*id, chunks[idx].clone()));
     }
-    let (ok, fail, embed_dim) = match embed::embed_chunks(
-        &db,
-        kb_id,
-        &id_chunk_pairs,
-        embedding_provider.as_deref(),
-        embedding_model.as_deref(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            let conn = db.conn_lock();
-            let _ = conn.execute(
-                "UPDATE documents SET status='failed', process_status='failed', updated_at=datetime('now') WHERE id = ?1",
-                rusqlite::params![doc_id],
-            );
-            let _ = conn.execute(
-                "UPDATE processing_jobs SET stage='failed', progress=1.0, error=?1 WHERE id = ?2",
-                rusqlite::params![e, job_id],
-            );
-            return Err(format!("重新向量化失败：{}", e));
+    // 未配置嵌入模型（或传入的模型被标记为非嵌入类型被回退）：跳过向量化
+    let no_embedding = embedding_provider
+        .as_deref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+        || embedding_model
+            .as_deref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+    let (ok, fail, embed_dim): (usize, usize, Option<usize>) = if no_embedding {
+        (0, 0, None)
+    } else {
+        match embed::embed_chunks(
+            &db,
+            kb_id,
+            &id_chunk_pairs,
+            embedding_provider.as_deref(),
+            embedding_model.as_deref(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // 向量化前置校验失败不再整篇标 failed：内容已解析分片完成，标记 embed_error
+                let conn = db.conn_lock();
+                let _ = conn.execute(
+                    "UPDATE documents SET status='ready', process_status='embed_error', updated_at=datetime('now') WHERE id = ?1",
+                    rusqlite::params![doc_id],
+                );
+                let _ = conn.execute(
+                    "UPDATE processing_jobs SET stage='embed_error', progress=1.0, error=?1 WHERE id = ?2",
+                    rusqlite::params![e, job_id],
+                );
+                log::warn!("文档重新处理向量化前置校验失败: doc={} err={}", doc_id, e);
+                (0, chunks.len(), None)
+            }
         }
     };
-    // 4) 完成（更新文档与任务状态）
+    // 4) 完成（解析/分片成功即视为 ready；向量化状态由 process_status 细分）
     {
         let conn = db.conn_lock();
-        if !chunks.is_empty() && ok == 0 {
-            conn.execute(
-                "UPDATE documents SET status='failed', process_status='failed', updated_at=datetime('now') WHERE id = ?1",
-                rusqlite::params![doc_id],
+        let (process_status, stage, err_msg) = if no_embedding {
+            (
+                "no_embedding",
+                "done",
+                "未配置嵌入模型，文档已解析但未向量化（可正常打开/预览/全文检索）",
             )
-            .map_err(|e| e.to_string())?;
+        } else if !chunks.is_empty() && ok == 0 {
+            (
+                "embed_error",
+                "embed_error",
+                "重新向量化全部失败（请检查嵌入模型配置）",
+            )
+        } else {
+            ("ready", "done", "")
+        };
+        conn.execute(
+            "UPDATE documents SET status='ready', process_status=?1, updated_at=datetime('now') WHERE id = ?2",
+            rusqlite::params![process_status, doc_id],
+        )
+        .map_err(|e| e.to_string())?;
+        if err_msg.is_empty() {
             conn.execute(
-                "UPDATE processing_jobs SET stage='failed', progress=1.0, error='重新向量化全部失败（请检查嵌入配置）' WHERE id = ?1",
-                rusqlite::params![job_id],
+                "UPDATE processing_jobs SET stage=?1, progress=1.0 WHERE id = ?2",
+                rusqlite::params![stage, job_id],
             )
             .map_err(|e| e.to_string())?;
         } else {
             conn.execute(
-                "UPDATE documents SET status='ready', process_status='ready', updated_at=datetime('now') WHERE id = ?1",
-                rusqlite::params![doc_id],
-            )
-            .map_err(|e| e.to_string())?;
-            conn.execute(
-                "UPDATE processing_jobs SET stage='done', progress=1.0 WHERE id = ?1",
-                rusqlite::params![job_id],
+                "UPDATE processing_jobs SET stage=?1, progress=1.0, error=?2 WHERE id = ?3",
+                rusqlite::params![stage, err_msg, job_id],
             )
             .map_err(|e| e.to_string())?;
         }

@@ -49,7 +49,11 @@
       if (!triggerEl?.contains(e.target as Node) && !menuEl?.contains(e.target as Node)) close();
     };
     const onDocKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close();
+      if (e.key === 'Escape') {
+        // 阻止事件继续传播：下拉打开时 Esc 只收起下拉，不关闭上层弹窗
+        e.stopPropagation();
+        close();
+      }
     };
     const onScroll = (e: Event) => {
       if (e.target instanceof Node && menuEl?.contains(e.target)) return;

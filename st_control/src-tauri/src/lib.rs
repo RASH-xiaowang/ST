@@ -700,6 +700,8 @@ pub fn run() {
             kb::handlers::kb_search_history,
             kb::handlers::kb_list_jobs,
             kb::handlers::kb_get_job_logs,
+            kb::handlers::kb_clear_activity,
+            kb::handlers::kb_stop_processing,
             kb::handlers::kb_wiki_list_pages,
             kb::handlers::kb_wiki_dirs,
             kb::handlers::kb_wiki_search,

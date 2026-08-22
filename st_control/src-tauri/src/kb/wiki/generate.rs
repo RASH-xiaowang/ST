@@ -100,6 +100,20 @@ pub async fn generate_with_jobs(
 
     let mut created = Vec::new();
     for (doc_id, file_type, doc_title) in docs {
+        // 停止检查：批量取消标记已置位（kb_stop_processing）时，终止整个批量
+        {
+            let conn = db.conn_lock();
+            let cancelled: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM kb_chunk_settings WHERE key = ?1 AND value = '1'",
+                    params![format!("generate_cancel_{}", kb_id)],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if cancelled > 0 {
+                break;
+            }
+        }
         // 创建处理任务
         let job_id: i64 = {
             let conn = db.conn_lock();
@@ -153,6 +167,24 @@ pub async fn generate_with_jobs(
             }
         };
         let page_count = pages.len();
+        // 停止检查：任务已被手动停止（kb_stop_processing 标记为 failed）时不落库
+        {
+            let conn = db.conn_lock();
+            let still_active: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM processing_jobs WHERE id = ?1 AND stage = 'generating'",
+                    params![job_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if still_active == 0 {
+                let _ = conn.execute(
+                    "UPDATE documents SET process_status='ready' WHERE id = ?1",
+                    params![doc_id],
+                );
+                continue;
+            }
+        }
         // 落库（同一文档重复提炼时按 kb_id+slug 覆盖旧页面）
         {
             let conn = db.conn_lock();
@@ -204,6 +236,14 @@ pub async fn generate_with_jobs(
         }
     }
 
+    // 批量结束（全部完成或被手动停止）后清除取消标记
+    {
+        let conn = db.conn_lock();
+        let _ = conn.execute(
+            "DELETE FROM kb_chunk_settings WHERE key = ?1",
+            params![format!("generate_cancel_{}", kb_id)],
+        );
+    }
     // 全部页面落库后统一重建链接（[[标题]] 可能引用其他文档提炼的页面）
     {
         let conn = db.conn_lock();

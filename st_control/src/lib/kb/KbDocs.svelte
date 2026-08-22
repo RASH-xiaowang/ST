@@ -62,6 +62,16 @@
 
   let dragOver = $state(false);
   let uploadTasks = $state<UploadTask[]>([]);
+  // 上传任务悬浮面板：默认展开；折叠后仅显示标题栏，不占布局
+  let uploadPanelOpen = $state(true);
+  let uploadPanelEl = $state<HTMLElement | null>(null);
+  // 新任务加入时自动滚到底部，方便连续上传多个文件时查看最新进度
+  $effect(() => {
+    const n = uploadTasks.length;
+    if (n > 0 && uploadPanelOpen && uploadPanelEl) {
+      uploadPanelEl.scrollTop = uploadPanelEl.scrollHeight;
+    }
+  });
 
   let viewDoc = $state<DocView | null>(null);
   let viewLoading = $state(false);
@@ -101,7 +111,7 @@
   }
 
   function fmtTime(t: string): string {
-    return formatIsoTime(t, { showYear: true });
+    return formatIsoTime(t, { showYear: true, utc: true });
   }
   /** 字节格式化：null/undefined 显示占位；保持原实现（无独立 GB 分支） */
   function fmtBytes(n: number | null | undefined): string {
@@ -214,12 +224,12 @@
       }
       uploadTasks[idx].status = 'done';
       uploadTasks[idx].msg = '已提交后台处理';
-      if (selectedKb !== null) { await loadDocs(selectedKb); refreshKbs(); }
+      if (selectedKb !== null) { page = 1; await loadDocs(selectedKb); refreshKbs(); }
       notify(`「${file.name}」已提交处理`);
     } catch (err: unknown) {
       uploadTasks[idx].status = 'error';
       uploadTasks[idx].msg = String(err);
-      notify(`上传失败：${file.name}`, 'error');
+      notify(`上传失败：${file.name}（${String(err)}）`, 'error');
     }
   }
   async function onFolderPick(e: Event) {
@@ -322,7 +332,7 @@
       });
       fetchUrlOpen = false; fetchUrlVal = '';
       notify(`已提交网页抓取：${res.title}`);
-      if (selectedKb !== null) await loadDocs(selectedKb);
+      if (selectedKb !== null) { page = 1; await loadDocs(selectedKb); }
     } catch (e: unknown) { fetchUrlErr = '抓取失败：' + e; }
     finally { fetchUrlBusy = false; }
   }
@@ -355,7 +365,7 @@
         },
       });
       mdDocOpen = false; mdDocTitle = ''; mdDocBody = '';
-      if (selectedKb !== null) await loadDocs(selectedKb);
+      if (selectedKb !== null) { page = 1; await loadDocs(selectedKb); }
       notify('Markdown 文档已提交处理');
     } catch (e: unknown) { mdDocErr = '创建失败：' + e; }
     finally { mdDocBusy = false; }
@@ -689,34 +699,20 @@
         ondragover={onDragOver} ondragleave={onDragLeave} ondrop={onDrop}>
         <div class="kb-dropzone-inner">
           <span class="kb-dropzone-ico"><KbIcon name="upload" size={20} color="var(--kb-accent-bright)" /></span>
-          <span class="kb-dropzone-text">
-            {#if dragOver}
-              松开即可上传，自动解析 → 分片 → 向量化入库
-            {:else}
-              拖拽文件或文件夹到此处上传，自动解析 → 分片 → 向量化入库（支持 Office / PDF / ODF / RTF / EPUB / 图片 OCR）
+          <span style="display:flex;flex-direction:column;align-items:flex-start;gap:3px;min-width:0">
+            <span class="kb-dropzone-text">
+              {#if dragOver}
+                松开即可上传，自动解析 → 分片 → 向量化入库
+              {:else}
+                拖拽文件或文件夹到此处上传，自动解析 → 分片 → 向量化入库（支持 Office / PDF / ODF / RTF / EPUB / 图片 OCR）
+              {/if}
+            </span>
+            {#if !selProvider || !selModel}
+              <span class="kb-upload-hint"><KbIcon name="warn" size={13} />未配置嵌入模型：文档可正常上传、解析与全文检索，但无法语义检索。请到「设置 → 模型设置」配置 Embeddings 模型后，对文档执行「重新处理」。</span>
             {/if}
           </span>
         </div>
       </div>
-
-      {#if uploadTasks.length > 0}
-        <div style="display:flex;flex-direction:column;gap:6px;margin-top:10px">
-          {#each uploadTasks as t, i}
-            <div style="display:flex;align-items:center;gap:8px;font-size:12.5px;padding:6px 10px;border:1px solid var(--kb-border);border-radius:8px;background:var(--app-bg-color)">
-              <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={t.file.name}>{t.file.name}</span>
-              {#if t.status === 'pending'}<span class="kb-badge kb-badge-mute">等待中</span>
-              {:else if t.status === 'uploading'}<span class="kb-badge kb-badge-warn">处理中…</span>
-              {:else if t.status === 'done'}<span class="kb-badge kb-badge-ok"><KbIcon name="check" size={11} />{t.msg}</span>
-              {:else}<span class="kb-badge kb-badge-err"><KbIcon name="close" size={11} />{t.msg}</span>
-              {/if}
-              {#if t.status === 'error'}
-                <button class="kb-btn-sm" onclick={() => retryUpload(i)}>重试</button>
-              {/if}
-            </div>
-          {/each}
-          <button class="kb-btn-sm" style="align-self:flex-start" onclick={clearTasks}>清空记录</button>
-        </div>
-      {/if}
 
       {#if batchMode}
         <div style="display:flex;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap;flex:none">
@@ -771,10 +767,17 @@
                     {/each}
                   </div>
                 </td>
-                <td>
-                  <span class="kb-badge" class:kb-badge-ok={doc.status === 'ready'}
-                    class:kb-badge-warn={doc.status === 'processing' || doc.status === 'pending'}
-                    class:kb-badge-err={doc.status === 'failed'}>{statusLabel[doc.status] ?? doc.status}</span>
+                <td style="white-space:nowrap">
+                  <div style="display:inline-flex;gap:4px;align-items:center;flex-wrap:wrap">
+                    <span class="kb-badge" class:kb-badge-ok={doc.status === 'ready'}
+                      class:kb-badge-warn={doc.status === 'processing' || doc.status === 'pending'}
+                      class:kb-badge-err={doc.status === 'failed'}>{statusLabel[doc.status] ?? doc.status}</span>
+                    {#if doc.status === 'ready' && doc.processStatus === 'no_embedding'}
+                      <span class="kb-badge kb-badge-warn" title="未配置嵌入模型：文档已解析但未向量化，仅可全文检索">未向量化</span>
+                    {:else if doc.status === 'ready' && doc.processStatus === 'embed_error'}
+                      <span class="kb-badge kb-badge-err" title="向量化失败：文档已解析但未向量化，请检查嵌入配置后重新处理">向量化失败</span>
+                    {/if}
+                  </div>
                 </td>
                 <td style="font-size:12.5px;color:var(--kb-text-2)">{fmtBytes(doc.fileSize)}</td>
                 <td><span class="kb-badge kb-badge-mute">.{doc.fileType ?? '?'}</span></td>
@@ -828,6 +831,11 @@
           title={viewDoc.meta.status === 'ready' ? '用 LLM 将本文档提炼为 Wiki 页面' : '仅就绪文档可提炼'}><KbIcon name="sparkle" size={12} />提炼</button>
         <button class="kb-btn-sm" onclick={() => viewDoc && reprocessDoc(viewDoc.meta.id)} disabled={reprocessing !== null}><KbIcon name="refresh" size={12} />重处理</button>
       </div>
+      {#if viewDoc.meta.processStatus === 'no_embedding'}
+        <div class="kb-msg warn" style="margin:10px 12px 0"><KbIcon name="warn" size={14} />未配置嵌入模型：本文档已解析但未向量化，无法参与语义检索。配置 Embeddings 模型后点击「重处理」。</div>
+      {:else if viewDoc.meta.processStatus === 'embed_error'}
+        <div class="kb-msg warn" style="margin:10px 12px 0"><KbIcon name="warn" size={14} />向量化失败：本文档已解析但未向量化。请检查嵌入模型配置后点击「重处理」。</div>
+      {/if}
       <div class="kb-seg" style="margin:10px 12px 0">
         <button class="kb-seg-item" class:active={detailTab === 'content'} onclick={() => detailTab = 'content'}>正文</button>
         <button class="kb-seg-item" class:active={detailTab === 'chunks'} onclick={() => detailTab = 'chunks'}>分片 {viewDoc.chunks.length}</button>
@@ -884,6 +892,43 @@
     </div>
   {/if}
 </div>
+
+<!-- 上传任务悬浮面板：右下角固定显示，不占布局；文件多时内部滚动，避免撑满列表区 -->
+{#if uploadTasks.length > 0}
+  <div class="kb-upload-panel" class:kb-upload-collapsed={!uploadPanelOpen}>
+    <div class="kb-upload-panel-hd">
+      <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600">
+        <KbIcon name="upload" size={14} color="var(--kb-accent-bright)" />
+        上传任务
+        <span class="kb-badge kb-badge-info">{uploadTasks.length}</span>
+      </span>
+      <div style="display:flex;align-items:center;gap:4px">
+        <button class="kb-btn-sm" onclick={clearTasks} title="清空记录"><KbIcon name="trash" size={12} />清空</button>
+        <button class="kb-btn-sm kb-btn-ghost" onclick={() => uploadPanelOpen = !uploadPanelOpen}
+          title={uploadPanelOpen ? '收起任务列表' : '展开任务列表'}>
+          <KbIcon name={uploadPanelOpen ? 'caretDown' : 'caretRight'} size={12} />
+        </button>
+      </div>
+    </div>
+    {#if uploadPanelOpen}
+      <div class="kb-upload-panel-body" bind:this={uploadPanelEl}>
+        {#each uploadTasks as t, i}
+          <div class="kb-upload-item">
+            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={t.file.name}>{t.file.name}</span>
+            {#if t.status === 'pending'}<span class="kb-badge kb-badge-mute">等待中</span>
+            {:else if t.status === 'uploading'}<span class="kb-badge kb-badge-warn">处理中…</span>
+            {:else if t.status === 'done'}<span class="kb-badge kb-badge-ok"><KbIcon name="check" size={11} />{t.msg}</span>
+            {:else}<span class="kb-badge kb-badge-err"><KbIcon name="close" size={11} />{t.msg}</span>
+            {/if}
+            {#if t.status === 'error'}
+              <button class="kb-btn-sm" onclick={() => retryUpload(i)}>重试</button>
+            {/if}
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
+{/if}
 
 <!-- 移动文档 -->
 {#if moveDocId !== null}
@@ -1110,5 +1155,73 @@
     display: inline-flex;
     transition: transform .15s;
   }
+  .kb-upload-hint {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--kb-warn);
+    line-height: 1.5;
+  }
+  .kb-msg.warn {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 8px 10px;
+    border: 1px solid color-mix(in srgb, var(--app-warning, #faad14) 45%, var(--kb-border));
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--app-warning, #faad14) 10%, transparent);
+    color: var(--kb-warn);
+    font-size: 12.5px;
+    line-height: 1.6;
+  }
   .kb-diff-on { background: var(--kb-hover-strong, #0a0f1e) !important; border-color: var(--app-accent, #1a73e8) !important; color: var(--kb-accent-bright, #6ea8ff) !important; }
+
+  /* ─── 上传任务悬浮面板（右下角固定，不占布局） ─── */
+  .kb-upload-panel {
+    position: fixed;
+    right: 18px;
+    bottom: 18px;
+    z-index: 61;
+    width: min(360px, calc(100vw - 36px));
+    display: flex;
+    flex-direction: column;
+    background: var(--app-bg-color);
+    border: 1px solid var(--kb-border-strong);
+    border-radius: 10px;
+    box-shadow: var(--kb-shadow-lg);
+    overflow: hidden;
+    animation: kb-pop .16s ease-out;
+  }
+  .kb-upload-panel-hd {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 8px 10px 8px 12px;
+    border-bottom: 1px solid var(--kb-border);
+    background: var(--app-bg-color);
+    flex: none;
+  }
+  .kb-upload-panel.kb-upload-collapsed .kb-upload-panel-hd { border-bottom: none; }
+  .kb-upload-panel-body {
+    max-height: min(280px, 34vh);
+    overflow: auto;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: var(--app-bg-color);
+  }
+  .kb-upload-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12.5px;
+    padding: 6px 10px;
+    border: 1px solid var(--kb-border);
+    border-radius: 8px;
+    background: var(--app-bg-color);
+    flex: none;
+  }
 </style>

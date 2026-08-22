@@ -18,6 +18,19 @@
     ariaLabel?: string;
     children?: Snippet;
   } = $props();
+
+  // 打开期间：全局 Esc 关闭（不依赖 mask 聚焦，避免焦点在输入框/下拉时关不掉弹窗）
+  $effect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    document.addEventListener('keydown', onKey);
+    return () => document.removeEventListener('keydown', onKey);
+  });
 </script>
 
 {#if open}

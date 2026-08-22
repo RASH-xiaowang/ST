@@ -104,29 +104,15 @@
   import WorkflowIcon from "@lucide/svelte/icons/workflow";
   import FolderOpenIcon from "@lucide/svelte/icons/folder-open";
   import PanelRightIcon from "@lucide/svelte/icons/panel-right";
-  import PanelLeftCloseIcon from "@lucide/svelte/icons/panel-left-close";
-  import PanelLeftOpenIcon from "@lucide/svelte/icons/panel-left-open";
   import ChevronRightIcon from "@lucide/svelte/icons/chevron-right";
   import ChevronDownIcon from "@lucide/svelte/icons/chevron-down";
+  import EyeIcon from "@lucide/svelte/icons/eye";
+  import ExternalLinkIcon from "@lucide/svelte/icons/external-link";
+  import FileTextIcon from "@lucide/svelte/icons/file-text";
 
   let sessions = $state<HarnessSessionMeta[]>([]);
   let activeId = $state<string | null>(null);
   let messages = $state<HarnessDisplayMessage[]>([]);
-  /** 侧栏折叠（DSH 56px 竖轨等价：折叠后仅保留头部图标） */
-  let sideCollapsed = $state(false);
-  /** 悬浮展开（rail 模式：鼠标移入临时展开，移出自动折叠） */
-  let sideHover = $state(false);
-  /** 实际展开状态：手动展开 或（手动折叠且悬浮中） */
-  const sideExpanded = $derived(sideCollapsed ? sideHover : true);
-  /** 折叠/展开切换：悬浮展开中点击 = 固定展开；展开中点击 = 折叠为 rail */
-  function toggleSidebar() {
-    if (sideCollapsed) {
-      sideCollapsed = false;
-      sideHover = false;
-    } else {
-      sideCollapsed = true;
-    }
-  }
   // ─── 会话视图标签页（DSH 对话|轨迹）：轨迹台账按需加载 ───
   let viewTab = $state<"chat" | "trajectory">("chat");
   let trajectory = $state<HarnessTrajectory | null>(null);
@@ -150,12 +136,29 @@
     }
     return map;
   });
-  /** 助手消息所属回合的 user seq（最近的前置 user 消息） */
+  /** 助手消息所属回合的 user seq（最近的前置 user 消息）；
+   * 只从已有产物的 user seq 里找会把后续回合误判为同一回合（后一轮
+   * 也会带出上一轮的产物 chip）。改为在所有 user 消息里取最近前置。 */
   function turnUserSeq(assistantSeq: number): number | undefined {
-    return [...turnFilesByUser.keys()]
-      .filter((s) => s <= assistantSeq)
-      .sort((a, b) => b - a)[0];
+    return messages
+      .filter((m) => m.role === "user" && m.seq > 0 && m.seq <= assistantSeq)
+      .sort((a, b) => b.seq - a.seq)[0]?.seq;
   }
+  /** 产物文件预览（DSH ProducedFiles 扩展：点击 chip 预览内容 + 独立「打开」按钮） */
+  let previewFile = $state<TurnFileView | null>(null);
+  let previewContent = $state("");
+  let previewLoading = $state(false);
+  let previewError = $state("");
+  /** 常见图片扩展名：预览直接渲染图片，其余走文本读取 */
+  const PREVIEW_IMAGE_EXTS = new Set([
+    "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "ico", "avif",
+  ]);
+  function isPreviewImage(path: string): boolean {
+    const ext = path.split(".").pop()?.toLowerCase() ?? "";
+    return PREVIEW_IMAGE_EXTS.has(ext);
+  }
+  /** 右侧产物区域（DSH deliverables 侧栏：会话内产物列表 + 内容预览） */
+  let deliverablesOpen = $state(false);
   /** 详情面板（DSH DetailsPanel 迁移：右侧列显示选中工具调用的输入/输出；
    * running = 工具执行中（实时详情，运行中态）） */
   let detailCall = $state<{
@@ -581,6 +584,7 @@
     trajectory = null;
     trajectoryError = "";
     turnFiles = [];
+    previewFile = null;
     sessionPresetId = sessions.find((s) => s.id === id)?.preset_id ?? "";
     // 面包屑（DSH 会话头：祖先链加载；近→远）
     lineage = [];
@@ -653,6 +657,48 @@
       await harnessApi.openPath(path);
     } catch (e) {
       notify(`打开失败：${errText(e)}`);
+    }
+  }
+  /** 切换产物文件预览：图片直接渲染；文本经 fsRead 读取（后端 64KB 截断） */
+  async function togglePreviewFile(f: TurnFileView) {
+    if (previewFile?.path === f.path) {
+      previewFile = null;
+      return;
+    }
+    previewFile = f;
+    previewContent = "";
+    previewError = "";
+    if (isPreviewImage(f.path)) return;
+    previewLoading = true;
+    try {
+      previewContent = await harnessApi.fsRead(f.path);
+    } catch (e) {
+      previewError = errText(e);
+    } finally {
+      previewLoading = false;
+    }
+  }
+
+  /** 在右侧产物区域选择文件：打开区域（如未开）+ 加载预览 */
+  function selectDeliverable(f: TurnFileView) {
+    deliverablesOpen = true;
+    void togglePreviewFile(f);
+  }
+
+  /** 打开右侧产物区域并选中指定文件（内联 chip 点击：总是选中并预览，不切换关闭） */
+  function openDeliverable(f: TurnFileView) {
+    deliverablesOpen = true;
+    if (previewFile?.path === f.path) return;
+    void togglePreviewFile(f);
+  }
+
+  /** 展开/收起产物区域：打开时不默认显示预览，仅展示产物列表（点击文件后再预览） */
+  function toggleDeliverables() {
+    deliverablesOpen = !deliverablesOpen;
+    if (deliverablesOpen) {
+      previewFile = null;
+      previewContent = "";
+      previewError = "";
     }
   }
 
@@ -1228,6 +1274,7 @@
             loadUsage().catch(() => {});
             loadSessionState().catch(() => {});
             const cmId = activeId;
+            loadTurnFiles(activeId).catch(() => {});
             if (cmId) loadContextMeter(cmId).catch(() => {});
             // 日志为准重载消息：模型端 session_clear/session_delete 等维护操作
             // 后，界面与日志投影保持一致（渲染与回放同源）
@@ -2776,28 +2823,15 @@
     </div>
   {/if}
   <!-- ─── 会话侧栏（折叠为 rail：悬浮自动展开、移开自动折叠） ─── -->
-  <aside
-    class="hns-side"
-    class:collapsed={!sideExpanded}
-    onmouseenter={() => (sideHover = true)}
-    onmouseleave={() => (sideHover = false)}
-  >
+  <aside class="hns-side">
     <div class="hns-side-head">
-      {#if sideExpanded}<span class="hns-side-title">Harness 会话</span>{/if}
+      <span class="hns-side-title">Harness 会话</span>
       <span class="hns-side-head-actions">
-        <button
-          class="hns-side-collapse"
-          onclick={toggleSidebar}
-          title={sideExpanded ? "收起侧栏（rail 模式，悬浮展开）" : "展开侧栏"}
-        >
-          {#if sideExpanded}<PanelLeftCloseIcon class="size-3.5" />{:else}<PanelLeftOpenIcon class="size-3.5" />{/if}
-        </button>
         <button class="hns-new" onclick={createSession} title="新建会话">
-          <PlusIcon class="size-3.5" />{#if sideExpanded}新建{/if}
+          <PlusIcon class="size-3.5" />新建
         </button>
       </span>
     </div>
-    {#if sideExpanded}
     <div class="hns-side-search">
       <input
         placeholder="搜索会话内容…"
@@ -2827,25 +2861,8 @@
         {/each}
       </div>
     {/if}
-    {/if}
     <div class="hns-side-list">
-      {#if !sideExpanded}
-        {#each sessions as s (s.id)}
-          <div
-            class="hns-session collapsed"
-            class:active={s.id === activeId}
-            onclick={() => selectSession(s.id)}
-            role="button"
-            tabindex="0"
-            onkeydown={(e) => {
-              if (e.key === "Enter") selectSession(s.id);
-            }}
-            title={s.title || "新会话"}
-          >
-            <span class="hns-session-dot" class:active-dot={s.id === activeId} aria-hidden="true"></span>
-          </div>
-        {/each}
-      {:else if sessions.length === 0 && !loading}
+      {#if sessions.length === 0 && !loading}
         <div class="hns-side-empty">暂无会话，点击「新建」开始</div>
       {:else}
         {#each workspaceGroups as g (g.id)}
@@ -3035,6 +3052,14 @@
             {/each}
           </select>
         {/if}
+        <button
+          class="hns-bar-icon"
+          class:on={deliverablesOpen}
+          onclick={toggleDeliverables}
+          title="产物区域（{turnFiles.length} 个文件）"
+        >
+          <BoxesIcon class="size-3.5" />
+        </button>
         <button
           class="hns-bar-icon"
           class:on={toolsOpen}
@@ -4331,14 +4356,29 @@
                 </div>
               {/if}
               {#if m.seq > 0 && (turnFilesByUser.get(turnUserSeq(m.seq) ?? -1) ?? []).length > 0}
-                <!-- 回合尾产物（DSH TurnTail + ProducedFiles：本轮编辑/写入的文件） -->
+                <!-- 回合尾产物（DSH TurnTail + ProducedFiles：本轮编辑/写入的文件；
+                     点击 chip 预览内容，「打开」用系统默认程序） -->
                 {@const ownerFiles = turnFilesByUser.get(turnUserSeq(m.seq) ?? -1) ?? []}
-                <div class="hns-turn-files" title="本轮编辑/写入的文件（点击打开）">
+                <div class="hns-turn-files" title="本轮编辑/写入的文件">
                   <span class="hns-turn-files-label">产物</span>
                   {#each ownerFiles as f (f.path)}
-                    <button class="hns-file-chip" onclick={() => openHarnessPath(f.path)} title={f.path}>
-                      <FolderOpenIcon class="size-3" />{f.path.split(/[\\/]/).pop()}
-                    </button>
+                    <span class="hns-file-chip-wrap">
+                      <button
+                        class="hns-file-chip"
+                        class:on={previewFile?.path === f.path}
+                        onclick={() => openDeliverable(f)}
+                        title={`预览：${f.path}`}
+                      >
+                        <EyeIcon class="size-3" />{f.path.split(/[\\/]/).pop()}
+                      </button>
+                      <button
+                        class="hns-file-open"
+                        onclick={() => openHarnessPath(f.path)}
+                        title={`用系统默认程序打开：${f.path}`}
+                      >
+                        <ExternalLinkIcon class="size-3" />打开
+                      </button>
+                    </span>
                   {/each}
                 </div>
               {/if}
@@ -4872,6 +4912,64 @@
       </div>
     {/if}
   </main>
+  {#if deliverablesOpen}
+    <aside class="hns-deliverables" aria-label="产物区域">
+      <div class="hns-deliverables-head">
+        <span class="hns-deliverables-title"><BoxesIcon class="size-3.5" />产物</span>
+        <span class="hns-deliverables-count">{turnFiles.length}</span>
+        <button class="hns-drawer-close" onclick={() => (deliverablesOpen = false)} title="关闭产物区域">
+          <XIcon class="size-3.5" />
+        </button>
+      </div>
+      {#if turnFiles.length === 0}
+        <div class="hns-deliverables-empty">
+          <span class="hns-deliverables-empty-ico">📄</span>
+          <span>暂无产物<br />模型编辑/写入文件后会自动出现在这里</span>
+        </div>
+      {:else}
+        <div class="hns-deliverables-list">
+          {#each turnFiles as f (f.path)}
+            <button
+              class="hns-deliverable"
+              class:on={previewFile?.path === f.path}
+              onclick={() => selectDeliverable(f)}
+              title={`${f.path}（点击预览）`}
+            >
+              {#if isPreviewImage(f.path)}
+                <img class="hns-deliverable-thumb" src={convertFileSrc(f.path)} alt="" />
+              {:else}
+                <FileTextIcon class="size-3.5" />
+              {/if}
+              <span class="hns-deliverable-name">{f.path.split(/[\\/]/).pop()}</span>
+              <span class="hns-deliverable-path" title={f.path}>{f.path}</span>
+            </button>
+          {/each}
+        </div>
+        {#if previewFile}
+          {@const pf = previewFile}
+          <div class="hns-deliverables-preview">
+            <div class="hns-deliverables-preview-head">
+              <span class="hns-deliverables-preview-name" title={pf.path}>{pf.path.split(/[\\/]/).pop()}</span>
+              <span class="hns-deliverables-preview-actions">
+                <button class="hns-file-preview-act" onclick={() => openHarnessPath(pf.path)} title="用系统默认程序打开">
+                  <ExternalLinkIcon class="size-3" />打开
+                </button>
+              </span>
+            </div>
+            {#if isPreviewImage(pf.path)}
+              <img class="hns-file-preview-img" src={convertFileSrc(pf.path)} alt={pf.path} />
+            {:else if previewLoading}
+              <div class="hns-file-preview-note">加载中…</div>
+            {:else if previewError}
+              <div class="hns-file-preview-error">{previewError}</div>
+            {:else}
+              <pre class="hns-file-preview-body">{previewContent}</pre>
+            {/if}
+          </div>
+        {/if}
+      {/if}
+    </aside>
+  {/if}
 </div>
 
 <style>
@@ -4935,7 +5033,6 @@
     transition: width .18s ease;
     overflow: hidden;
   }
-  .hns-side.collapsed { width: 52px; }
   .hns-side-head {
     display: flex; align-items: center; justify-content: space-between; gap: 8px;
     padding: 14px 14px 10px;
@@ -4943,38 +5040,6 @@
   .hns-side-head-actions {
     display: inline-flex; align-items: center; gap: 6px; flex: none;
   }
-  /* rail 态：头部按钮竖排（折叠开关在上、新建在下），32px 方形统一居中 */
-  .hns-side.collapsed .hns-side-head {
-    flex-direction: column;
-    padding: 12px 0 8px;
-    gap: 8px;
-  }
-  .hns-side.collapsed .hns-side-head-actions {
-    flex-direction: column;
-    gap: 8px;
-    width: 100%;
-  }
-  .hns-side-collapse {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 30px; height: 30px; flex: none;
-    background: var(--hns-surface); border: 1px solid var(--hns-border);
-    color: var(--hns-muted); border-radius: 8px; cursor: pointer;
-    transition: color .15s, border-color .15s;
-  }
-  .hns-side-collapse:hover { color: var(--hns-text); border-color: color-mix(in srgb, var(--hns-accent) 40%, var(--hns-border)); }
-  .hns-side.collapsed .hns-side-collapse { order: 0; width: 32px; height: 32px; }
-  .hns-side.collapsed .hns-new {
-    order: 1;
-    width: 32px; height: 32px;
-    padding: 0;
-    justify-content: center;
-  }
-  .hns-session-dot {
-    width: 8px; height: 8px; flex: none; border-radius: 50%;
-    background: var(--hns-border);
-    margin: 0 auto;
-  }
-  .hns-session-dot.active-dot { background: var(--hns-accent); box-shadow: 0 0 6px color-mix(in srgb, var(--hns-accent) 60%, transparent); }
   .hns-side-title {
     display: inline-flex; align-items: center; gap: 6px;
     flex: 1; min-width: 0;
@@ -5031,11 +5096,6 @@
     border: 1px solid transparent;
     transition: background .12s, border-color .12s;
   }
-  .hns-session.collapsed {
-    justify-content: center;
-    padding: 8px 0;
-  }
-  .hns-side.collapsed .hns-side-list { padding: 0 8px 12px; }
   .hns-session:hover { background: color-mix(in srgb, var(--hns-card-2) 60%, transparent); border-color: var(--hns-border-light); }
   .hns-session.active {
     background: var(--hns-accent-soft);
@@ -5095,6 +5155,12 @@
     background: color-mix(in srgb, var(--hns-card) 86%, transparent);
     backdrop-filter: blur(8px);
     min-height: 48px;
+    /* backdrop-filter 会为头部建立独立层叠上下文，导致向下弹出的模型/子代理菜单
+       被后置的 .hns-msgs（position:relative）盖住而无法点击；给头部自身定位 +
+       z-index 抬升整个头部上下文，使菜单正常浮在消息流之上（抽屉 30 / 详情 29
+       仍在其上不受影响）。 */
+    position: relative;
+    z-index: 10;
   }
   .hns-bar-title {
     display: inline-flex; align-items: center; gap: 8px;
@@ -5683,6 +5749,135 @@
     white-space: nowrap;
   }
   .hns-file-chip:hover { border-color: var(--hns-accent, #4176e6); color: var(--hns-accent, #4176e6); }
+  .hns-file-chip.on {
+    border-color: var(--hns-accent, #4176e6);
+    color: var(--hns-accent, #4176e6);
+    background: color-mix(in srgb, var(--hns-accent, #4176e6) 10%, transparent);
+  }
+  .hns-file-chip-wrap { display: inline-flex; align-items: center; gap: 4px; }
+  .hns-file-open {
+    display: inline-flex; align-items: center; gap: 3px;
+    font-size: 10.5px; color: var(--hns-accent, #4176e6);
+    background: color-mix(in srgb, var(--hns-accent, #4176e6) 8%, transparent);
+    border: 1px solid color-mix(in srgb, var(--hns-accent, #4176e6) 35%, var(--hns-border));
+    border-radius: 999px;
+    padding: 2px 8px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background .12s;
+  }
+  .hns-file-open:hover { background: color-mix(in srgb, var(--hns-accent, #4176e6) 14%, transparent); }
+  /* ─── 产物文件预览（DSH ProducedFiles 扩展：内容预览面板） ─── */
+  .hns-file-preview-act {
+    display: inline-flex; align-items: center; gap: 3px;
+    font-size: 10.5px; color: var(--hns-muted);
+    background: transparent; border: 1px solid var(--hns-border);
+    border-radius: 6px; padding: 2px 7px; cursor: pointer;
+    transition: color .12s, border-color .12s;
+  }
+  .hns-file-preview-act:hover { color: var(--hns-accent, #4176e6); border-color: var(--hns-accent, #4176e6); }
+  .hns-file-preview-body {
+    margin: 0; padding: 10px 12px;
+    max-height: 320px; overflow: auto;
+    font-family: ui-monospace, Consolas, "Courier New", monospace;
+    font-size: 11.5px; line-height: 1.55;
+    color: var(--hns-text);
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .hns-file-preview-img {
+    display: block; max-width: 100%; max-height: 340px;
+    margin: 0 auto; object-fit: contain;
+  }
+  .hns-file-preview-note { padding: 16px; font-size: 12px; color: var(--hns-muted); text-align: center; }
+  .hns-file-preview-error { padding: 14px 16px; font-size: 12px; color: var(--hns-red, #f87171); }
+  /* ─── 产物区域（右侧侧栏：会话内产物列表 + 内容预览） ─── */
+  .hns-deliverables {
+    width: 300px; flex: none;
+    display: flex; flex-direction: column;
+    min-height: 0;
+    border-left: 1px solid var(--hns-border);
+    background: color-mix(in srgb, var(--hns-card) 94%, transparent);
+    backdrop-filter: blur(10px);
+    animation: hns-deliverables-in .16s ease-out;
+  }
+  @keyframes hns-deliverables-in {
+    from { opacity: 0; transform: translateX(10px); }
+    to { opacity: 1; transform: none; }
+  }
+  .hns-deliverables-head {
+    flex: none; display: flex; align-items: center; gap: 8px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--hns-border-light, rgba(128, 128, 128, .14));
+  }
+  .hns-deliverables-title {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 13px; font-weight: 700; color: var(--hns-text);
+  }
+  .hns-deliverables-title > :global(svg) { color: var(--hns-accent, #4176e6); flex: none; }
+  .hns-deliverables-count {
+    font-size: 10.5px; color: var(--hns-muted);
+    background: var(--hns-surface); border-radius: 999px; padding: 1px 8px;
+    font-variant-numeric: tabular-nums;
+  }
+  .hns-deliverables-list {
+    flex: 1; min-height: 0; overflow-y: auto;
+    padding: 8px; display: flex; flex-direction: column; gap: 4px;
+  }
+  .hns-deliverable {
+    display: flex; align-items: center; gap: 7px;
+    padding: 7px 9px;
+    border: 1px solid transparent; border-radius: 8px;
+    background: transparent; color: var(--hns-text); font-size: 12px;
+    text-align: left; cursor: pointer; min-width: 0;
+    transition: background .12s, border-color .12s;
+  }
+  .hns-deliverable:hover { background: color-mix(in srgb, var(--hns-accent, #4176e6) 7%, transparent); }
+  .hns-deliverable.on {
+    border-color: color-mix(in srgb, var(--hns-accent, #4176e6) 45%, var(--hns-border));
+    background: color-mix(in srgb, var(--hns-accent, #4176e6) 10%, transparent);
+  }
+  .hns-deliverable > :global(svg) { color: var(--hns-accent, #4176e6); flex: none; }
+  .hns-deliverable-thumb {
+    width: 20px; height: 20px; border-radius: 4px;
+    object-fit: cover; flex: none;
+    background: var(--hns-surface);
+  }
+  .hns-deliverable-name {
+    flex: 1; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-weight: 600;
+  }
+  .hns-deliverable-path {
+    flex: none; max-width: 120px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-size: 10px; color: var(--hns-muted);
+    font-family: ui-monospace, Consolas, monospace;
+  }
+  .hns-deliverables-empty {
+    flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; padding: 24px; text-align: center;
+    font-size: 12px; color: var(--hns-muted); line-height: 1.6;
+  }
+  .hns-deliverables-empty-ico { font-size: 30px; opacity: .7; }
+  .hns-deliverables-preview {
+    flex: none; max-height: 46%; min-height: 0;
+    display: flex; flex-direction: column;
+    border-top: 1px solid var(--hns-border-light, rgba(128, 128, 128, .14));
+  }
+  .hns-deliverables-preview-head {
+    flex: none; display: flex; align-items: center; gap: 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--hns-border-light, rgba(128, 128, 128, .14));
+    background: color-mix(in srgb, var(--hns-card-2) 60%, transparent);
+  }
+  .hns-deliverables-preview-name {
+    flex: 1; min-width: 0;
+    font-size: 12px; font-weight: 600; color: var(--hns-text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .hns-deliverables-preview-actions { flex: none; display: inline-flex; gap: 6px; }
+  .hns-deliverables-preview > .hns-file-preview-body { max-height: none; flex: 1; overflow: auto; }
+  .hns-deliverables-preview > .hns-file-preview-img { max-height: 300px; }
   .hns-hero { text-align: center; color: var(--hns-muted); padding: 0 40px; }
   .hns-hero-logo {
     font-size: 40px;
@@ -5976,7 +6171,7 @@
   }
   /* 时间线竖线：从首个节点连接到回复气泡 */
   .hns-tool-timeline::before {
-    content: ""; position: absolute; left: 15px; top: 22px; bottom: -14px;
+    content: ""; position: absolute; left: 11px; top: 22px; bottom: -14px;
     width: 2px; border-radius: 2px;
     background: linear-gradient(var(--hns-border), color-mix(in srgb, var(--hns-accent) 40%, var(--hns-border)));
   }
@@ -5990,7 +6185,9 @@
   }
   /* 步骤节点（状态圆点：完成绿 / 失败红 / 执行中脉冲） */
   .hns-tool-node {
-    position: absolute; left: -32px; top: 7px; z-index: 1;
+    position: absolute; left: -32px; top: 2px; z-index: 1;
+    /* top:2px 使 22px 圆点与单行头部（padding 4px + 行高 ≈25px）垂直居中，
+       避免状态圆点比工具文本低约 5px 的对齐错位；展开详情时头部仍居首行。 */
     width: 22px; height: 22px; border-radius: 50%;
     display: inline-flex; align-items: center; justify-content: center;
     background: var(--hns-card);

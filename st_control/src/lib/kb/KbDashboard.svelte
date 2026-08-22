@@ -31,7 +31,7 @@
   const filteredKbs = $derived(filterKbsByKeyword(kbs, kbSearch));
 
   function fmtTime(t: string): string {
-    return formatDateOnly(t);
+    return formatDateOnly(t, true);
   }
   /** 字节格式化：保持原实现（GB 两位小数；null 走 '0 B'） */
   function fmtBytes(n: number | null | undefined): string {
@@ -140,6 +140,44 @@
       <span class="kb-badge kb-badge-err">失败 {stats.job_failed}</span>
     </div>
   {/if}
+
+  <!-- 我的知识库（快捷入口：首页直达工作区） -->
+  <div style="display:flex;flex-direction:column;gap:10px">
+    <div class="kb-section-title">
+      <KbIcon name="kb" size={16} color="var(--kb-accent-bright)" />我的知识库
+      <span class="kb-section-sub">选择一个知识库，进入文档 / Wiki 工作区</span>
+      <div style="flex:1"></div>
+      <button class="kb-btn-sm" onclick={onNewKb} title="新建知识库"><KbIcon name="plus" size={13} weight="bold" />新建知识库</button>
+    </div>
+    {#if kbs.length === 0}
+      <div class="kb-card"><div class="kb-empty" style="padding:26px 18px">
+        <span class="kb-empty-ico"><KbIcon name="folderOpen" size={20} /></span>
+        <span>还没有知识库，创建第一个开始搭建知识资产</span>
+        <button class="kb-btn" onclick={onNewKb}><KbIcon name="plus" size={13} />新建第一个知识库</button>
+      </div></div>
+    {:else}
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px">
+        {#each kbs as kb}
+          <div class="kb-kb-card" role="button" tabindex="0"
+            onclick={() => onOpenKb(kb.id)}
+            onkeydown={(e) => e.key === 'Enter' && onOpenKb(kb.id)}>
+            <div class="kb-kb-card-cover" style="height:54px">
+              <div class="kb-kb-monogram" style="width:34px;height:34px;font-size:14px">{kbMonogram(kb.name)}</div>
+              <div style="flex:1;min-width:0">
+                <div style="display:flex;align-items:center;gap:6px">
+                  <span style="font-size:13px;font-weight:600;color:var(--kb-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={kb.name}>{kb.name}</span>
+                  {#if kb.pinned}<span class="kb-badge kb-badge-info"><KbIcon name="pin" size={11} /></span>{/if}
+                  {#if kb.isSystem}<span class="kb-badge kb-badge-mute">系统</span>{/if}
+                </div>
+                <div style="font-size:11.5px;color:var(--kb-text-3)">{kb.docCount} 文档</div>
+              </div>
+              <KbIcon name="arrowRight" size={14} color="var(--kb-text-3)" />
+            </div>
+          </div>
+        {/each}
+      </div>
+    {/if}
+  </div>
 
   <!-- 数据指标 -->
   <div style="display:flex;flex-direction:column;gap:12px">

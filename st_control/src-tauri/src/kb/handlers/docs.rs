@@ -328,6 +328,7 @@ pub struct UploadDocInput {
 
 #[derive(Serialize)]
 #[allow(non_snake_case)]
+#[serde(rename_all = "camelCase")]
 pub struct UploadResult {
     pub doc_id: i64,
     pub job_id: i64,
@@ -1049,46 +1050,92 @@ async fn process_document_async(db: KbDatabase, job: DocProcessJob, opts: Chunki
         .zip(chunks.iter())
         .map(|(id, c)| (*id, c.clone()))
         .collect();
-    let (ok, fail_n, embed_dim) = match embed::embed_chunks(
-        &db,
-        kb_id,
-        &id_chunk_pairs,
-        embedding_provider.as_deref(),
-        embedding_model.as_deref(),
-    )
-    .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            mark_failed(&e);
-            return;
+    // 未配置嵌入模型（或传入的模型被标记为非嵌入类型被回退）：跳过向量化，
+    // 文档仍解析/分片成功，标记 ready + no_embedding，可正常打开、预览、全文检索。
+    let no_embedding = embedding_provider
+        .as_deref()
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(true)
+        || embedding_model
+            .as_deref()
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true);
+    let (ok, fail_n, embed_dim): (usize, usize, Option<usize>) = if no_embedding {
+        (0, 0, None)
+    } else {
+        match embed::embed_chunks(
+            &db,
+            kb_id,
+            &id_chunk_pairs,
+            embedding_provider.as_deref(),
+            embedding_model.as_deref(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                // 向量化前置校验失败（如知识库已用其他嵌入模型）不再整篇标失败：
+                // 内容已解析分片完成，标记 embed_error 供用户处理后重试。
+                let conn = db.conn_lock();
+                let _ = conn.execute(
+                    "UPDATE documents SET status='ready', process_status='embed_error' WHERE id = ?1",
+                    rusqlite::params![doc_id],
+                );
+                let _ = conn.execute(
+                    "UPDATE processing_jobs SET stage='embed_error', progress=1.0, error=?1 WHERE id = ?2",
+                    rusqlite::params![e, job_id],
+                );
+                let _ = conn.execute(
+                    "INSERT INTO processing_logs (job_id, level, message) VALUES (?1,'warn',?2)",
+                    rusqlite::params![job_id, e],
+                );
+                log::warn!("文档向量化前置校验失败: doc={} err={}", doc_id, e);
+                (0, chunks.len(), None)
+            }
         }
     };
-    // 完成
+    // 完成：解析/分片成功即视为 ready（可操作），向量化状态由 process_status 细分。
+    // 若任务已被手动停止（kb_stop_processing 标记为 failed），不再改写任务状态，仅复位文档。
     {
         let conn = db.conn_lock();
-        if !chunks.is_empty() && ok == 0 {
-            let err = "全部向量化失败（请检查大模型嵌入配置：提供方/模型是否可用）";
-            let _ = conn.execute(
-                "UPDATE documents SET status='failed', process_status='failed' WHERE id = ?1",
-                rusqlite::params![doc_id],
-            );
-            let _ = conn.execute(
-                "UPDATE processing_jobs SET stage='failed', progress=1.0, error=?1 WHERE id = ?2",
-                rusqlite::params![err, job_id],
-            );
-            let _ = conn.execute(
-                "INSERT INTO processing_logs (job_id, level, message) VALUES (?1,'error',?2)",
-                rusqlite::params![job_id, err],
-            );
-        } else {
+        let still_active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM processing_jobs WHERE id = ?1 AND stage IN ('pending','parsing','chunking','embedding')",
+                rusqlite::params![job_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if still_active == 0 {
             let _ = conn.execute(
                 "UPDATE documents SET status='ready', process_status='ready' WHERE id = ?1",
                 rusqlite::params![doc_id],
             );
+            drop(conn);
+            return;
+        }
+        let (process_status, stage, err_msg) = if no_embedding {
+            (
+                "no_embedding",
+                "done",
+                "未配置嵌入模型，文档已解析但未向量化（可正常打开/预览/全文检索，语义检索需先配置 Embeddings 模型后重新处理）",
+            )
+        } else if !chunks.is_empty() && ok == 0 {
+            (
+                "embed_error",
+                "embed_error",
+                "全部向量化失败（请检查大模型嵌入配置：提供方/模型是否可用），文档已解析但未向量化",
+            )
+        } else {
+            ("ready", "done", "")
+        };
+        let _ = conn.execute(
+            "UPDATE documents SET status='ready', process_status=?1 WHERE id = ?2",
+            rusqlite::params![process_status, doc_id],
+        );
+        if err_msg.is_empty() {
             let _ = conn.execute(
-                "UPDATE processing_jobs SET stage='done', progress=1.0 WHERE id = ?1",
-                rusqlite::params![job_id],
+                "UPDATE processing_jobs SET stage=?1, progress=1.0 WHERE id = ?2",
+                rusqlite::params![stage, job_id],
             );
             let _ = conn.execute(
                 "INSERT INTO processing_logs (job_id, level, message) VALUES (?1,'info',?2)",
@@ -1101,6 +1148,15 @@ async fn process_document_async(db: KbDatabase, job: DocProcessJob, opts: Chunki
                         fail_n
                     )
                 ],
+            );
+        } else {
+            let _ = conn.execute(
+                "UPDATE processing_jobs SET stage=?1, progress=1.0, error=?2 WHERE id = ?3",
+                rusqlite::params![stage, err_msg, job_id],
+            );
+            let _ = conn.execute(
+                "INSERT INTO processing_logs (job_id, level, message) VALUES (?1,'warn',?2)",
+                rusqlite::params![job_id, err_msg],
             );
         }
     }

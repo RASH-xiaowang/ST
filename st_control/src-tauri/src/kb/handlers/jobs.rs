@@ -32,7 +32,7 @@ pub fn list_jobs(
     kb_id: Option<i64>,
     limit: i64,
 ) -> Result<Vec<JobItem>, String> {
-    let lim = limit.clamp(1, 200);
+    let lim = limit.clamp(1, 5000);
     let visible = crate::kb::retrieval::visible_kb_ids(db, uid);
     if visible.is_empty() {
         return Ok(Vec::new());
@@ -95,15 +95,46 @@ pub fn list_jobs(
     Ok(out)
 }
 
+/// 统计任务总数（与 list_jobs 同口径），供前端展示「共 N 条」并判断是否被截断
+pub fn count_jobs(db: &KbDatabase, uid: i64, kb_id: Option<i64>) -> i64 {
+    let visible = crate::kb::retrieval::visible_kb_ids(db, uid);
+    if visible.is_empty() {
+        return 0;
+    }
+    let conn = db.conn_lock();
+    let sql = if kb_id.is_some() {
+        "SELECT COUNT(*) FROM processing_jobs j JOIN documents d ON d.id = j.doc_id WHERE d.kb_id = ?1"
+            .to_string()
+    } else {
+        let ph = visible.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        format!(
+            "SELECT COUNT(*) FROM processing_jobs j JOIN documents d ON d.id = j.doc_id WHERE d.kb_id IN ({})",
+            ph
+        )
+    };
+    let r = if let Some(k) = kb_id {
+        conn.query_row(&sql, rusqlite::params![k], |r| r.get::<_, i64>(0))
+    } else {
+        let binds: Vec<&dyn rusqlite::types::ToSql> = visible
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        conn.query_row(&sql, binds.as_slice(), |r| r.get::<_, i64>(0))
+    };
+    r.unwrap_or(0)
+}
+
 #[tauri::command]
 pub async fn kb_list_jobs(
     db: State<'_, KbDatabase>,
     session: State<'_, crate::kb::auth::UserSession>,
     kb_id: Option<i64>,
     limit: Option<i64>,
-) -> Result<Vec<JobItem>, String> {
+) -> Result<serde_json::Value, String> {
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
-    list_jobs(&db, uid, kb_id, limit.unwrap_or(50))
+    let items = list_jobs(&db, uid, kb_id, limit.unwrap_or(50))?;
+    let total = count_jobs(&db, uid, kb_id);
+    Ok(serde_json::json!({ "items": items, "total": total }))
 }
 
 #[derive(Serialize)]
@@ -156,4 +187,160 @@ pub async fn kb_get_job_logs(
         })
         .map_err(|e| e.to_string())?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// 清理活动数据：
+/// - jobs    ：删除已完成 / 失败的处理任务及其日志（保留排队/执行中的任务）
+/// - logs    ：删除当前用户可见知识库的处理日志
+/// - history ：清空当前用户的检索历史
+#[tauri::command]
+pub async fn kb_clear_activity(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    scope: String,
+) -> Result<serde_json::Value, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    let visible = crate::kb::retrieval::visible_kb_ids(&db, uid);
+    let conn = db.conn_lock();
+    let mut cleared = serde_json::Map::new();
+    match scope.as_str() {
+        "jobs" => {
+            if visible.is_empty() {
+                cleared.insert("jobs".into(), 0.into());
+                cleared.insert("logs".into(), 0.into());
+            } else {
+                let ph = visible.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let job_ids: Vec<i64> = {
+                    let mut stmt = conn
+                        .prepare(&format!(
+                            "SELECT j.id FROM processing_jobs j JOIN documents d ON d.id = j.doc_id
+                             WHERE j.stage IN ('done','failed') AND d.kb_id IN ({})",
+                            ph
+                        ))
+                        .map_err(|e| e.to_string())?;
+                    let binds: Vec<&dyn rusqlite::types::ToSql> = visible
+                        .iter()
+                        .map(|v| v as &dyn rusqlite::types::ToSql)
+                        .collect();
+                    let rows = stmt
+                        .query_map(binds.as_slice(), |r| r.get::<_, i64>(0))
+                        .map_err(|e| e.to_string())?;
+                    rows.filter_map(|r| r.ok()).collect()
+                };
+                let n = job_ids.len();
+                if n > 0 {
+                    let ids = job_ids
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    conn.execute(
+                        &format!("DELETE FROM processing_logs WHERE job_id IN ({})", ids),
+                        [],
+                    )
+                    .map_err(|e| e.to_string())?;
+                    conn.execute(
+                        &format!("DELETE FROM processing_jobs WHERE id IN ({})", ids),
+                        [],
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                cleared.insert("jobs".into(), (n as i64).into());
+            }
+        }
+        "logs" => {
+            if visible.is_empty() {
+                cleared.insert("logs".into(), 0.into());
+            } else {
+                let ph = visible.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "DELETE FROM processing_logs WHERE job_id IN
+                     (SELECT j.id FROM processing_jobs j JOIN documents d ON d.id = j.doc_id
+                      WHERE d.kb_id IN ({}))",
+                    ph
+                );
+                let binds: Vec<&dyn rusqlite::types::ToSql> = visible
+                    .iter()
+                    .map(|v| v as &dyn rusqlite::types::ToSql)
+                    .collect();
+                let n = conn
+                    .execute(&sql, binds.as_slice())
+                    .map_err(|e| e.to_string())?;
+                cleared.insert("logs".into(), (n as i64).into());
+            }
+        }
+        "history" => {
+            let n = conn
+                .execute(
+                    "DELETE FROM search_logs WHERE user_id = ?1",
+                    rusqlite::params![uid],
+                )
+                .map_err(|e| e.to_string())?;
+            cleared.insert("history".into(), (n as i64).into());
+        }
+        _ => return Err("未知的清理范围".to_string()),
+    }
+    drop(conn);
+    Ok(serde_json::Value::Object(cleared))
+}
+
+/// 停止后台处理：把进行中/待处理的任务标记为「已手动停止」，
+/// 并对知识库置位批量取消标记，让正在运行的批量 Wiki 提炼在下一个文档处停止。
+/// kb_id=None 时作用于全部可见知识库。
+#[tauri::command]
+pub async fn kb_stop_processing(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    kb_id: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    let visible = crate::kb::retrieval::visible_kb_ids(&db, uid);
+    if visible.is_empty() {
+        return Ok(serde_json::json!({ "stopped": 0 }));
+    }
+    let conn = db.conn_lock();
+    let target_kbs: Vec<i64> = match kb_id {
+        Some(k) if visible.contains(&k) => vec![k],
+        Some(_) => Vec::new(),
+        None => visible,
+    };
+    let stopped: usize;
+    if target_kbs.is_empty() {
+        stopped = 0;
+    } else {
+        let ph = target_kbs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        // 1) 标记所有进行中/待处理任务
+        let sql = format!(
+            "UPDATE processing_jobs SET stage='failed', progress=1.0,
+                    error='已手动停止', updated_at=datetime('now')
+             WHERE stage IN ('pending','parsing','chunking','embedding','generating')
+               AND doc_id IN (SELECT id FROM documents WHERE kb_id IN ({}))",
+            ph
+        );
+        let binds: Vec<&dyn rusqlite::types::ToSql> = target_kbs
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        stopped = conn
+            .execute(&sql, binds.as_slice())
+            .map_err(|e| e.to_string())?;
+        // 2) 置位批量取消标记（批量提炼循环每处理一个文档前都会检查）
+        for k in &target_kbs {
+            conn.execute(
+                "INSERT INTO kb_chunk_settings (key, value, updated_at) VALUES (?1,'1',datetime('now'))
+                 ON CONFLICT(key) DO UPDATE SET value='1', updated_at=datetime('now')",
+                rusqlite::params![format!("generate_cancel_{}", k)],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        // 3) 进行中/待处理任务的文档复位为 ready（内容本身可用，可稍后重新处理）
+        let doc_sql = format!(
+            "UPDATE documents SET process_status='ready', updated_at=datetime('now')
+             WHERE process_status IN ('parsing','chunking','embedding','generating') AND kb_id IN ({})",
+            ph
+        );
+        let _ = conn.execute(&doc_sql, binds.as_slice());
+    }
+    drop(conn);
+    Ok(serde_json::json!({ "stopped": stopped }))
 }

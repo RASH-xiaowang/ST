@@ -9,6 +9,7 @@
   import KbDocs from './KbDocs.svelte';
   import KbChat from './KbChat.svelte';
   import KbSettings from './KbSettings.svelte';
+  import KbActivity from './KbActivity.svelte';
   import WikiPanel from './WikiPanel.svelte';
   import KbIcon from './KbIcon.svelte';
   import KbModal from './KbModal.svelte';
@@ -18,6 +19,7 @@
   const NAV = [
     { id: 'home', ico: 'dashboard', label: '首页' },
     { id: 'chat', ico: 'chat', label: 'AI问答' },
+    { id: 'activity', ico: 'activity', label: '活动' },
     { id: 'settings', ico: 'settings', label: '设置' },
   ] as const;
   // 'kb' / 'docs' / 'wiki' 不是导航项，而是“选择知识库后进入的工作区”内部视图
@@ -59,15 +61,17 @@ let nav = $state<NavId>('home');
       models = await kbApi.listModels();
     } catch { models = []; /* 未配置模型时忽略 */ }
     try {
-      const dft = await kbApi.getDefaultModel();
       // 用户手动选择仍然有效时保留选择，避免每次刷新把选择重置回默认
-      // 有「嵌入」类型标记时，只接受嵌入模型作为有效选择
+      // 只接受「嵌入」类型标记的模型作为向量化模型：对话/其他类型模型没有
+      // 嵌入接口，误用会导致全部文档上传后向量化失败（404）。
       const embedMarked = models.filter((m) => m.modelType === '嵌入' || m.modelType === 'embedding');
-      const hasEmbed = embedMarked.length > 0;
-      const scope = hasEmbed ? embedMarked : models;
-      const providerOk = scope.some((m) => m.providerId === selProvider);
-      const modelOk = scope.some((m) => m.providerId === selProvider && m.model === selModel);
-      if (!providerOk || !modelOk) { selProvider = dft[0]; selModel = dft[1]; }
+      // 未配置任何嵌入模型时清空选择：上传/重处理传入 null，后端回退到
+      // 「设置 → 模型设置」中的 Embeddings 配置；仍无则跳过向量化
+      // （文档正常解析与全文检索），并在界面提示用户配置 Embeddings 模型。
+      if (embedMarked.length === 0) { selProvider = ''; selModel = ''; return; }
+      const providerOk = embedMarked.some((m) => m.providerId === selProvider);
+      const modelOk = embedMarked.some((m) => m.providerId === selProvider && m.model === selModel);
+      if (!providerOk || !modelOk) { selProvider = embedMarked[0].providerId; selModel = embedMarked[0].model; }
     } catch { /* 默认模型不可用时忽略（仍保留已加载的模型列表） */ }
   }
   function setModel(p: string, m: string) { selProvider = p; selModel = m; }
@@ -80,7 +84,7 @@ let nav = $state<NavId>('home');
     nav = 'chat';
   }
   function fmtSessionTime(t: string): string {
-    return formatIsoTime(t, { showYear: false });
+    return formatIsoTime(t, { showYear: false, utc: true });
   }
 
   let kbObserver: IntersectionObserver | null = null;
@@ -217,6 +221,9 @@ let nav = $state<NavId>('home');
       <button class="kb-sidebar-item" class:active={nav === 'chat'} onclick={() => goNav('chat')} title="选择知识库进行对话测试">
         <KbIcon name="chat" size={15} />AI问答
       </button>
+      <button class="kb-sidebar-item" class:active={nav === 'activity'} onclick={() => goNav('activity')} title="处理任务与检索历史">
+        <KbIcon name="activity" size={15} />活动
+      </button>
       <div class="kb-sidebar-section kb-sidebar-section-row">
         <span>历史对话</span>
         <button class="kb-sidebar-add" onclick={() => { chatTarget = null; goNav('chat'); }} title="开始新对话"><KbIcon name="plus" size={13} weight="bold" /></button>
@@ -253,6 +260,9 @@ let nav = $state<NavId>('home');
         {/if}
       </div>
       <div style="flex:1"></div>
+      {#if nav === 'home' || nav === 'kb'}
+        <button class="kb-btn-md" onclick={openNewKb} title="新建知识库"><KbIcon name="plus" size={14} weight="bold" />新建</button>
+      {/if}
       {#if selectedKb !== null && (nav === 'docs' || nav === 'wiki')}
         <div class="kb-seg kb-seg-tabs">
           <button class="kb-seg-item" class:active={nav === 'docs'} onclick={() => goNav('docs')}><KbIcon name="docs" size={14} />文档列表 ({docTotal})</button>
@@ -312,6 +322,8 @@ let nav = $state<NavId>('home');
           onOpenDoc={(id, kbId) => { if (kbId != null) selectedKb = kbId; pendingDoc = { id, ts: Date.now() }; nav = 'docs'; }} />
       {:else if nav === 'wiki'}
         <WikiPanel kbId={selectedKb} />
+      {:else if nav === 'activity'}
+        <KbActivity {selectedKb} {notify} />
       {:else if nav === 'settings'}
         <KbSettings {models} {setModel} {notify} />
       {/if}
