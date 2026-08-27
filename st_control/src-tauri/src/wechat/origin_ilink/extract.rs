@@ -54,6 +54,9 @@ pub(crate) fn extract_image_xml(
         let xml = String::from_utf8_lossy(&decoded);
         let start = xml.find("<msg")?;
         let end = xml.find("</msg>")? + "</msg>".len();
+        if end <= start {
+            return None;
+        } // 畸形 XML 防护
         let msg = &xml[start..end];
         if msg.contains("cdnbigimgurl") {
             return Some(msg.to_string());

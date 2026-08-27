@@ -1,7 +1,7 @@
 [env]
 # whisper.cpp（whisper-rs）编译需要 cmake；VS 自带 cmake 不在 PATH，
 # 这里显式指定，避免安装系统级工具（GitHub CI 的 windows-latest 自带 cmake）。
-CMAKE = "C:\\Program Files\\Microsoft Visual Studio\\18\\Community\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe"
+CMAKE = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\Common7\\IDE\\CommonExtensions\\Microsoft\\CMake\\CMake\\bin\\cmake.exe"
 # whisper-rs-sys 用 bindgen 生成 C 绑定，需要 libclang.dll；
 # 来自 pip 安装的 libclang 轮子（仅构建期依赖）。
-LIBCLANG_PATH = "C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python312\\Lib\\site-packages\\clang\\native"
+LIBCLANG_PATH = "C:\\Users\\28361\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\site-packages\\clang\\native"

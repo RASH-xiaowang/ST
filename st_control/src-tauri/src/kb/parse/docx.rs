@@ -16,16 +16,14 @@ pub(crate) fn parse_docx(data: &[u8]) -> Result<ParsedDoc, String> {
 
 /// 从 docx(zip) 中读取 word/document.xml 字节（使用 zip 包）
 fn extract_docx_document_xml(data: &[u8]) -> Result<String, String> {
-    use std::io::Read;
     let cursor = std::io::Cursor::new(data);
     let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("docx 解压失败: {}", e))?;
-    let mut file = zip
+    // 安全：条目数量与单条目解压大小都设上限，防御 zip-bomb
+    super::check_zip_entry_count(&zip)?;
+    let file = zip
         .by_name("word/document.xml")
         .map_err(|_| "未找到 word/document.xml".to_string())?;
-    let mut buf = String::new();
-    file.read_to_string(&mut buf)
-        .map_err(|e| format!("读取 document.xml 失败: {}", e))?;
-    Ok(buf)
+    super::read_zip_entry_text(file, "word/document.xml")
 }
 
 /// 从 WordprocessingML 提取 <w:t> 文本，按段落补换行

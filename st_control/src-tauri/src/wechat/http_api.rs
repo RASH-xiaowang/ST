@@ -60,6 +60,10 @@ pub struct ApiServerState {
     shutdown_tx: std::sync::Mutex<Option<tokio::sync::watch::Sender<bool>>>,
     /// 数据查询响应缓存（会话/消息/通讯录/群成员，TTL 内命中免重复查询）
     response_cache: std::sync::Mutex<HashMap<String, ApiCacheEntry>>,
+    /// API 速率限制器（普通接口：60 次/分钟）
+    rate_limiter: crate::rate_limit::RateLimiter,
+    /// 严格速率限制器（写入/推送接口：10 次/分钟）
+    rate_limiter_strict: crate::rate_limit::RateLimiter,
 }
 
 impl ApiServerState {
@@ -77,6 +81,8 @@ impl ApiServerState {
             started: Instant::now(),
             shutdown_tx: std::sync::Mutex::new(None),
             response_cache: std::sync::Mutex::new(HashMap::new()),
+            rate_limiter: crate::rate_limit::RateLimiter::default_api(),
+            rate_limiter_strict: crate::rate_limit::RateLimiter::strict(),
         }
     }
 
@@ -361,9 +367,81 @@ pub fn build_router(state: Arc<ApiServerState>) -> Router {
             post(automation_task_complete),
         )
         .route("/api/v1/openapi.json", get(openapi_json))
+        // 速率限制中间件（60 次/分钟读取，10 次/分钟写入）
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
         // 仅放行应用自身来源（WebView2 dev/prod），拒绝任意站点跨域读取本地数据
         .layer(app_cors_layer())
         .with_state(state)
+}
+
+/// 速率限制中间件：提取客户端 IP，按接口类型检查限流
+/// /health 健康检查豁免限流
+async fn rate_limit_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<ApiServerState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    let path = req.uri().path().to_string();
+    // 健康检查豁免
+    if path == "/health" || path == "/api/v1/health" {
+        return Ok(next.run(req).await);
+    }
+
+    // 提取客户端 IP（本地服务默认 127.0.0.1）
+    let ip = req
+        .headers()
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let method = req.method().clone();
+    let is_write = method == axum::http::Method::POST
+        || method == axum::http::Method::PUT
+        || method == axum::http::Method::DELETE;
+
+    // 写入接口用严格限制器，读取接口用普通限制器
+    let limiter = if is_write {
+        &state.rate_limiter_strict
+    } else {
+        &state.rate_limiter
+    };
+
+    match limiter.check(&ip) {
+        Ok(remaining) => {
+            let mut response = next.run(req).await;
+            response.headers_mut().insert(
+                "x-ratelimit-remaining",
+                remaining.to_string().parse().unwrap(),
+            );
+            Ok(response)
+        }
+        Err(retry_after) => {
+            log::warn!(
+                "[rate-limit] IP {} 触发限流（{} 接口），建议 {}s 后重试",
+                ip,
+                if is_write { "写入" } else { "读取" },
+                retry_after
+            );
+            let body = serde_json::json!({
+                "success": false,
+                "error": {
+                    "code": "RATE_LIMITED",
+                    "message": format!("请求过于频繁，请 {} 秒后重试", retry_after),
+                    "retry_after": retry_after
+                }
+            });
+            let mut resp = Json(body).into_response();
+            *resp.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+            resp.headers_mut()
+                .insert("retry-after", retry_after.to_string().parse().unwrap());
+            Ok(resp)
+        }
+    }
 }
 
 /// 受限 CORS：仅允许应用自身 Origin，其余跨域请求不返回 CORS 头

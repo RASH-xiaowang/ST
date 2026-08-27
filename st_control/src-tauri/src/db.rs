@@ -57,10 +57,28 @@ impl Database {
     }
 
     /// 获取池化连接（Deref 到 rusqlite::Connection）
+    /// 连接池超时（5s）时 panic；在此之前记录 error 日志以便诊断。
+    /// 关键路径应使用 try_lock_conn() 获取 Result 以优雅降级。
     pub(crate) fn lock_conn(&self) -> r2d2::PooledConnection<SqliteConnectionManager> {
-        self.pool
-            .get()
-            .unwrap_or_else(|e| panic!("获取数据库连接失败: {}", e))
+        self.pool.get().unwrap_or_else(|e| {
+            log::error!(
+                "数据库连接池耗尽（pool_size={}）: {}",
+                self.pool.state().connections,
+                e
+            );
+            panic!("获取数据库连接失败: {}", e)
+        })
+    }
+
+    /// 尝试获取池化连接（不 panic，超时返回 Err）
+    #[allow(dead_code)] // 新增备用方法，关键路径逐步迁移使用
+    pub(crate) fn try_lock_conn(
+        &self,
+    ) -> Result<r2d2::PooledConnection<SqliteConnectionManager>, String> {
+        self.pool.get().map_err(|e| {
+            log::error!("数据库连接池耗尽: {}", e);
+            format!("获取数据库连接失败: {}", e)
+        })
     }
 
     fn init_tables(&self) -> SqlResult<()> {

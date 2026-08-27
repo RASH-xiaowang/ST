@@ -261,9 +261,9 @@ fn ratio_series_7d(
     out
 }
 
-/// 首页数据指标（8 项全真实口径）：
+/// 首页数据指标（7 项全真实口径）：
 /// 消息量/会话量 = QA 记录；FAQ = faq_hit 事件；LLM 问答 = rag 事件；
-/// 召回率 = 有结果检索事件占比；转人工率 = handoff_click / (search+rag)；
+/// 召回率 = 有结果检索事件占比；
 /// 任务技能 = processing_jobs done；问题推荐 = recommend_click。
 pub fn analytics_for(db: &KbDatabase, _uid: i64) -> Result<serde_json::Value, String> {
     let conn = db.conn_lock();
@@ -283,16 +283,6 @@ pub fn analytics_for(db: &KbDatabase, _uid: i64) -> Result<serde_json::Value, St
     let (rec_series, rec_today, rec_yday, rec_7d) = metric_counts(
         &conn,
         "SELECT * FROM kb_metric_events WHERE event_type='recommend_click'",
-    );
-    let (task_series, task_today, task_yday, task_7d) =
-        metric_counts(&conn, "SELECT * FROM processing_jobs WHERE stage='done'");
-    let (hand_series, hand_cnt_today, hand_cnt_yday, hand_cnt_7d) = metric_counts(
-        &conn,
-        "SELECT * FROM kb_metric_events WHERE event_type='handoff_click'",
-    );
-    let (qry_series, _qry_cnt_today, _qry_cnt_yday, _qry_cnt_7d) = metric_counts(
-        &conn,
-        "SELECT * FROM kb_metric_events WHERE event_type IN ('search','rag')",
     );
 
     // 检索事件按日统计（hits>0, total），detail 存 hitCount
@@ -336,34 +326,6 @@ pub fn analytics_for(db: &KbDatabase, _uid: i64) -> Result<serde_json::Value, St
             r.get(0)
         })
         .unwrap_or_default();
-
-    // 转人工率：分母 = 当日 search+rag 事件数
-    let den_map: std::collections::HashMap<String, i64> = qry_series.iter().cloned().collect();
-    let handoff_at = |date: &str, hand: i64| -> i64 {
-        let den = den_map.get(date).copied().unwrap_or(0);
-        if den > 0 {
-            ((hand as f64) / (den as f64) * 100.0).round() as i64
-        } else {
-            0
-        }
-    };
-    let handoff_series: Vec<(String, i64)> = build_series_7d(&conn, hand_series)
-        .into_iter()
-        .map(|(d, h)| {
-            let den = den_map.get(&d).copied().unwrap_or(0);
-            (
-                d,
-                if den > 0 {
-                    ((h as f64) / (den as f64) * 100.0).round() as i64
-                } else {
-                    0
-                },
-            )
-        })
-        .collect();
-    let handoff_today = handoff_at(&today, hand_cnt_today);
-    let handoff_yday = handoff_at(&yday, hand_cnt_yday);
-    let handoff_7d = handoff_at(&w7d, hand_cnt_7d);
 
     let recall_series = ratio_series_7d(&conn, &recall_at);
 
@@ -422,14 +384,6 @@ pub fn analytics_for(db: &KbDatabase, _uid: i64) -> Result<serde_json::Value, St
             true,
         ),
         build_metric(
-            "handoff",
-            handoff_today,
-            handoff_yday,
-            handoff_7d,
-            handoff_series,
-            true,
-        ),
-        build_metric(
             "faq",
             faq_today,
             faq_yday,
@@ -443,14 +397,6 @@ pub fn analytics_for(db: &KbDatabase, _uid: i64) -> Result<serde_json::Value, St
             rag_yday,
             rag_7d,
             build_series_7d(&conn, rag_series),
-            false,
-        ),
-        build_metric(
-            "task",
-            task_today,
-            task_yday,
-            task_7d,
-            build_series_7d(&conn, task_series),
             false,
         ),
         build_metric(

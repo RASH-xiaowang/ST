@@ -11,10 +11,13 @@ pub mod kb;
 mod llm;
 mod native_tts;
 mod ocr;
+mod rate_limit;
+mod security;
 mod sql_browse;
 #[cfg(feature = "local-stt")]
 pub mod stt;
 mod system_metrics;
+mod vector_index;
 pub mod wechat;
 mod ws_server;
 
@@ -109,6 +112,18 @@ pub fn run() {
 
             app.manage(ws_server);
             log::info!("ST Control 服务器已就绪，端口: {}", DEFAULT_WS_PORT);
+
+            // ─── 向量索引缓存（加速知识库检索） ───
+            let vector_index = std::sync::Arc::new(vector_index::VectorIndex::new());
+            app.manage(vector_index.clone());
+
+            // ─── 应用级安全加密器（统一密钥管理） ───
+            if let Err(e) = security::AppCipher::init(&crate::common::st_data_dir()) {
+                log::warn!(
+                    "[security] 应用加密器初始化失败（敏感数据将明文存储）: {}",
+                    e
+                );
+            }
 
             // ─── 知识库数据库（独立 SQLite 库） ───
             let kb_db = match kb::db::KbDatabase::new() {
@@ -342,6 +357,7 @@ pub fn run() {
             ipc_handlers::export_table_csv,
             ipc_handlers::backup_internal_db,
             ipc_handlers::restore_internal_db,
+            ipc_handlers::get_security_status,
             // ─── 微信监控 IPC（从 wechat::handlers 注册） ───
             wechat::handlers::get_session_snapshots,
             wechat::handlers::get_session_list,
@@ -643,6 +659,7 @@ pub fn run() {
             kb::handlers::kb_rename_dir,
             kb::handlers::kb_delete_dir,
             kb::handlers::kb_upload_document,
+            kb::handlers::kb_multimodal_analyze,
             kb::handlers::kb_upload_new_version,
             kb::handlers::kb_fetch_url,
             kb::handlers::kb_update_chunk,
@@ -656,10 +673,12 @@ pub fn run() {
             kb::handlers::kb_search,
             kb::handlers::kb_rag,
             kb::handlers::kb_rag_stream,
+            kb::handlers::kb_rag_cancel,
             kb::handlers::kb_highlight,
             kb::handlers::kb_list_versions,
             kb::handlers::kb_version_diff,
             kb::handlers::kb_set_acl,
+            kb::handlers::kb_acl_delete,
             kb::handlers::kb_list_documents,
             kb::handlers::kb_get_document,
             kb::handlers::kb_delete_document,
@@ -675,6 +694,13 @@ pub fn run() {
             kb::handlers::kb_set_model_settings,
             kb::handlers::kb_get_chunk_settings,
             kb::handlers::kb_set_chunk_settings,
+            kb::handlers::kb_get_rag_system_prompt,
+            kb::handlers::kb_set_rag_system_prompt,
+            kb::handlers::kb_test_model,
+            kb::handlers::kb_export,
+            kb::handlers::kb_import,
+            kb::handlers::kb_fetch_url,
+            kb::handlers::kb_batch_fetch_url,
             kb::handlers::kb_get_stats,
             kb::handlers::kb_get_analytics,
             kb::handlers::kb_track_event,
@@ -702,6 +728,8 @@ pub fn run() {
             kb::handlers::kb_get_job_logs,
             kb::handlers::kb_clear_activity,
             kb::handlers::kb_stop_processing,
+            kb::handlers::kb_retry_job,
+            kb::handlers::kb_retry_failed_jobs,
             kb::handlers::kb_wiki_list_pages,
             kb::handlers::kb_wiki_dirs,
             kb::handlers::kb_wiki_search,
@@ -713,6 +741,12 @@ pub fn run() {
             kb::handlers::kb_wiki_generate,
             kb::handlers::kb_wiki_extract,
             kb::handlers::kb_wiki_extract_all,
+            kb::handlers::kb_wiki_list_versions,
+            kb::handlers::kb_wiki_restore_version,
+            kb::handlers::kb_backup,
+            kb::handlers::kb_list_backups,
+            kb::handlers::kb_cleanup_backups,
+            kb::handlers::kb_list_audit_logs,
             kb::auth::kb_login,
             kb::auth::kb_logout,
             kb::auth::kb_current_user,

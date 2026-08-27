@@ -85,7 +85,7 @@ pub(crate) fn sniff_ext(kind: &str, data: &[u8], file_name: Option<&str>) -> Str
                 "jpg"
             } else if data.starts_with(b"GIF8") {
                 "gif"
-            } else if data.starts_with(b"RIFF") && &data[8..12] == b"WEBP" {
+            } else if data.starts_with(b"RIFF") && data.len() >= 12 && &data[8..12] == b"WEBP" {
                 "webp"
             } else {
                 "img"

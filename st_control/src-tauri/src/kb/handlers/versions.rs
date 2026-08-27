@@ -250,17 +250,17 @@ pub async fn kb_restore_version(
         .map_err(|e| e.to_string())?
     };
 
-    // 4) 权限校验 + 读取目标版本文件（不持有 conn 锁，避免 Mutex 死锁）
+    // 4) 权限校验 + 读取目标版本文件与版本号（不持有 conn 锁，避免 Mutex 死锁）
     let kb_id = db_kb_id(&db, doc_id);
     if !crate::kb::retrieval::can_manage_kb(&db, kb_id, uid) {
         return Err("无权限：仅知识库 owner/admin 可回滚版本".to_string());
     }
-    let file_object_id: i64 = {
+    let (file_object_id, target_version_no): (i64, i64) = {
         let conn = db.conn_lock();
         conn.query_row(
-            "SELECT file_object_id FROM document_versions WHERE id = ?1",
+            "SELECT file_object_id, version_no FROM document_versions WHERE id = ?1",
             rusqlite::params![version_id],
-            |r| r.get::<_, i64>(0),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         )
         .map_err(|e| format!("版本不存在: {}", e))?
     };
@@ -275,7 +275,7 @@ pub async fn kb_restore_version(
                 doc_id,
                 next_version,
                 file_object_id,
-                format!("回滚自 v{}（{}）", next_version - 1, note.trim()),
+                format!("回滚自 v{}（{}）", target_version_no, note.trim()),
                 uid
             ],
         )
@@ -286,10 +286,7 @@ pub async fn kb_restore_version(
     // 6) 创建处理任务并清理旧分片（save_chunks 内部会加锁，先释放外层锁）
     let job_id = {
         let conn = db.conn_lock();
-        conn.execute(
-            "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
-            rusqlite::params![doc_id],
-        ).map_err(|e| e.to_string())?;
+        crate::kb::db::fts_delete_chunks_by_doc(&conn, doc_id)?;
         conn.execute(
             "DELETE FROM document_chunks WHERE doc_id = ?1",
             rusqlite::params![doc_id],
@@ -364,7 +361,11 @@ pub async fn kb_restore_version(
     }
     // record_embedding_meta 内部会加锁，必须在锁外调用
     if let Some(dim) = embed_dim {
-        let _ = embed::record_embedding_meta(&db, kb_id, "", dim);
+        match embed::record_embedding_meta(&db, kb_id, "", dim) {
+            Ok(Some(w)) => log::warn!("版本恢复嵌入告警: {}", w),
+            Err(e) => log::warn!("记录嵌入元数据失败: {}", e),
+            _ => {}
+        }
     }
     // 源文档内容变化 → 自动刷新关联 Wiki 页面的摘要/实体
     if ok > 0 {

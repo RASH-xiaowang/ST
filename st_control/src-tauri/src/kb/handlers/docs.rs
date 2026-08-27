@@ -13,6 +13,7 @@ use crate::kb::embed;
 use crate::kb::parse::{self, Chunk, ChunkConfig};
 use rusqlite::params_from_iter;
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use tauri::State;
 #[derive(Serialize)]
 #[allow(non_snake_case)]
@@ -201,13 +202,8 @@ pub async fn kb_delete_dir(
         )
         .map_err(|_| "目录不存在".to_string())?
     };
-    let role = crate::kb::retrieval::kb_role(&db, kb_id, uid);
-    if !matches!(
-        role.as_deref(),
-        Some("owner") | Some("admin") | Some("editor")
-    ) {
-        return Err("无权限：仅知识库 owner/admin/editor 可删除目录".to_string());
-    }
+    crate::kb::retrieval::require_kb_role(&db, kb_id, uid, "editor")
+        .map_err(|_| "无权限：仅知识库 owner/admin/editor 可删除目录".to_string())?;
     let conn = db.conn_lock();
     let (dirs, docs) = collect_dir_docs(&conn, dir_id);
     // 收集本目录树文档引用的 file_object_id（删除文档后清理孤儿 BLOB）
@@ -228,15 +224,9 @@ pub async fn kb_delete_dir(
     };
     // 先清理 FTS 索引，再删除文档（chunks/versions 靠外键级联）
     for doc_id in &docs {
-        conn.execute(
-            "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
-            rusqlite::params![doc_id],
-        ).map_err(|e| e.to_string())?;
+        crate::kb::db::fts_delete_chunks_by_doc(&conn, *doc_id)?;
         // 清理该文档关联 Wiki 页面的 FTS 索引（wiki_pages 由外键级联删除，普通 FTS 表不会自动清理）
-        conn.execute(
-            "DELETE FROM wiki_pages_fts WHERE rowid IN (SELECT id FROM wiki_pages WHERE doc_id = ?1)",
-            rusqlite::params![doc_id],
-        ).map_err(|e| e.to_string())?;
+        crate::kb::db::fts_delete_wiki_pages_by_doc(&conn, *doc_id)?;
     }
     for doc_id in &docs {
         conn.execute(
@@ -275,13 +265,8 @@ pub async fn kb_move_doc(
         )
         .map_err(|_| "文档不存在".to_string())?
     };
-    let role = crate::kb::retrieval::kb_role(&db, kb_id, uid);
-    if !matches!(
-        role.as_deref(),
-        Some("owner") | Some("admin") | Some("editor")
-    ) {
-        return Err("无权限：仅知识库 owner/admin/editor 可移动文档".to_string());
-    }
+    crate::kb::retrieval::require_kb_role(&db, kb_id, uid, "editor")
+        .map_err(|_| "无权限：仅知识库 owner/admin/editor 可移动文档".to_string())?;
     if let Some(tid) = target_dir_id {
         let tkb: i64 = {
             let c = db.conn_lock();
@@ -315,7 +300,11 @@ pub struct UploadDocInput {
     pub dir_id: Option<i64>,
     pub title: String,
     pub file_type: String,
-    pub data: Vec<u8>, // 原始文件二进制
+    #[serde(default)]
+    pub data: Vec<u8>, // 原始文件二进制（小文件兼容）
+    /// base64 编码的文件内容（大文件推荐，避免 JSON 数组的巨大内存开销）
+    #[serde(default, alias = "dataBase64")]
+    pub data_base64: Option<String>,
     pub embedding_provider: Option<String>,
     pub embedding_model: Option<String>,
     /// 分块策略：recursive（默认）/ title（标题感知）/ parent_child（父子分块）
@@ -324,6 +313,22 @@ pub struct UploadDocInput {
     pub chunk_size: Option<usize>,
     /// 分块重叠（字符数，可选）
     pub chunk_overlap: Option<usize>,
+}
+
+impl UploadDocInput {
+    /// 解析文件数据：优先 base64，回退到原始 data 数组
+    pub fn resolve_data(&self) -> Result<Vec<u8>, String> {
+        if let Some(b64) = &self.data_base64 {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("base64 解码失败: {}", e))
+        } else if !self.data.is_empty() {
+            Ok(self.data.clone())
+        } else {
+            Err("未提供文件数据（data 或 dataBase64 至少一个）".to_string())
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -360,46 +365,53 @@ fn global_storage_used(db: &KbDatabase) -> i64 {
 pub async fn kb_upload_document(
     db: State<'_, KbDatabase>,
     session: State<'_, crate::kb::auth::UserSession>,
-    mut input: UploadDocInput,
+    app: tauri::AppHandle,
+    input: UploadDocInput,
 ) -> Result<UploadResult, String> {
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
-    // 权限：可访问知识库即可上传（成员或开放）
-    if !crate::kb::retrieval::can_access_kb(&db, input.kb_id, uid) {
-        return Err("无权限：你不是该知识库成员".to_string());
+    // 权限：需 editor 及以上角色（viewer 只读不可上传）
+    let role = crate::kb::retrieval::kb_role(&db, input.kb_id, uid);
+    if !matches!(
+        role.as_deref(),
+        Some("owner") | Some("admin") | Some("editor")
+    ) {
+        return Err("无权限：仅知识库 owner/admin/editor 可上传文档".to_string());
     }
+    // 解析文件数据（优先 base64，回退到 data 数组）
+    let file_data = input.resolve_data()?;
     // 上传前置校验：空文件 / 大小上限 / 存储配额
-    if input.data.is_empty() {
+    if file_data.is_empty() {
         return Err("文件内容为空，无法上传".to_string());
     }
-    if input.data.len() > MAX_UPLOAD_SIZE {
+    if file_data.len() > MAX_UPLOAD_SIZE {
         return Err(format!(
             "文件大小超过上限（{} MB），当前文件 {} MB",
             MAX_UPLOAD_SIZE / 1024 / 1024,
-            input.data.len() / 1024 / 1024
+            file_data.len() / 1024 / 1024
         ));
     }
     let used = global_storage_used(&db);
-    if used + input.data.len() as i64 > KB_STORAGE_QUOTA {
+    if used + file_data.len() as i64 > KB_STORAGE_QUOTA {
         return Err(format!(
             "存储空间不足：已用 {} / 配额 {}，请先清理或提升配额",
             used, KB_STORAGE_QUOTA
         ));
     }
     // 1. 校验文件类型（尽早失败，避免创建无效文档记录；解析为 CPU 密集，移出 tokio worker）
-    {
+    let file_data = {
         let ft = input.file_type.clone();
         let (data_back, validate) = tauri::async_runtime::spawn_blocking(move || {
-            let r = parse::parse_document(&ft, &input.data);
-            (input.data, r)
+            let r = parse::parse_document(&ft, &file_data);
+            (file_data, r)
         })
         .await
         .map_err(|e| format!("解析任务失败: {}", e))?;
-        input.data = data_back;
         validate?;
-    }
+        data_back
+    };
 
     // 2. 同知识库内相同内容（哈希一致）视为重复上传：跳过建库，返回已存在文档
-    let hash = format!("{:x}", md5_short(&input.data));
+    let hash = format!("{:x}", content_fingerprint(&file_data));
     {
         let conn = db.conn_lock();
         if let Ok((exist_id, exist_title)) = conn.query_row(
@@ -431,7 +443,7 @@ pub async fn kb_upload_document(
         conn.execute(
             "INSERT INTO file_objects (hash, ext, size, blob_data) VALUES (?1,?2,?3,?4)
              ON CONFLICT(hash) DO NOTHING",
-            rusqlite::params![hash, input.file_type, input.data.len() as i64, input.data],
+            rusqlite::params![hash, input.file_type, file_data.len() as i64, file_data],
         )
         .map_err(|e| e.to_string())?;
         let file_obj_id = conn
@@ -445,7 +457,7 @@ pub async fn kb_upload_document(
         conn.execute(
             "INSERT INTO documents (kb_id, dir_id, title, original_name, file_type, file_size, source, hash, status, process_status, created_by)
              VALUES (?1,?2,?3,?4,?5,?6,'upload',?7,'processing','pending',?8)",
-            rusqlite::params![input.kb_id, input.dir_id, input.title, input.title, input.file_type, input.data.len() as i64, hash, uid],
+            rusqlite::params![input.kb_id, input.dir_id, input.title, input.title, input.file_type, file_data.len() as i64, hash, uid],
         ).map_err(|e| e.to_string())?;
         let doc_id = conn.last_insert_rowid();
 
@@ -474,7 +486,7 @@ pub async fn kb_upload_document(
     let db_task = (*db).clone();
     let kb_id = input.kb_id;
     let file_type = input.file_type.clone();
-    let data = input.data; // 移动所有权到任务，避免大文件二次拷贝
+    let data = file_data; // 移动所有权到任务，避免大文件二次拷贝
     let (embedding_provider, embedding_model) = resolve_embedding_pair(
         &db,
         input.embedding_provider.clone(),
@@ -483,6 +495,7 @@ pub async fn kb_upload_document(
     let chunk_strategy = input.chunk_strategy.clone();
     let chunk_size = input.chunk_size;
     let chunk_overlap = input.chunk_overlap;
+    let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         process_document_async(
             db_task,
@@ -501,6 +514,7 @@ pub async fn kb_upload_document(
                 chunk_size,
                 chunk_overlap,
             },
+            Some(app_handle),
         )
         .await;
     });
@@ -516,12 +530,228 @@ pub async fn kb_upload_document(
     })
 }
 
+/// 多模态分析：对已上传的图片/PDF 文件调用多模态模型生成摘要
+/// 返回分析结果（摘要文本），同时更新文档的 multimodal_summary 字段
+#[tauri::command]
+pub async fn kb_multimodal_analyze(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    doc_id: i64,
+) -> Result<serde_json::Value, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+
+    // 1. 读取文档信息
+    let (kb_id, title, file_type, file_path) = {
+        let conn = db.conn_lock();
+        conn.query_row(
+            "SELECT kb_id, title, file_type, COALESCE(file_path,'') FROM documents WHERE id = ?1",
+            rusqlite::params![doc_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .map_err(|_| "文档不存在".to_string())?
+    };
+
+    // 权限检查
+    if !crate::kb::retrieval::can_access_kb(&db, kb_id, uid) {
+        return Err("无权限：你不是该知识库成员".to_string());
+    }
+
+    // 2. 检查是否为可分析的文件类型
+    let ft = file_type.to_lowercase();
+    let is_image = ["png", "jpg", "jpeg", "gif", "webp", "bmp"].contains(&ft.as_str());
+    let is_pdf = ft == "pdf";
+    if !is_image && !is_pdf {
+        return Err("仅支持图片和 PDF 文件的多模态分析".to_string());
+    }
+
+    // 3. 读取文件数据
+    let file_data: Vec<u8> = {
+        let conn = db.conn_lock();
+        // 优先从 file_path 读取，否则从 file_objects 读取
+        if !file_path.is_empty() {
+            let full_path = crate::common::app_base_dir().join(&file_path);
+            std::fs::read(&full_path).map_err(|e| format!("读取文件失败: {}", e))?
+        } else {
+            // 从 file_objects 读取
+            let hash: String = conn
+                .query_row(
+                    "SELECT hash FROM documents WHERE id = ?1",
+                    rusqlite::params![doc_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            conn.query_row(
+                "SELECT blob_data FROM file_objects WHERE hash = ?1",
+                rusqlite::params![hash],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .map_err(|e| format!("读取文件数据失败: {}", e))?
+        }
+    };
+
+    // 4. 调用多模态模型
+    let analysis = if is_image {
+        // 图片：通过 vision 接口分析
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&file_data);
+        let mime = match ft.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            _ => "image/png",
+        };
+        let data_url = format!("data:{};base64,{}", mime, b64);
+
+        let messages = vec![crate::llm::types::ChatMessage {
+            role: "user".to_string(),
+            content: format!("请详细描述这张图片的内容，包括：1. 主要内容和场景 2. 图中文字（如有）3. 关键信息摘要。图片标题：{}", title),
+            parts: Some(vec![
+                crate::llm::types::ContentPart {
+                    part_type: "image_url".to_string(),
+                    text: None,
+                    image_url: Some(crate::llm::types::ImageUrl { url: data_url }),
+                    name: None,
+                    mime: None,
+                    data: None,
+                    file_path: None,
+                },
+            ]),
+        }];
+
+        let (provider, model) = resolve_multimodal_pair(&db);
+        call_llm_for_analysis(&provider, &model, messages).await?
+    } else {
+        // PDF：提取文本后分析
+        let text = {
+            let ft_clone = ft.clone();
+            let data_clone = file_data.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                crate::kb::parse::parse_document(&ft_clone, &data_clone)
+                    .map(|doc| doc.text)
+                    .unwrap_or_default()
+            })
+            .await
+            .map_err(|e| format!("解析任务失败: {}", e))?
+        };
+
+        if text.trim().is_empty() {
+            return Err("PDF 未提取到文本内容，无法分析".to_string());
+        }
+
+        // 截取前 8000 字符避免超出上下文（按字符截断，避免 UTF-8 多字节边界 panic）
+        let char_count = text.chars().count();
+        let truncated = if char_count > 8000 {
+            &text[..text
+                .char_indices()
+                .nth(8000)
+                .map(|(i, _)| i)
+                .unwrap_or(text.len())]
+        } else {
+            &text
+        };
+
+        let messages = vec![crate::llm::types::ChatMessage {
+            role: "user".to_string(),
+            content: format!(
+                "请为以下文档生成一份结构化摘要，包括：1. 文档主题 2. 主要内容概述 3. 关键信息要点（列表形式）4. 适用场景\n\n文档标题：{}\n\n文档内容：\n{}",
+                title, truncated
+            ),
+            parts: None,
+        }];
+
+        let (provider, model) = resolve_multimodal_pair(&db);
+        call_llm_for_analysis(&provider, &model, messages).await?
+    };
+
+    // 5. 更新文档的多模态分析结果
+    {
+        let conn = db.conn_lock();
+        conn.execute(
+            "UPDATE documents SET multimodal_summary = ?1, multimodal_model = ?2, multimodal_status = 'done' WHERE id = ?3",
+            rusqlite::params![analysis, "multimodal", doc_id],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+
+    log::info!(
+        "[multimodal] 文档 {} 多模态分析完成: {} 字符",
+        doc_id,
+        analysis.len()
+    );
+    Ok(serde_json::json!({
+        "doc_id": doc_id,
+        "summary": analysis,
+        "status": "done"
+    }))
+}
+
+/// 解析多模态模型配置（从 kb_model_settings 表读取，与前端设置页一致）
+fn resolve_multimodal_pair(db: &KbDatabase) -> (String, String) {
+    let conn = db.conn_lock();
+    // 优先使用知识库设置中的多模态模型（role='multimodal'）
+    if let Some((p, m)) = super::settings::read_model_setting(&conn, "multimodal") {
+        return (p, m);
+    }
+    // 回退：使用推理模型（role='inference'）
+    if let Some((p, m)) = super::settings::read_model_setting(&conn, "inference") {
+        return (p, m);
+    }
+    (String::new(), String::new())
+}
+
+/// 调用 LLM 进行分析
+async fn call_llm_for_analysis(
+    provider_id: &str,
+    model: &str,
+    messages: Vec<crate::llm::types::ChatMessage>,
+) -> Result<String, String> {
+    if provider_id.is_empty() || model.is_empty() {
+        return Err("未配置多模态分析模型，请在「设置 → 模型配置」中配置".to_string());
+    }
+
+    let cfg = crate::llm::config::load_config();
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| format!("提供方 '{}' 不存在", provider_id))?;
+
+    let params = crate::llm::client::chat::CompletionParams {
+        model,
+        messages: &messages,
+        max_tokens: Some(2000),
+        temperature: Some(0.3),
+        top_p: None,
+        presence_penalty: None,
+        frequency_penalty: None,
+        tools: None,
+        tool_choice: None,
+    };
+
+    let (content, _prompt_tokens, _completion_tokens, _total_tokens) =
+        crate::llm::client::chat::chat_completion(provider, &params).await?;
+    Ok(content)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewVersionInput {
     pub doc_id: i64,
     pub file_type: String,
+    #[serde(default)]
     pub data: Vec<u8>,
+    /// base64 编码的文件内容（大文件推荐）
+    #[serde(default, alias = "dataBase64")]
+    pub data_base64: Option<String>,
     pub note: Option<String>,
     pub embedding_provider: Option<String>,
     pub embedding_model: Option<String>,
@@ -530,13 +760,29 @@ pub struct NewVersionInput {
     pub chunk_overlap: Option<usize>,
 }
 
+impl NewVersionInput {
+    pub fn resolve_data(&self) -> Result<Vec<u8>, String> {
+        if let Some(b64) = &self.data_base64 {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(b64)
+                .map_err(|e| format!("base64 解码失败: {}", e))
+        } else if !self.data.is_empty() {
+            Ok(self.data.clone())
+        } else {
+            Err("未提供文件数据（data 或 dataBase64 至少一个）".to_string())
+        }
+    }
+}
+
 /// 上传文档新版本：为已有文档追加版本（版本号自动 +1）并重新走
 /// 解析 → 分片 → 向量化流水线；旧版本保留，可随时回滚。
 #[tauri::command]
 pub async fn kb_upload_new_version(
     db: State<'_, KbDatabase>,
     session: State<'_, crate::kb::auth::UserSession>,
-    mut input: NewVersionInput,
+    app: tauri::AppHandle,
+    input: NewVersionInput,
 ) -> Result<serde_json::Value, String> {
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
     let (kb_id, title): (i64, String) = {
@@ -551,47 +797,49 @@ pub async fn kb_upload_new_version(
     if !crate::kb::retrieval::can_manage_kb(&db, kb_id, uid) {
         return Err("无权限：仅知识库 owner/admin 可上传新版本".to_string());
     }
+    // 解析文件数据（优先 base64，回退到 data 数组）
+    let file_data = input.resolve_data()?;
     // 上传前置校验：空文件 / 大小上限 / 存储配额（与首次上传一致）
-    if input.data.is_empty() {
+    if file_data.is_empty() {
         return Err("文件内容为空，无法上传".to_string());
     }
-    if input.data.len() > MAX_UPLOAD_SIZE {
+    if file_data.len() > MAX_UPLOAD_SIZE {
         return Err(format!(
             "文件大小超过上限（{} MB），当前文件 {} MB",
             MAX_UPLOAD_SIZE / 1024 / 1024,
-            input.data.len() / 1024 / 1024
+            file_data.len() / 1024 / 1024
         ));
     }
     let used = global_storage_used(&db);
-    if used + input.data.len() as i64 > KB_STORAGE_QUOTA {
+    if used + file_data.len() as i64 > KB_STORAGE_QUOTA {
         return Err(format!(
             "存储空间不足：已用 {} / 配额 {}，请先清理或提升配额",
             used, KB_STORAGE_QUOTA
         ));
     }
     // 校验文件类型（与首次上传一致，尽早失败；解析为 CPU 密集，移出 tokio worker）
-    {
+    let file_data = {
         let ft = input.file_type.clone();
         let (data_back, validate) = tauri::async_runtime::spawn_blocking(move || {
-            let r = parse::parse_document(&ft, &input.data);
-            (input.data, r)
+            let r = parse::parse_document(&ft, &file_data);
+            (file_data, r)
         })
         .await
         .map_err(|e| format!("解析任务失败: {}", e))?;
-        input.data = data_back;
         validate?;
-    }
+        data_back
+    };
 
     // 落库：去重文件对象 + 新版本 + 处理任务（同步完成，保证可追踪）
     let (version_id, job_id) = {
         let conn = db.conn_lock();
-        let hash = format!("{:x}", md5_short(&input.data));
+        let hash = format!("{:x}", content_fingerprint(&file_data));
         // 文件按哈希去重：已存在则保持原记录（引用计数由 document_versions 的
         // NOT EXISTS 孤儿清理判定，不再维护 ref_count 字段）
         conn.execute(
             "INSERT INTO file_objects (hash, ext, size, blob_data) VALUES (?1,?2,?3,?4)
              ON CONFLICT(hash) DO NOTHING",
-            rusqlite::params![hash, input.file_type, input.data.len() as i64, input.data],
+            rusqlite::params![hash, input.file_type, file_data.len() as i64, file_data],
         )
         .map_err(|e| e.to_string())?;
         let file_obj_id: i64 = conn
@@ -636,7 +884,7 @@ pub async fn kb_upload_new_version(
     let db_task = (*db).clone();
     let doc_id = input.doc_id;
     let file_type = input.file_type.clone();
-    let data = input.data;
+    let data = file_data;
     let (embedding_provider, embedding_model) = resolve_embedding_pair(
         &db,
         input.embedding_provider.clone(),
@@ -645,6 +893,7 @@ pub async fn kb_upload_new_version(
     let chunk_strategy = input.chunk_strategy.clone();
     let chunk_size = input.chunk_size;
     let chunk_overlap = input.chunk_overlap;
+    let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         process_document_async(
             db_task,
@@ -663,6 +912,7 @@ pub async fn kb_upload_new_version(
                 chunk_size,
                 chunk_overlap,
             },
+            Some(app_handle),
         )
         .await;
     });
@@ -687,6 +937,7 @@ pub struct FetchUrlInput {
 pub async fn kb_fetch_url(
     db: State<'_, KbDatabase>,
     session: State<'_, crate::kb::auth::UserSession>,
+    app: tauri::AppHandle,
     input: FetchUrlInput,
 ) -> Result<serde_json::Value, String> {
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
@@ -720,10 +971,28 @@ pub async fn kb_fetch_url(
     if !status.is_success() {
         return Err(format!("网页返回错误 {}", status));
     }
-    let html = resp
-        .text()
+    // 响应体大小限制（10MB）：防止恶意 URL 返回超大响应导致 OOM
+    const MAX_WEB_BODY: usize = 10 * 1024 * 1024;
+    let content_length = resp.content_length().unwrap_or(0);
+    if content_length > MAX_WEB_BODY as u64 {
+        return Err(format!(
+            "网页内容过大（{} MB），超过限制 {} MB",
+            content_length / 1024 / 1024,
+            MAX_WEB_BODY / 1024 / 1024
+        ));
+    }
+    let bytes = resp
+        .bytes()
         .await
         .map_err(|e| format!("读取网页内容失败: {}", e))?;
+    if bytes.len() > MAX_WEB_BODY {
+        return Err(format!(
+            "网页内容过大（{} MB），超过限制 {} MB",
+            bytes.len() / 1024 / 1024,
+            MAX_WEB_BODY / 1024 / 1024
+        ));
+    }
+    let html = String::from_utf8_lossy(&bytes).to_string();
     let (raw_title, text) = extract_web_text(&html);
     if text.trim().is_empty() {
         return Err("网页未提取到正文内容".to_string());
@@ -740,7 +1009,7 @@ pub async fn kb_fetch_url(
         resolve_embedding_pair(&db, input.embedding_provider, input.embedding_model);
     let (doc_id, version_id, job_id) = {
         let conn = db.conn_lock();
-        let hash = format!("{:x}", md5_short(md.as_bytes()));
+        let hash = format!("{:x}", content_fingerprint(md.as_bytes()));
         conn.execute(
             "INSERT INTO file_objects (hash, ext, size, blob_data) VALUES (?1,'md',?2,?3)
              ON CONFLICT(hash) DO NOTHING",
@@ -785,6 +1054,7 @@ pub async fn kb_fetch_url(
     let chunk_strategy = None;
     let chunk_size = None;
     let chunk_overlap = None;
+    let app_handle = app.clone();
     tauri::async_runtime::spawn(async move {
         process_document_async(
             db_task,
@@ -803,6 +1073,7 @@ pub async fn kb_fetch_url(
                 chunk_size,
                 chunk_overlap,
             },
+            Some(app_handle),
         )
         .await;
     });
@@ -833,7 +1104,8 @@ async fn host_is_private(host: &str) -> bool {
     if let Ok(mut addrs) = tokio::net::lookup_host((host, 443)).await {
         return addrs.any(|a| ip_is_private(a.ip()));
     }
-    false
+    // DNS 解析失败视为不安全，拒绝抓取（防止通过 DNS 故障绕过 SSRF 防护）
+    true
 }
 
 /// 简易网页正文提取：去除 script/style/注释/标签，按 UTF-8 解码文本，
@@ -863,7 +1135,9 @@ fn extract_web_text(html: &str) -> (String, String) {
             while j < bytes.len() && bytes[j].is_ascii_alphanumeric() {
                 j += 1;
             }
-            let tag = html[i + 1..j].to_ascii_lowercase();
+            let tag = std::str::from_utf8(&bytes[i + 1..j])
+                .unwrap_or("")
+                .to_ascii_lowercase();
             if tag == "script" || tag == "style" {
                 in_skip = Some(tag);
             }
@@ -880,14 +1154,15 @@ fn extract_web_text(html: &str) -> (String, String) {
             continue;
         }
         if let Some(sk) = &in_skip {
-            let lower = html[i..].to_ascii_lowercase();
+            // 使用字节级比较避免 UTF-8 边界问题
+            let lower_bytes = bytes[i..].to_ascii_lowercase();
             if sk == "comment" && bytes[i..].starts_with(b"-->") {
                 in_skip = None;
                 i += 3;
                 continue;
             }
-            if (sk == "script" && lower.starts_with("</script"))
-                || (sk == "style" && lower.starts_with("</style"))
+            if (sk == "script" && lower_bytes.starts_with(b"</script"))
+                || (sk == "style" && lower_bytes.starts_with(b"</style"))
             {
                 in_skip = None;
             }
@@ -932,6 +1207,51 @@ fn extract_web_text(html: &str) -> (String, String) {
     (title, joined)
 }
 
+// ─── 批量网页抓取 ───
+
+/// 批量网页抓取：逐个 URL 调用 kb_fetch_url，返回成功/失败计数
+#[tauri::command]
+pub async fn kb_batch_fetch_url(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    app: tauri::AppHandle,
+    urls: Vec<String>,
+    kb_id: i64,
+    dir_id: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    if !crate::kb::retrieval::can_access_kb(&db, kb_id, uid) {
+        return Err("无权限".to_string());
+    }
+    let (emb_provider, emb_model) = super::settings::resolve_embedding_pair(&db, None, None);
+    let mut ok = 0usize;
+    let mut err = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for url in urls {
+        let input = FetchUrlInput {
+            url: url.clone(),
+            kb_id,
+            dir_id,
+            embedding_provider: emb_provider.clone(),
+            embedding_model: emb_model.clone(),
+        };
+        match kb_fetch_url(db.clone(), session.clone(), app.clone(), input).await {
+            Ok(_) => ok += 1,
+            Err(e) => {
+                err += 1;
+                errors.push(format!("{}: {}", url, e));
+                if errors.len() >= 10 {
+                    errors.push("…更多错误已省略".to_string());
+                    break;
+                }
+            }
+        }
+    }
+    Ok(serde_json::json!({ "ok": ok, "err": err, "errors": errors }))
+}
+
+// ─── 文档处理流水线 ───
+
 /// 后台文档处理流水线：解析 → 分片入库 → 向量化 → 更新文档/任务状态。
 /// 失败时文档与任务均标记 failed，并写入 processing_logs。
 /// 文档处理参数（嵌入模型 + 分块配置）
@@ -953,7 +1273,12 @@ pub struct DocProcessJob {
     pub data: Vec<u8>,
 }
 
-async fn process_document_async(db: KbDatabase, job: DocProcessJob, opts: ChunkingOptions) {
+async fn process_document_async(
+    db: KbDatabase,
+    job: DocProcessJob,
+    opts: ChunkingOptions,
+    app: Option<tauri::AppHandle>,
+) {
     let DocProcessJob {
         kb_id,
         doc_id,
@@ -982,6 +1307,18 @@ async fn process_document_async(db: KbDatabase, job: DocProcessJob, opts: Chunki
             rusqlite::params![job_id, err],
         );
         log::error!("文档处理失败: doc={} err={}", doc_id, err);
+        // 推送失败事件到前端
+        if let Some(ref handle) = app {
+            let _ = handle.emit(
+                "kb:doc-processed",
+                serde_json::json!({
+                    "docId": doc_id,
+                    "kbId": kb_id,
+                    "status": "failed",
+                    "error": err,
+                }),
+            );
+        }
     };
 
     // 解析 + 分片入库（CPU 密集：文档解析/分块/FTS 写入，移出 tokio worker）
@@ -991,7 +1328,9 @@ async fn process_document_async(db: KbDatabase, job: DocProcessJob, opts: Chunki
             let parsed = parse::parse_document(&file_type, &data).map_err(|e| e.to_string())?;
             // 分块配置（overlap 上限依赖最终 chunk_size，先算 size 再算 overlap）
             let base_cfg = ChunkConfig::default();
-            let chunk_size = chunk_size.map(|sz| sz.max(100)).unwrap_or(base_cfg.chunk_size);
+            let chunk_size = chunk_size
+                .map(|sz| sz.max(100))
+                .unwrap_or(base_cfg.chunk_size);
             let cfg = ChunkConfig {
                 strategy: chunk_strategy
                     .as_deref()
@@ -1010,10 +1349,7 @@ async fn process_document_async(db: KbDatabase, job: DocProcessJob, opts: Chunki
             // 保证同一时间库里只保留当前版本的分片，避免新旧版本内容混在一起被检索到
             {
                 let conn = db_block.conn_lock();
-                let _ = conn.execute(
-                    "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
-                    rusqlite::params![doc_id],
-                );
+                let _ = crate::kb::db::fts_delete_chunks_by_doc(&conn, doc_id);
                 let _ = conn.execute(
                     "DELETE FROM document_chunks WHERE doc_id = ?1",
                     rusqlite::params![doc_id],
@@ -1161,9 +1497,18 @@ async fn process_document_async(db: KbDatabase, job: DocProcessJob, opts: Chunki
         }
     }
     // 记录嵌入模型/维度（record_embedding_meta 内部会加锁，必须在锁外调用）
+    // 维度不一致时返回告警信息，前端可展示提示
+    let mut embed_warning: Option<String> = None;
     if let Some(dim) = embed_dim {
-        let _ =
-            embed::record_embedding_meta(&db, kb_id, embedding_model.as_deref().unwrap_or(""), dim);
+        match embed::record_embedding_meta(
+            &db,
+            kb_id,
+            embedding_model.as_deref().unwrap_or(""),
+            dim,
+        ) {
+            Ok(w) => embed_warning = w,
+            Err(e) => log::warn!("记录嵌入元数据失败: {}", e),
+        }
     }
     // 源文档内容变化 → 自动刷新关联 Wiki 页面的摘要/实体
     if ok > 0 {
@@ -1176,16 +1521,83 @@ async fn process_document_async(db: KbDatabase, job: DocProcessJob, opts: Chunki
         ok,
         fail_n
     );
+    // 推送事件到前端（通知文档状态变化，无需轮询；含嵌入维度告警）
+    if let Some(ref handle) = app {
+        let mut payload = serde_json::json!({
+            "docId": doc_id,
+            "kbId": kb_id,
+            "status": "ready",
+            "chunks": chunks.len(),
+            "embedded": ok,
+            "failed": fail_n,
+        });
+        if let Some(ref w) = embed_warning {
+            payload["embedWarning"] = serde_json::Value::String(w.clone());
+        }
+        let _ = handle.emit("kb:doc-processed", payload);
+    }
 }
 
-fn md5_short(data: &[u8]) -> u128 {
-    // 简易 128 位哈希（非加密，仅去重用）：FNV-1a 组合
-    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
-    for &b in data {
-        h ^= b as u128;
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
+/// 供重试命令调用的公开入口：重新处理单个文档
+// 参数为任务快照的各个字段（与 jobs 表一一对应），保持平铺便于调用方传参。
+#[allow(clippy::too_many_arguments)]
+pub async fn process_document_for_retry(
+    db: KbDatabase,
+    doc_id: i64,
+    version_id: i64,
+    job_id: i64,
+    file_type: String,
+    data: Vec<u8>,
+    embedding_provider: Option<String>,
+    embedding_model: Option<String>,
+) {
+    // 读取分块设置和 kb_id
+    let (strategy, size, overlap, kb_id) = {
+        let conn = db.conn_lock();
+        let get = |key: &str| -> String {
+            conn.query_row(
+                "SELECT value FROM kb_chunk_settings WHERE key = ?1",
+                rusqlite::params![key],
+                |r| r.get(0),
+            )
+            .unwrap_or_default()
+        };
+        let kid: i64 = conn
+            .query_row(
+                "SELECT kb_id FROM documents WHERE id = ?1",
+                rusqlite::params![doc_id],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        (get("strategy"), get("size"), get("overlap"), kid)
+    };
+    process_document_async(
+        db,
+        DocProcessJob {
+            kb_id,
+            doc_id,
+            version_id,
+            job_id,
+            file_type,
+            data,
+        },
+        ChunkingOptions {
+            embedding_provider,
+            embedding_model,
+            chunk_strategy: Some(strategy),
+            chunk_size: size.parse().ok(),
+            chunk_overlap: overlap.parse().ok(),
+        },
+        None,
+    )
+    .await;
+}
+
+fn content_fingerprint(data: &[u8]) -> u128 {
+    // 使用 SHA-256（sha2 crate 已在依赖中）取前 128 位作为内容指纹，碰撞率远低于 FNV-1a
+    use sha2::{Digest, Sha256};
+    let hash = Sha256::digest(data);
+    u128::from_be_bytes(hash[..16].try_into().unwrap())
 }
 
 /// 重命名文档（仅改展示标题，original_name 保留原始文件名）
@@ -1328,14 +1740,24 @@ pub async fn kb_list_documents(
         params.push(Box::new(did));
     }
     if !keyword.is_empty() {
+        // 标题/文件名用 LIKE（数据量小，LIKE 足够）
+        // 内容搜索用 FTS5（比 LIKE '%...%' 快一个数量级）
+        let fts_query: String = keyword
+            .split_whitespace()
+            .map(|w| w.replace(['"', '(', ')', '*', '^', ':', '-'], " "))
+            .filter(|w| !w.is_empty())
+            .map(|w| format!("\"{}\"", crate::kb::cjk_spaced(&w)))
+            .collect::<Vec<_>>()
+            .join(" ");
         conds.push(
-            "(title LIKE ? OR original_name LIKE ? OR EXISTS (SELECT 1 FROM document_chunks c WHERE c.doc_id = documents.id AND c.content LIKE ?))"
+            "(title LIKE ? OR original_name LIKE ? OR (? != '' AND EXISTS (SELECT 1 FROM chunks_fts WHERE chunks_fts MATCH ? AND chunks_fts.rowid IN (SELECT id FROM document_chunks WHERE doc_id = documents.id))))"
                 .to_string(),
         );
         let like = format!("%{}%", keyword);
         params.push(Box::new(like.clone()));
-        params.push(Box::new(like.clone()));
         params.push(Box::new(like));
+        params.push(Box::new(fts_query.clone()));
+        params.push(Box::new(fts_query));
     }
     if let Some(st) = status {
         conds.push("status = ?".to_string());
@@ -1366,6 +1788,13 @@ pub async fn kb_list_documents(
         )
         .unwrap_or(0);
 
+    let has_keyword = !keyword.is_empty();
+    let snippet_col = if has_keyword {
+        // FTS5 snippet：返回匹配关键词前后的内容片段（高亮用）
+        ", COALESCE((SELECT snippet(chunks_fts, 0, '【', '】', '…', 64) FROM chunks_fts WHERE chunks_fts MATCH ?1 AND chunks_fts.rowid IN (SELECT id FROM document_chunks WHERE doc_id = documents.id) LIMIT 1), '') AS snippet"
+    } else {
+        ", '' AS snippet"
+    };
     let limit = page_size;
     let offset = (page - 1) * page_size;
     let mut binds: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
@@ -1375,9 +1804,9 @@ pub async fn kb_list_documents(
         .prepare(
             &format!(
                 "SELECT id, title, file_type, status, process_status, created_at, updated_at, file_size, source,
-                        COALESCE((SELECT GROUP_CONCAT(tag, ',') FROM kb_doc_tags WHERE doc_id = documents.id), '') {}
+                        COALESCE((SELECT GROUP_CONCAT(tag, ',') FROM kb_doc_tags WHERE doc_id = documents.id), '') {} {}
                  ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
-                base
+                snippet_col, base
             ),
         )
         .map_err(|e| e.to_string())?;
@@ -1393,6 +1822,7 @@ pub async fn kb_list_documents(
             "fileSize": row.get::<_, Option<i64>>(7)?,
             "source": row.get::<_, Option<String>>(8)?,
             "tags": row.get::<_, String>(9)?.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect::<Vec<_>>(),
+            "snippet": row.get::<_, Option<String>>(10).ok().flatten().unwrap_or_default(),
         }))
     })
     .map_err(|e| e.to_string())?;
@@ -1707,11 +2137,7 @@ pub async fn kb_delete_document(
     }
     let conn = db.conn_lock();
     // 清理该文档关联 Wiki 页面的 FTS 索引（wiki_pages 由外键级联删除，但普通 FTS 表不会自动清理）
-    conn.execute(
-        "DELETE FROM wiki_pages_fts WHERE rowid IN (SELECT id FROM wiki_pages WHERE doc_id = ?1)",
-        rusqlite::params![doc_id],
-    )
-    .map_err(|e| e.to_string())?;
+    crate::kb::db::fts_delete_wiki_pages_by_doc(&conn, doc_id)?;
     // 收集该文档引用的 file_object_id（在删除版本前完成，供孤儿清理）
     let fo_ids: Vec<i64> = {
         let mut stmt = conn
@@ -1723,11 +2149,7 @@ pub async fn kb_delete_document(
         rows.filter_map(|r| r.ok()).collect()
     };
     // 先删除 FTS 索引行（与 document_chunks 行一一对应）
-    conn.execute(
-        "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
-        rusqlite::params![doc_id],
-    )
-    .map_err(|e| e.to_string())?;
+    crate::kb::db::fts_delete_chunks_by_doc(&conn, doc_id)?;
     conn.execute(
         "DELETE FROM document_chunks WHERE doc_id = ?1",
         rusqlite::params![doc_id],
@@ -1746,6 +2168,8 @@ pub async fn kb_delete_document(
     // 删除不再被任何版本引用的孤儿 file_objects（修复：旧逻辑在删版本后才查询，
     // 永远查不到引用，导致去重 BLOB 永久残留）
     cleanup_orphan_file_objects(&conn, &fo_ids)?;
+    // 通知向量索引缓存失效
+    crate::vector_index::VECTOR_INDEX.invalidate();
     Ok(())
 }
 

@@ -97,6 +97,22 @@ fn is_rerank_model(provider: &crate::llm::types::ProviderConfig, model: &str) ->
         .unwrap_or(false)
 }
 
+/// 判断模型是否被标记为「多模态/视觉」类型（兼容中文「视觉」「多模态」与英文 vision/multimodal）
+/// 多模态模型也接受「对话」类型，因为大多数多模态模型同时也是对话模型
+fn is_multimodal_model(provider: &crate::llm::types::ProviderConfig, model: &str) -> bool {
+    provider
+        .model_meta
+        .get(model)
+        .and_then(|meta| meta.model_type.as_deref())
+        .map(|t| {
+            t == "视觉"
+                || t == "多模态"
+                || t.eq_ignore_ascii_case("vision")
+                || t.eq_ignore_ascii_case("multimodal")
+        })
+        .unwrap_or(false)
+}
+
 fn default_embedding_model_from_cfg(
     cfg: &crate::llm::types::LlmConfig,
 ) -> Option<(String, String)> {
@@ -165,7 +181,22 @@ fn default_rerank_model_from_cfg(cfg: &crate::llm::types::LlmConfig) -> Option<(
     None
 }
 
-/// 知识库模型设置（推理/解析/嵌入/重排序）
+fn default_multimodal_model_from_cfg(
+    cfg: &crate::llm::types::LlmConfig,
+) -> Option<(String, String)> {
+    // 优先查找显式标记为多模态/视觉的模型
+    for p in &cfg.providers {
+        if p.enabled {
+            if let Some(m) = p.models.iter().find(|m| is_multimodal_model(p, m)) {
+                return Some((p.id.clone(), m.clone()));
+            }
+        }
+    }
+    // 回退到对话模型（大多数多模态模型同时也是对话模型）
+    default_chat_model_from_cfg(cfg)
+}
+
+/// 知识库模型设置（推理/解析/嵌入/重排序/多模态）
 #[derive(Serialize, Deserialize, Clone)]
 #[allow(non_snake_case)]
 pub struct ModelSetting {
@@ -173,7 +204,7 @@ pub struct ModelSetting {
     pub model: String,
 }
 
-const MODEL_ROLES: [&str; 4] = ["inference", "parsing", "embedding", "rerank"];
+const MODEL_ROLES: [&str; 5] = ["inference", "parsing", "embedding", "rerank", "multimodal"];
 
 pub(crate) fn read_model_setting(
     conn: &rusqlite::Connection,
@@ -237,7 +268,7 @@ pub(crate) fn resolve_inference_pair(
         .unwrap_or((None, None))
 }
 
-/// 读取四类模型设置；未手动配置时返回按类型推导的默认值
+/// 读取五类模型设置；未手动配置时返回按类型推导的默认值
 #[tauri::command]
 pub async fn kb_get_model_settings(db: State<'_, KbDatabase>) -> Result<serde_json::Value, String> {
     let cfg = crate::llm::config::load_config();
@@ -259,10 +290,11 @@ pub async fn kb_get_model_settings(db: State<'_, KbDatabase>) -> Result<serde_js
         "parsing": get("parsing").or_else(|| to_setting(default_chat_model_from_cfg(&cfg))),
         "embedding": get("embedding").or_else(|| to_setting(default_embedding_model_from_cfg(&cfg))),
         "rerank": get("rerank").or_else(|| to_setting(default_rerank_model_from_cfg(&cfg))),
+        "multimodal": get("multimodal").or_else(|| to_setting(default_multimodal_model_from_cfg(&cfg))),
     }))
 }
 
-/// 保存某类模型设置（inference / parsing / embedding / rerank）
+/// 保存某类模型设置（inference / parsing / embedding / rerank / multimodal）
 #[tauri::command]
 pub async fn kb_set_model_settings(
     db: State<'_, KbDatabase>,
@@ -314,6 +346,7 @@ pub async fn kb_get_chunk_settings(db: State<'_, KbDatabase>) -> Result<serde_js
         "strategy": strategy,
         "size": parse_i64("size", 800),
         "overlap": parse_i64("overlap", 128),
+        "vectorScanCap": parse_i64("vector_scan_cap", 500),
     }))
 }
 
@@ -324,6 +357,7 @@ pub async fn kb_set_chunk_settings(
     strategy: String,
     size: i64,
     overlap: i64,
+    vector_scan_cap: Option<i64>,
 ) -> Result<(), String> {
     if !["recursive", "title", "parent_child"].contains(&strategy.as_str()) {
         return Err("未知的分块策略".to_string());
@@ -347,6 +381,17 @@ pub async fn kb_set_chunk_settings(
             rusqlite::params![key, value],
         )
         .map_err(|e| e.to_string())?;
+    }
+    // 向量扫描阈值（可选：50 ~ 10000，超限则忽略）
+    if let Some(cap) = vector_scan_cap {
+        if (50..=10000).contains(&cap) {
+            conn.execute(
+                "INSERT INTO kb_chunk_settings (key, value, updated_at) VALUES ('vector_scan_cap', ?1, datetime('now'))
+                 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+                rusqlite::params![cap.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
     }
     Ok(())
 }
@@ -377,6 +422,163 @@ pub async fn kb_get_default_chat_model(
     }
     let cfg = crate::llm::config::load_config();
     default_chat_model_from_cfg(&cfg).ok_or_else(|| "未找到可用的对话模型".to_string())
+}
+
+/// RAG 默认系统提示词（用户未自定义时使用）
+pub(crate) const RAG_DEFAULT_SYSTEM_PROMPT: &str =
+    "你是企业知识库助手。请严格基于以下【知识上下文】回答用户问题，\
+    若上下文无法回答请如实说明，不要编造。回答中可适当引用来源文档。";
+
+/// 读取自定义 RAG 系统提示词（未配置时返回默认值）
+pub(crate) fn read_rag_system_prompt(conn: &rusqlite::Connection) -> String {
+    conn.query_row(
+        "SELECT value FROM kb_chunk_settings WHERE key = 'rag_system_prompt'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .filter(|s| !s.trim().is_empty())
+    .unwrap_or_else(|| RAG_DEFAULT_SYSTEM_PROMPT.to_string())
+}
+
+/// 获取 RAG 系统提示词
+#[tauri::command]
+pub async fn kb_get_rag_system_prompt(db: State<'_, KbDatabase>) -> Result<String, String> {
+    let conn = db.conn_lock();
+    Ok(read_rag_system_prompt(&conn))
+}
+
+/// 设置 RAG 系统提示词（传空字符串恢复默认）
+#[tauri::command]
+pub async fn kb_set_rag_system_prompt(
+    db: State<'_, KbDatabase>,
+    prompt: String,
+) -> Result<(), String> {
+    let conn = db.conn_lock();
+    if prompt.trim().is_empty() {
+        // 恢复默认：删除自定义记录
+        conn.execute(
+            "DELETE FROM kb_chunk_settings WHERE key = 'rag_system_prompt'",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        conn.execute(
+            "INSERT INTO kb_chunk_settings (key, value, updated_at) VALUES ('rag_system_prompt', ?1, datetime('now'))
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=datetime('now')",
+            rusqlite::params![prompt],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 测试模型连通性：对推理/嵌入模型发送简单请求，验证 API 是否可用
+#[tauri::command]
+pub async fn kb_test_model(
+    provider_id: String,
+    model: String,
+    model_type: String,
+) -> Result<serde_json::Value, String> {
+    let cfg = crate::llm::config::load_config();
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|p| p.id == provider_id && p.enabled)
+        .ok_or_else(|| format!("提供方「{}」不存在或已被禁用", provider_id))?;
+    // 检查模型是否在提供方的模型列表中
+    if !provider.models.contains(&model) {
+        return Err(format!(
+            "模型「{}」不在提供方「{}」的模型列表中，请检查模型名称是否正确",
+            model, provider.name
+        ));
+    }
+    let start = std::time::Instant::now();
+    let normalized_type = model_type.to_lowercase();
+    match normalized_type.as_str() {
+        "embedding" | "嵌入" => {
+            // 测试嵌入接口：发送简单文本
+            let req = crate::llm::types::EmbeddingRequest {
+                provider_id: Some(provider_id.clone()),
+                model: Some(model.clone()),
+                input: "测试连接".to_string(),
+            };
+            crate::llm::handlers::create_embedding(req)
+                .await
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("does not exist") || msg.contains("not found") {
+                        format!(
+                            "模型「{}」不存在，请检查模型名称或在提供方后台确认模型是否可用",
+                            model
+                        )
+                    } else {
+                        format!("嵌入模型测试失败: {}", msg)
+                    }
+                })?;
+        }
+        "rerank" | "重排序" => {
+            // 重排序模型不支持简单测试，仅验证配置存在
+            return Ok(serde_json::json!({
+                "ok": true,
+                "providerId": provider_id,
+                "model": model,
+                "latencyMs": 0,
+                "note": "重排序模型已配置，将在检索时自动使用",
+            }));
+        }
+        _ => {
+            // 测试对话接口：发送简单消息
+            let req = crate::llm::types::ChatRequest {
+                provider_id: Some(provider_id.clone()),
+                model: Some(model.clone()),
+                role_id: None,
+                messages: vec![crate::llm::types::ChatMessage {
+                    role: "user".to_string(),
+                    content: "请回复「连接成功」四个字。".to_string(),
+                    parts: None,
+                }],
+                max_tokens: Some(20),
+                temperature: Some(0.0),
+                top_p: None,
+                presence_penalty: None,
+                frequency_penalty: None,
+            };
+            crate::llm::handlers::chat_with_llm(req)
+                .await
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.contains("does not exist")
+                        || msg.contains("not found")
+                        || msg.contains("Model does not exist")
+                    {
+                        format!(
+                            "模型「{}」不存在，请检查模型名称或在提供方后台确认模型是否可用",
+                            model
+                        )
+                    } else if msg.contains("401")
+                        || msg.contains("Unauthorized")
+                        || msg.contains("invalid api key")
+                    {
+                        format!(
+                            "API Key 无效或已过期，请在「大模型管理」中更新提供方「{}」的密钥",
+                            provider.name
+                        )
+                    } else if msg.contains("429") || msg.contains("rate limit") {
+                        format!("请求频率超限，请稍后再试（提供方：{}）", provider.name)
+                    } else {
+                        format!("对话模型测试失败: {}", msg)
+                    }
+                })?;
+        }
+    }
+    let elapsed = start.elapsed().as_millis();
+    Ok(serde_json::json!({
+        "ok": true,
+        "providerId": provider_id,
+        "model": model,
+        "latencyMs": elapsed,
+    }))
 }
 
 #[cfg(test)]

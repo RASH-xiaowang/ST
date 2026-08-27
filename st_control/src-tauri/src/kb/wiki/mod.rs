@@ -12,7 +12,9 @@ mod fts;
 pub use fts::*;
 
 mod mutate;
-pub use mutate::{create_page, delete_page, update_page};
+pub use mutate::{
+    create_page, delete_page, list_versions, restore_version, update_page, WikiVersionItem,
+};
 
 mod generate;
 pub use generate::{generate, generate_with_jobs, list_ready_docs};

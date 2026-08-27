@@ -246,6 +246,8 @@ pub async fn set_llm_default_model<R: tauri::Runtime>(
 }
 
 /// 设置单个模型的能力元数据（类型 / 标签）。类型与标签均为空时删除该条目。
+// Tauri 命令参数必须平铺，无法用结构体收敛，故允许超参（18 个）。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn set_llm_model_meta<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
@@ -253,6 +255,19 @@ pub async fn set_llm_model_meta<R: tauri::Runtime>(
     model: String,
     #[allow(non_snake_case)] modelType: Option<String>,
     tags: Vec<String>,
+    #[allow(non_snake_case)] inputModalities: Vec<String>,
+    #[allow(non_snake_case)] outputModalities: Vec<String>,
+    reasoning: bool,
+    #[allow(non_snake_case)] toolUse: bool,
+    streaming: bool,
+    #[allow(non_snake_case)] webSearch: bool,
+    #[allow(non_snake_case)] structuredOutput: bool,
+    #[allow(non_snake_case)] promptCache: bool,
+    multimodal: bool,
+    #[allow(non_snake_case)] maxOutputTokens: Option<u64>,
+    #[allow(non_snake_case)] requestsPerMinute: Option<u64>,
+    #[allow(non_snake_case)] tokensPerMinute: Option<u64>,
+    #[allow(non_snake_case)] contextWindow: Option<u64>,
 ) -> Result<ProviderConfig, String> {
     let mut cfg = config::load_config();
     let provider = cfg
@@ -272,7 +287,37 @@ pub async fn set_llm_model_meta<R: tauri::Runtime>(
     let model_type_clean = modelType
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
-    if model_type_clean.is_none() && cleaned_tags.is_empty() {
+
+    // 清理输入输出模态
+    let cleaned_input_modalities: Vec<String> = inputModalities
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let cleaned_output_modalities: Vec<String> = outputModalities
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    // 如果所有字段都是默认值，则移除元数据
+    let has_meta = model_type_clean.is_some()
+        || !cleaned_tags.is_empty()
+        || !cleaned_input_modalities.is_empty()
+        || !cleaned_output_modalities.is_empty()
+        || reasoning
+        || toolUse
+        || streaming
+        || webSearch
+        || structuredOutput
+        || promptCache
+        || multimodal
+        || maxOutputTokens.is_some()
+        || requestsPerMinute.is_some()
+        || tokensPerMinute.is_some()
+        || contextWindow.is_some();
+
+    if !has_meta {
         provider.model_meta.remove(&m);
     } else {
         provider.model_meta.insert(
@@ -281,7 +326,19 @@ pub async fn set_llm_model_meta<R: tauri::Runtime>(
                 model_type: model_type_clean,
                 tags: cleaned_tags,
                 reasoning_efforts: Vec::new(),
-                context_window: None,
+                context_window: contextWindow,
+                input_modalities: cleaned_input_modalities,
+                output_modalities: cleaned_output_modalities,
+                reasoning,
+                tool_use: toolUse,
+                streaming,
+                web_search: webSearch,
+                structured_output: structuredOutput,
+                prompt_cache: promptCache,
+                multimodal,
+                max_output_tokens: maxOutputTokens,
+                requests_per_minute: requestsPerMinute,
+                tokens_per_minute: tokensPerMinute,
             },
         );
     }
@@ -291,13 +348,14 @@ pub async fn set_llm_model_meta<R: tauri::Runtime>(
     Ok(result)
 }
 
-/// 供测试或内部调用：返回受支持的提供方类型
+/// 供测试或内部调用
 #[tauri::command]
 pub async fn get_llm_provider_types() -> Result<Vec<String>, String> {
     Ok(vec![
         ProviderType::OpenAI.as_str().to_string(),
         ProviderType::Azure.as_str().to_string(),
         ProviderType::Ollama.as_str().to_string(),
+        ProviderType::Xiaomi.as_str().to_string(),
         ProviderType::Custom.as_str().to_string(),
     ])
 }

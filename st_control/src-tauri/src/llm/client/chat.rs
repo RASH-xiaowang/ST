@@ -264,15 +264,23 @@ pub async fn chat_completion_with_tools_raw(
 
     // 读取响应体并计量首 token / 首字节延迟：逐块收取，首个网络块的
     // 到达时间即 TTFT 代理（服务端开始产出即送达，非流式同样成立）
+    // 若 body 流读取失败（网络中断 / chunk 解码错误），向上层返回可重试的错误
     let mut stream = resp.bytes_stream();
     let mut first_token_ms: Option<u64> = None;
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("读取响应失败: {}", e))?;
+        let chunk = chunk.map_err(|e| {
+            // 标记为可重试错误：body 流中断不应直接失败，上层可重试整个请求
+            format!("读取响应失败（网络中断，请重试）: {}", e)
+        })?;
         if first_token_ms.is_none() {
             first_token_ms = Some(started.elapsed().as_millis() as u64);
         }
         body.extend_from_slice(&chunk);
+    }
+    // 响应体为空时也视为可重试错误
+    if body.is_empty() {
+        return Err("响应体为空，请重试".to_string());
     }
     let wall_ms = started.elapsed().as_millis() as u64;
     let data: Value = serde_json::from_slice(&body).map_err(|e| format!("解析响应失败: {}", e))?;
@@ -407,13 +415,15 @@ mod stream_delta_tests {
 
 /// 流式对话补全：每收到一段内容增量就调用 on_delta，最终返回完整结果与 token 用量。
 /// 兼容 OpenAI / Azure / Ollama 等返回 SSE（data: {...}）的接口。
+/// on_delta 返回 false 表示调用方请求提前停止（如用户点击「停止生成」），
+/// 此时立即中断流式读取并返回已累积的内容。
 pub async fn chat_completion_stream<F>(
     provider: &ProviderConfig,
     params: &CompletionParams<'_>,
     mut on_delta: F,
 ) -> Result<(String, u64, u64, u64), String>
 where
-    F: FnMut(&str),
+    F: FnMut(&str) -> bool,
 {
     let model = params.model;
     let messages = params.messages;
@@ -493,6 +503,7 @@ where
     let mut reasoning = String::new();
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
+    let mut stopped = false;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| format!("读取流失败: {}", e))?;
@@ -532,7 +543,11 @@ where
             if let Some(d) = content_delta {
                 if !d.is_empty() {
                     full.push_str(&d);
-                    on_delta(&d);
+                    if !on_delta(&d) {
+                        // 调用方请求停止：中断流式读取，返回已累积内容
+                        stopped = true;
+                        break;
+                    }
                 }
             }
             // 思考过程只收集不展示：若与正文同流混发，绝不能进入 on_delta
@@ -547,8 +562,8 @@ where
     }
 
     // 极少数推理模型只输出 reasoning_content 而没有正文：
-    // 此时回退用思考内容，避免下游拿到空文本（保留原兜底意图）
-    if full.trim().is_empty() && !reasoning.trim().is_empty() {
+    // 此时回退用思考内容，避免下游拿到空文本（保留原兜底意图；手动停止时不回退）
+    if !stopped && full.trim().is_empty() && !reasoning.trim().is_empty() {
         log::warn!(
             "[llm] 流式响应无正文，回退使用 reasoning_content（{} 字符）",
             reasoning.chars().count()

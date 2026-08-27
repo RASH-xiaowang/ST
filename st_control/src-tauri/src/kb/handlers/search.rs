@@ -48,6 +48,7 @@ pub async fn kb_search(
     if visible.is_empty() {
         return Err("当前用户无可访问的知识库".to_string());
     }
+
     // 查询向量使用「模型设置」中的 Embeddings 配置（优先），否则退回调用方传入的模型
     let (emb_provider, emb_model) = {
         let conn = db.conn_lock();
@@ -55,9 +56,18 @@ pub async fn kb_search(
             .map(|(p, m)| (Some(p), Some(m)))
             .unwrap_or((input.provider_id.clone(), input.model.clone()))
     };
+    let emb_model_key = emb_model.as_deref().unwrap_or("");
+
+    // LRU 缓存：相同查询 + 相同嵌入模型 60 秒内直接返回
+    if let Some(cached) = retrieval::get_cached(&visible, &input.query, &mode, top_k, emb_model_key)
+    {
+        return Ok(cached);
+    }
     let results = match mode.as_str() {
         "vector" => {
-            vector_search_wrap(
+            // 优先使用内存缓存索引加速检索（SME 场景 10K-50K 分片）
+            let vi = &crate::vector_index::VECTOR_INDEX;
+            vi.search(
                 &db,
                 &input.query,
                 &visible,
@@ -70,23 +80,18 @@ pub async fn kb_search(
         "bm25" => retrieval::bm25_search(&db, &input.query, &visible, top_k)?,
         _ => {
             let b = retrieval::bm25_search(&db, &input.query, &visible, top_k)?;
-            // FTS 候选池预筛：只对候选分片做向量精排，避免每次搜索全量载入所有 embedding
-            let candidates = retrieval::fts_candidate_ids(
-                &db,
-                &input.query,
-                &visible,
-                (top_k * 30).clamp(100, 2000),
-            )?;
-            match retrieval::vector_search_in_candidates(
-                &db,
-                &input.query,
-                &visible,
-                &candidates,
-                top_k,
-                emb_provider.as_deref(),
-                emb_model.as_deref(),
-            )
-            .await
+            // 优先使用内存缓存索引加速向量检索
+            let vi = &crate::vector_index::VECTOR_INDEX;
+            match vi
+                .search(
+                    &db,
+                    &input.query,
+                    &visible,
+                    top_k,
+                    emb_provider.as_deref(),
+                    emb_model.as_deref(),
+                )
+                .await
             {
                 Ok(v) => retrieval::rrf_fuse(v, b, 60),
                 Err(e) => {
@@ -101,7 +106,10 @@ pub async fn kb_search(
         }
     };
     // Rerank：配置了重排序模型时，对检索结果智能重排序（失败保留原顺序）
-    let results = crate::kb::retrieval::rerank_chunks(&db, &input.query, results).await;
+    let mut results = crate::kb::retrieval::rerank_chunks(&db, &input.query, results).await;
+    // 混合检索 RRF 融合后可能返回 2×top_k 条，重排后再截断回用户选择的条数，
+    // 否则「条数」选择不生效（实测选 10 条返回 14~20 条）。
+    results.truncate(top_k);
     // 记录检索历史
     log_search(
         &db,
@@ -125,18 +133,16 @@ pub async fn kb_search(
             detail: Some(&detail.to_string()),
         },
     );
+    // 写入 LRU 缓存（含嵌入模型标识，切换模型后缓存自动失效）
+    retrieval::put_cache(
+        &visible,
+        &input.query,
+        &mode,
+        top_k,
+        emb_model_key,
+        &results,
+    );
     Ok(results)
-}
-
-async fn vector_search_wrap(
-    db: &KbDatabase,
-    query: &str,
-    visible: &[i64],
-    top_k: usize,
-    provider: Option<&str>,
-    model: Option<&str>,
-) -> Result<Vec<RetrievedChunk>, String> {
-    retrieval::vector_search(db, query, visible, top_k, provider, model).await
 }
 
 // ─── RAG ───
@@ -242,6 +248,7 @@ pub async fn kb_rag(
                     top_k,
                     mode: &mode,
                     chunk_overrides: chunk_overrides_opt,
+                    session_id: input.session_id,
                 },
             )
             .await?
@@ -260,6 +267,7 @@ pub async fn kb_rag(
                 top_k,
                 mode: &mode,
                 chunk_overrides: chunk_overrides_opt,
+                session_id: input.session_id,
             },
         )
         .await?
@@ -365,6 +373,8 @@ pub async fn kb_rag_stream(
     input: RagInput,
     on_chunk: tauri::ipc::Channel<String>,
 ) -> Result<serde_json::Value, String> {
+    // 分配本次流式生成的唯一 ID（用于精准取消，不干扰其他并发请求）
+    let rag_id = crate::kb::rag::next_rag_id();
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
     let top_k = input.top_k.unwrap_or(5).clamp(1, 100);
     // 显式指定知识库时校验可见性
@@ -432,7 +442,7 @@ pub async fn kb_rag_stream(
                     detail: Some(&question),
                 },
             );
-            return Ok(serde_json::json!({ "streamed": true, "faq": true }));
+            return Ok(serde_json::json!({ "streamed": true, "faq": true, "ragId": rag_id }));
         }
     }
 
@@ -449,7 +459,9 @@ pub async fn kb_rag_stream(
             top_k,
             mode: &mode,
             chunk_overrides: chunk_overrides_opt,
+            session_id: input.session_id,
         },
+        rag_id,
         |delta: &str| {
             let _ =
                 on_chunk.send(serde_json::json!({ "type": "delta", "content": delta }).to_string());
@@ -495,7 +507,9 @@ pub async fn kb_rag_stream(
                     detail: Some(&detail.to_string()),
                 },
             );
-            Ok(serde_json::json!({ "streamed": true, "model": model, "provider": provider_id }))
+            Ok(
+                serde_json::json!({ "streamed": true, "model": model, "provider": provider_id, "ragId": rag_id }),
+            )
         }
         Err(e) => {
             let _ = on_chunk.send(serde_json::json!({ "type": "error", "message": e }).to_string());
@@ -571,4 +585,13 @@ pub async fn kb_search_history(
         })
         .map_err(|e| e.to_string())?;
     Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
+/// 取消指定 RAG 流式生成（精准取消：仅中断目标请求，不影响其他并发请求）
+/// rag_id 为 kb_rag_stream 返回的流式生成 ID；未传时取消最新的活跃请求。
+#[tauri::command]
+pub async fn kb_rag_cancel(rag_id: Option<u64>) -> Result<(), String> {
+    let target = rag_id.unwrap_or_else(|| crate::kb::rag::next_rag_id().saturating_sub(1));
+    crate::kb::rag::request_rag_cancel(target);
+    Ok(())
 }

@@ -508,3 +508,44 @@ fn test_parse_with_anydoc_rejects_minimal_zip_falls_back() {
         doc.text
     );
 }
+
+#[test]
+fn test_sniff_format_magic_rejects_mismatch() {
+    let err = parse_document("docx", b"plain text, not a zip").unwrap_err();
+    assert!(
+        err.contains("魔数"),
+        "docx 非 zip 应被魔数嗅探拒绝: {}",
+        err
+    );
+    let err2 = parse_document("pdf", b"not a pdf").unwrap_err();
+    assert!(err2.contains("魔数"), "pdf 非 %PDF 应被拒绝: {}", err2);
+}
+
+/// zip-bomb：声明解压 70MB 的 document.xml，应在解压（anydoc/简易解析）之前被元数据预检拒绝
+#[test]
+fn test_docx_zip_bomb_rejected_before_decompression() {
+    use std::io::Write;
+    let mut buf = Vec::new();
+    {
+        let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let opts = zip::write::SimpleFileOptions::default();
+        zw.start_file("word/document.xml", opts).unwrap();
+        let big = vec![b'a'; 70 * 1024 * 1024]; // 70MB 高度可压缩 → zip 本身很小
+        zw.write_all(&big).unwrap();
+        zw.finish().unwrap();
+    }
+    let err = parse_document("docx", &buf).unwrap_err();
+    assert!(
+        err.contains("压缩炸弹"),
+        "zip-bomb docx 应在解压前被拒绝: {}",
+        err
+    );
+}
+
+/// 回归：加入魔数/炸弹防护后，正常 docx 仍可解析
+#[test]
+fn test_valid_docx_still_parses_after_guards() {
+    let docx = make_valid_docx("安全校验回归文档");
+    let parsed = parse_document("docx", &docx).unwrap();
+    assert!(!parsed.text.trim().is_empty(), "正常 docx 应能解析出文本");
+}

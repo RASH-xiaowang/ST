@@ -5,7 +5,7 @@
 
 use rusqlite::params;
 
-use super::extract::{extract_page_meta, refine_with_llm};
+use super::extract::{extract_page_meta, refine_with_llm, RefinedPage};
 use super::fts::sync_fts_upsert;
 use super::mutate::rebuild_links_for_page;
 use super::types::WikiGenerateInput;
@@ -75,8 +75,8 @@ pub async fn generate(
     .await
 }
 
-/// 批量提炼流水线（供后台任务调用）：逐文档创建 processing_jobs 任务，
-/// 提炼成功标记 done，失败标记 failed 并记录 processing_logs。
+/// 批量提炼流水线（供后台任务调用）：并发调用 LLM 提炼，显著提升速度。
+/// 并发度：WIKI_CONCURRENT_LIMIT（默认 3），避免 API 限流。
 pub async fn generate_with_jobs(
     db: KbDatabase,
     uid: i64,
@@ -85,8 +85,9 @@ pub async fn generate_with_jobs(
     provider_id: Option<&str>,
     model: Option<&str>,
 ) -> Result<Vec<i64>, String> {
-    let mark_job_failed = |job_id: i64, err: &str| {
-        let conn = db.conn_lock();
+    const WIKI_CONCURRENT_LIMIT: usize = 5;
+
+    let mark_job_failed = |conn: &rusqlite::Connection, job_id: i64, err: &str| {
         let _ = conn.execute(
             "UPDATE processing_jobs SET stage='failed', progress=1.0, error=?1 WHERE id = ?2",
             params![err, job_id],
@@ -98,9 +99,16 @@ pub async fn generate_with_jobs(
         log::error!("Wiki 提炼失败: job={} err={}", job_id, err);
     };
 
-    let mut created = Vec::new();
-    for (doc_id, file_type, doc_title) in docs {
-        // 停止检查：批量取消标记已置位（kb_stop_processing）时，终止整个批量
+    // ── 第一阶段：批量创建任务 + 读取文档文本 ──
+    struct DocTask {
+        doc_id: i64,
+        job_id: i64,
+        doc_title: String,
+        text: String,
+    }
+    let mut tasks: Vec<DocTask> = Vec::new();
+    for (doc_id, file_type, doc_title) in &docs {
+        // 停止检查
         {
             let conn = db.conn_lock();
             let cancelled: i64 = conn
@@ -114,7 +122,7 @@ pub async fn generate_with_jobs(
                 break;
             }
         }
-        // 创建处理任务
+        // 创建任务
         let job_id: i64 = {
             let conn = db.conn_lock();
             conn.execute(
@@ -148,26 +156,100 @@ pub async fn generate_with_jobs(
                 )
                 .ok();
             match blob {
-                Some(b) => parse::parse_document(&file_type, &b)
+                Some(b) => parse::parse_document(file_type, &b)
                     .map(|p| p.text)
                     .unwrap_or_default(),
                 None => String::new(),
             }
         };
         if text.trim().is_empty() {
-            mark_job_failed(job_id, "文档正文为空，无法提炼");
+            let conn = db.conn_lock();
+            mark_job_failed(&conn, job_id, "文档正文为空，无法提炼");
             continue;
         }
-        // 调用 LLM 提炼
-        let pages = match refine_with_llm(&text, &doc_title, provider_id, model).await {
-            Ok(p) => p,
-            Err(e) => {
-                mark_job_failed(job_id, &e);
-                continue;
+        tasks.push(DocTask {
+            doc_id: *doc_id,
+            job_id,
+            doc_title: doc_title.clone(),
+            text,
+        });
+    }
+
+    // ── 第二阶段：并发调用 LLM 提炼（限制并发数） ──
+    let provider_owned = provider_id.map(|s| s.to_string());
+    let model_owned = model.map(|s| s.to_string());
+    let mut llm_results: Vec<(i64, i64, Result<Vec<RefinedPage>, String>)> = Vec::new();
+    let total_tasks = tasks.len();
+    let mut completed_tasks = 0usize;
+    let batch_count = total_tasks.div_ceil(WIKI_CONCURRENT_LIMIT);
+
+    // 分批并发：每批 WIKI_CONCURRENT_LIMIT 个文档同时调用 LLM
+    for (batch_idx, chunk) in tasks.chunks(WIKI_CONCURRENT_LIMIT).enumerate() {
+        // 停止检查
+        {
+            let conn = db.conn_lock();
+            let cancelled: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM kb_chunk_settings WHERE key = ?1 AND value = '1'",
+                    params![format!("generate_cancel_{}", kb_id)],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if cancelled > 0 {
+                break;
             }
-        };
-        let page_count = pages.len();
-        // 停止检查：任务已被手动停止（kb_stop_processing 标记为 failed）时不落库
+        }
+
+        // 更新进度：每批开始时记录
+        {
+            let conn = db.conn_lock();
+            let progress = completed_tasks as f64 / total_tasks.max(1) as f64;
+            for task in chunk {
+                let _ = conn.execute(
+                    "UPDATE processing_jobs SET progress = ?1, updated_at = datetime('now') WHERE id = ?2",
+                    params![progress, task.job_id],
+                );
+            }
+            let _ = conn.execute(
+                "INSERT INTO processing_logs (job_id, level, message) VALUES (?1,'info',?2)",
+                params![
+                    chunk[0].job_id,
+                    format!(
+                        "开始第 {}/{} 批（并发 {}）",
+                        batch_idx + 1,
+                        batch_count,
+                        chunk.len()
+                    )
+                ],
+            );
+        }
+
+        let mut join_set = tokio::task::JoinSet::new();
+        for task in chunk {
+            let text = task.text.clone();
+            let title = task.doc_title.clone();
+            let pid = provider_owned.clone();
+            let mid = model_owned.clone();
+            let doc_id = task.doc_id;
+            let job_id = task.job_id;
+            join_set.spawn(async move {
+                let result = refine_with_llm(&text, &title, pid.as_deref(), mid.as_deref()).await;
+                (doc_id, job_id, result)
+            });
+        }
+        // 等待本批全部完成
+        while let Some(res) = join_set.join_next().await {
+            if let Ok(r) = res {
+                llm_results.push(r);
+                completed_tasks += 1;
+            }
+        }
+    }
+
+    // ── 第三阶段：落库（顺序执行，保证 SQLite 一致性） ──
+    let mut created = Vec::new();
+    for (doc_id, job_id, result) in llm_results {
+        // 停止检查：任务已被手动停止时不落库
         {
             let conn = db.conn_lock();
             let still_active: i64 = conn
@@ -185,7 +267,18 @@ pub async fn generate_with_jobs(
                 continue;
             }
         }
-        // 落库（同一文档重复提炼时按 kb_id+slug 覆盖旧页面）
+
+        let pages = match result {
+            Ok(p) => p,
+            Err(e) => {
+                let conn = db.conn_lock();
+                mark_job_failed(&conn, job_id, &e);
+                continue;
+            }
+        };
+        let page_count = pages.len();
+
+        // 落库
         {
             let conn = db.conn_lock();
             for p in pages {
@@ -206,7 +299,6 @@ pub async fn generate_with_jobs(
                     params![kb_id, doc_id, p.title, slug, p.summary, p.content, uid],
                 )
                 .map_err(|e| e.to_string())?;
-                // upsert 命中更新时 last_insert_rowid 行为依赖 SQLite 版本，显式取回页面 id
                 let pid: i64 = conn
                     .query_row(
                         "SELECT id FROM wiki_pages WHERE kb_id = ?1 AND slug = ?2",

@@ -273,6 +273,7 @@ fn ensure_entity_dir(
 
 /// 为抽取的实体自动创建「实体页」（不存在时），并按类型归档到 实体/<类型> 目录，
 /// 页面正文回链来源页，自动重建链接后纳入知识图谱。
+/// 修复：实体页关联来源文档的 doc_id，确保删除文档时级联清理。
 pub(crate) fn ensure_entity_pages(
     db: &KbDatabase,
     kb_id: i64,
@@ -283,6 +284,16 @@ pub(crate) fn ensure_entity_pages(
     if entities.is_empty() {
         return Ok(0);
     }
+    // 查找来源页面关联的 doc_id，用于级联删除
+    let source_doc_id: Option<i64> = {
+        let conn = db.conn_lock();
+        conn.query_row(
+            "SELECT doc_id FROM wiki_pages WHERE id = ?1",
+            params![source_page_id],
+            |r| r.get(0),
+        )
+        .ok()
+    };
     let mut created = 0usize;
     {
         let conn = db.conn_lock();
@@ -312,9 +323,9 @@ pub(crate) fn ensure_entity_pages(
             md.push_str(&format!("相关页面：[[{}]]", source_title));
             let summary = desc.clone().unwrap_or_else(|| format!("实体「{}」", name));
             conn.execute(
-                "INSERT INTO wiki_pages (kb_id, dir_id, title, slug, summary, content_md, status, extract_status, created_by)
-                 VALUES (?1,?2,?3,?4,?5,?6,'draft','done',NULL)",
-                params![kb_id, dir_id, name, slug, summary, md],
+                "INSERT INTO wiki_pages (kb_id, dir_id, doc_id, title, slug, summary, content_md, status, extract_status, created_by)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,'published','done',NULL)",
+                params![kb_id, dir_id, source_doc_id, name, slug, summary, md],
             )
             .map_err(|e| e.to_string())?;
             created += 1;
@@ -325,7 +336,6 @@ pub(crate) fn ensure_entity_pages(
         let conn = db.conn_lock();
         rebuild_kb_links(&conn, kb_id)?;
     }
-    let _ = source_page_id;
     Ok(created)
 }
 
@@ -337,7 +347,33 @@ pub(crate) struct RefinedPage {
 }
 
 /// 调用大模型将文档正文提炼为相互链接的多页面 Markdown。
+/// 长文档拆分阈值（字符数）：超过此值将分段提炼
+const LONG_DOC_SPLIT_THRESHOLD: usize = 15000;
+
+/// 将长文档按段落边界拆分为多段，每段不超过 max_chars
+fn split_long_text(text: &str, max_chars: usize) -> Vec<String> {
+    if text.len() <= max_chars {
+        return vec![text.to_string()];
+    }
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        if current.len() + line.len() + 1 > max_chars && !current.is_empty() {
+            segments.push(current.clone());
+            current.clear();
+        }
+        current.push_str(line);
+        current.push('\n');
+    }
+    if !current.trim().is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
 /// 要求模型按 `<<<PAGE>>>...<<<END>>>` 分段输出，正文内用 [[页面标题]] 表示链接。
+/// 内置重试：网络中断 / 响应解码失败时自动重试最多 3 次。
+/// 优化：长文档自动拆分为多段分别提炼，减少单次 LLM 耗时。
 pub(crate) async fn refine_with_llm(
     text: &str,
     doc_title: &str,
@@ -356,35 +392,89 @@ pub(crate) async fn refine_with_llm(
     正文（Markdown）\n\
     <<<END>>>\n\
     不要输出任何其他文字。";
-    let user = format!(
-        "请将以下文档《{}》提炼为相互链接的知识库页面：\n\n{}",
-        doc_title,
-        truncate_for_llm(text, 30000)
-    );
-    let request = crate::llm::types::ChatRequest {
-        provider_id: provider_id.map(|s| s.to_string()),
-        model: model.map(|s| s.to_string()),
-        role_id: None,
-        messages: vec![
-            crate::llm::types::ChatMessage {
-                role: "system".into(),
-                content: system.to_string(),
-                parts: None,
-            },
-            crate::llm::types::ChatMessage {
-                role: "user".into(),
-                content: user,
-                parts: None,
-            },
-        ],
-        max_tokens: Some(6000),
-        temperature: Some(0.3),
-        top_p: None,
-        presence_penalty: None,
-        frequency_penalty: None,
-    };
-    let result = crate::llm::handlers::chat_with_llm(request).await?;
-    parse_refined_pages(&result.content)
+
+    let truncated = truncate_for_llm(text, 30000);
+
+    // 长文档拆分：超过阈值时分段提炼
+    let segments = split_long_text(&truncated, LONG_DOC_SPLIT_THRESHOLD);
+    let mut all_pages: Vec<RefinedPage> = Vec::new();
+
+    for (i, segment) in segments.iter().enumerate() {
+        let title_hint = if segments.len() > 1 {
+            format!("{}（第{}/{}部分）", doc_title, i + 1, segments.len())
+        } else {
+            doc_title.to_string()
+        };
+
+        let user = format!(
+            "请将以下文档《{}》提炼为相互链接的知识库页面：\n\n{}",
+            title_hint, segment
+        );
+        let request = crate::llm::types::ChatRequest {
+            provider_id: provider_id.map(|s| s.to_string()),
+            model: model.map(|s| s.to_string()),
+            role_id: None,
+            messages: vec![
+                crate::llm::types::ChatMessage {
+                    role: "system".into(),
+                    content: system.to_string(),
+                    parts: None,
+                },
+                crate::llm::types::ChatMessage {
+                    role: "user".into(),
+                    content: user,
+                    parts: None,
+                },
+            ],
+            max_tokens: Some(4000), // 分段后每段输出更少
+            temperature: Some(0.3),
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+        };
+
+        // 重试逻辑
+        let max_retries = 3;
+        let mut last_err = String::new();
+        let mut segment_result = None;
+        for attempt in 1..=max_retries {
+            match crate::llm::handlers::chat_with_llm(request.clone()).await {
+                Ok(result) => {
+                    segment_result = Some(parse_refined_pages(&result.content));
+                    break;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_retryable = msg.contains("读取响应失败")
+                        || msg.contains("响应体为空")
+                        || msg.contains("connection closed")
+                        || msg.contains("connection reset")
+                        || msg.contains("timed out")
+                        || msg.contains("error decoding response body");
+                    if is_retryable && attempt < max_retries {
+                        let delay = std::time::Duration::from_millis(1000 * attempt as u64);
+                        log::warn!(
+                            "Wiki 提炼 LLM 调用失败（第 {} 次），{}ms 后重试: {}",
+                            attempt,
+                            delay.as_millis(),
+                            msg
+                        );
+                        tokio::time::sleep(delay).await;
+                        last_err = msg;
+                        continue;
+                    }
+                    return Err(msg);
+                }
+            }
+        }
+        match segment_result {
+            Some(Ok(pages)) => all_pages.extend(pages),
+            Some(Err(e)) => return Err(e),
+            None => return Err(last_err),
+        }
+    }
+
+    Ok(all_pages)
 }
 
 /// 解析 LLM 输出的多页面 Markdown

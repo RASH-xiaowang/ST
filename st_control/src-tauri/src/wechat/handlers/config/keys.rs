@@ -32,10 +32,11 @@ pub async fn verify_database_key(
     };
     let (hmac_ok, aes_ok) = crypto::verify_key(&wx_key_bin, page1);
     let valid = hmac_ok && aes_ok;
-    let salt_hex = hex::encode(&page1[..crypto::SALT_SZ]);
-    eprintln!(
-        "[verify_db] key={} salt={} hmac={} aes={} valid={}",
-        enc_key_hex, salt_hex, hmac_ok, aes_ok, valid
+    log::debug!(
+        "[verify_db] hmac={} aes={} valid={}",
+        hmac_ok,
+        aes_ok,
+        valid
     );
     Ok(
         serde_json::json!({ "valid": valid, "format": if valid { serde_json::Value::String("wx_key_v4.1".into()) } else { serde_json::Value::Null }, "aes_ok": aes_ok, "hmac_ok": hmac_ok, "size": 32 }),

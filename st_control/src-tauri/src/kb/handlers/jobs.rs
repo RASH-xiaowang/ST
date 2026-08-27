@@ -124,6 +124,57 @@ pub fn count_jobs(db: &KbDatabase, uid: i64, kb_id: Option<i64>) -> i64 {
     r.unwrap_or(0)
 }
 
+/// 按分类统计任务数量（从数据库直接统计，不依赖已加载的 jobs 数组）
+pub fn count_jobs_by_category(
+    db: &KbDatabase,
+    uid: i64,
+    kb_id: Option<i64>,
+) -> std::collections::HashMap<String, i64> {
+    let mut map = std::collections::HashMap::new();
+    let visible = crate::kb::retrieval::visible_kb_ids(db, uid);
+    if visible.is_empty() {
+        return map;
+    }
+    let conn = db.conn_lock();
+    let (kb_filter, binds): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(k) = kb_id
+    {
+        ("d.kb_id = ?1".to_string(), vec![Box::new(k)])
+    } else {
+        let ph = visible.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        (
+            format!("d.kb_id IN ({})", ph),
+            visible
+                .iter()
+                .map(|v| Box::new(*v) as Box<dyn rusqlite::types::ToSql>)
+                .collect(),
+        )
+    };
+    let stages = [
+        "pending",
+        "parsing",
+        "chunking",
+        "embedding",
+        "generating",
+        "done",
+        "failed",
+        "embed_error",
+    ];
+    for stage in stages {
+        let sql = format!(
+            "SELECT COUNT(*) FROM processing_jobs j JOIN documents d ON d.id = j.doc_id WHERE {} AND j.stage = ?",
+            kb_filter
+        );
+        let mut all_binds: Vec<&dyn rusqlite::types::ToSql> =
+            binds.iter().map(|b| b.as_ref()).collect();
+        all_binds.push(&stage);
+        let count: i64 = conn
+            .query_row(&sql, all_binds.as_slice(), |r| r.get(0))
+            .unwrap_or(0);
+        map.insert(stage.to_string(), count);
+    }
+    map
+}
+
 #[tauri::command]
 pub async fn kb_list_jobs(
     db: State<'_, KbDatabase>,
@@ -134,7 +185,21 @@ pub async fn kb_list_jobs(
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
     let items = list_jobs(&db, uid, kb_id, limit.unwrap_or(50))?;
     let total = count_jobs(&db, uid, kb_id);
-    Ok(serde_json::json!({ "items": items, "total": total }))
+    let counts = count_jobs_by_category(&db, uid, kb_id);
+    Ok(serde_json::json!({
+        "items": items,
+        "total": total,
+        "counts": {
+            "pending": counts.get("pending").copied().unwrap_or(0),
+            "processing": counts.get("parsing").copied().unwrap_or(0)
+                + counts.get("chunking").copied().unwrap_or(0)
+                + counts.get("embedding").copied().unwrap_or(0)
+                + counts.get("generating").copied().unwrap_or(0),
+            "done": counts.get("done").copied().unwrap_or(0),
+            "failed": counts.get("failed").copied().unwrap_or(0)
+                + counts.get("embed_error").copied().unwrap_or(0),
+        }
+    }))
 }
 
 #[derive(Serialize)]
@@ -200,7 +265,9 @@ pub async fn kb_clear_activity(
     scope: String,
 ) -> Result<serde_json::Value, String> {
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
-    let visible = crate::kb::retrieval::visible_kb_ids(&db, uid);
+    // 安全：jobs/logs 清理作用于多个知识库，仅限用户具备「编辑者」及以上权限的库；
+    // history 为当前用户检索历史，任何已登录用户可清空自己的记录。
+    let visible = crate::kb::retrieval::editable_kb_ids(&db, uid);
     let conn = db.conn_lock();
     let mut cleared = serde_json::Map::new();
     match scope.as_str() {
@@ -294,16 +361,18 @@ pub async fn kb_stop_processing(
     kb_id: Option<i64>,
 ) -> Result<serde_json::Value, String> {
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
-    let visible = crate::kb::retrieval::visible_kb_ids(&db, uid);
-    if visible.is_empty() {
+    // 安全：停止处理是编辑级操作；显式指定库时要求 editor+，未指定时仅作用于可编辑库
+    let target_kbs: Vec<i64> = match kb_id {
+        Some(k) => {
+            crate::kb::retrieval::require_kb_role(&db, k, uid, "editor")?;
+            vec![k]
+        }
+        None => crate::kb::retrieval::editable_kb_ids(&db, uid),
+    };
+    if target_kbs.is_empty() {
         return Ok(serde_json::json!({ "stopped": 0 }));
     }
     let conn = db.conn_lock();
-    let target_kbs: Vec<i64> = match kb_id {
-        Some(k) if visible.contains(&k) => vec![k],
-        Some(_) => Vec::new(),
-        None => visible,
-    };
     let stopped: usize;
     if target_kbs.is_empty() {
         stopped = 0;
@@ -343,4 +412,226 @@ pub async fn kb_stop_processing(
     }
     drop(conn);
     Ok(serde_json::json!({ "stopped": stopped }))
+}
+
+/// 重试单个失败任务：将 failed/embed_error 状态的任务重新提交处理
+#[tauri::command]
+pub async fn kb_retry_job(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    job_id: i64,
+) -> Result<serde_json::Value, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    let conn = db.conn_lock();
+    // 校验任务存在且为可重试状态，并要求用户对该库具备 editor+ 权限
+    let (doc_id, kb_id, stage): (i64, i64, String) = conn
+        .query_row(
+            "SELECT j.doc_id, d.kb_id, j.stage FROM processing_jobs j
+             JOIN documents d ON d.id = j.doc_id WHERE j.id = ?1",
+            rusqlite::params![job_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| "任务不存在".to_string())?;
+    crate::kb::retrieval::require_kb_role(&db, kb_id, uid, "editor")?;
+    if stage != "failed" && stage != "embed_error" {
+        return Err(format!("当前状态「{}」不可重试，仅失败任务可重试", stage));
+    }
+    // 重置任务状态
+    conn.execute(
+        "UPDATE processing_jobs SET stage='pending', progress=0.0, error=NULL, updated_at=datetime('now') WHERE id = ?1",
+        rusqlite::params![job_id],
+    ).map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE documents SET status='processing', process_status='pending', updated_at=datetime('now') WHERE id = ?1",
+        rusqlite::params![doc_id],
+    ).map_err(|e| e.to_string())?;
+    conn.execute(
+        "INSERT INTO processing_logs (job_id, level, message) VALUES (?1,'info','任务已重新提交')",
+        rusqlite::params![job_id],
+    )
+    .map_err(|e| e.to_string())?;
+    drop(conn);
+
+    // 后台异步重新处理
+    let db_task = (*db).clone();
+    let provider_model = crate::kb::handlers::resolve_embedding_pair(&db, None, None);
+    tauri::async_runtime::spawn(async move {
+        // 读取文档信息并重新走处理流水线
+        let (file_type, version_id): (String, i64) = {
+            let c = db_task.conn_lock();
+            let ft: String = c
+                .query_row(
+                    "SELECT COALESCE(file_type,'txt') FROM documents WHERE id = ?1",
+                    rusqlite::params![doc_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default();
+            let vid: i64 = c
+                .query_row(
+                    "SELECT COALESCE(current_version_id, 0) FROM documents WHERE id = ?1",
+                    rusqlite::params![doc_id],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            (ft, vid)
+        };
+        // 读取文件数据
+        let data: Vec<u8> = {
+            let c = db_task.conn_lock();
+            c.query_row(
+                "SELECT fo.blob_data FROM document_versions dv
+                 JOIN file_objects fo ON fo.id = dv.file_object_id
+                 WHERE dv.doc_id = ?1 ORDER BY dv.version_no DESC LIMIT 1",
+                rusqlite::params![doc_id],
+                |r| r.get(0),
+            )
+            .unwrap_or_default()
+        };
+        if data.is_empty() {
+            let c = db_task.conn_lock();
+            let _ = c.execute(
+                "UPDATE processing_jobs SET stage='failed', error='文件数据为空，无法重试' WHERE id = ?1",
+                rusqlite::params![job_id],
+            );
+            return;
+        }
+        // 调用文档处理流水线
+        crate::kb::handlers::docs::process_document_for_retry(
+            db_task,
+            doc_id,
+            version_id,
+            job_id,
+            file_type,
+            data,
+            provider_model.0,
+            provider_model.1,
+        )
+        .await;
+    });
+
+    Ok(serde_json::json!({ "retried": true, "jobId": job_id }))
+}
+
+/// 批量重试所有失败任务
+#[tauri::command]
+pub async fn kb_retry_failed_jobs(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    kb_id: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    // 安全：批量重试是编辑级操作；显式指定库时要求 editor+，未指定时仅作用于可编辑库
+    let target_kbs: Vec<i64> = match kb_id {
+        Some(k) => {
+            crate::kb::retrieval::require_kb_role(&db, k, uid, "editor")?;
+            vec![k]
+        }
+        None => crate::kb::retrieval::editable_kb_ids(&db, uid),
+    };
+    if target_kbs.is_empty() {
+        return Ok(serde_json::json!({ "retried": 0 }));
+    }
+    let conn = db.conn_lock();
+    if target_kbs.is_empty() {
+        return Ok(serde_json::json!({ "retried": 0 }));
+    }
+    let ph = target_kbs.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    // 找出所有失败任务
+    let failed_jobs: Vec<(i64, i64)> = {
+        let sql = format!(
+            "SELECT j.id, j.doc_id FROM processing_jobs j
+             JOIN documents d ON d.id = j.doc_id
+             WHERE j.stage IN ('failed','embed_error') AND d.kb_id IN ({})",
+            ph
+        );
+        let binds: Vec<&dyn rusqlite::types::ToSql> = target_kbs
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(binds.as_slice(), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let count = failed_jobs.len();
+    if count == 0 {
+        return Ok(serde_json::json!({ "retried": 0 }));
+    }
+    // 批量重置状态
+    for (jid, did) in &failed_jobs {
+        let _ = conn.execute(
+            "UPDATE processing_jobs SET stage='pending', progress=0.0, error=NULL, updated_at=datetime('now') WHERE id = ?1",
+            rusqlite::params![jid],
+        );
+        let _ = conn.execute(
+            "UPDATE documents SET status='processing', process_status='pending', updated_at=datetime('now') WHERE id = ?1",
+            rusqlite::params![did],
+        );
+        let _ = conn.execute(
+            "INSERT INTO processing_logs (job_id, level, message) VALUES (?1,'info','批量重试：任务已重新提交')",
+            rusqlite::params![jid],
+        );
+    }
+    drop(conn);
+
+    // 后台逐个重新处理（复用单个重试逻辑）
+    let db_task = (*db).clone();
+    let provider_model = crate::kb::handlers::resolve_embedding_pair(&db, None, None);
+    tauri::async_runtime::spawn(async move {
+        for (jid, did) in failed_jobs {
+            let (file_type, version_id): (String, i64) = {
+                let c = db_task.conn_lock();
+                let ft: String = c
+                    .query_row(
+                        "SELECT COALESCE(file_type,'txt') FROM documents WHERE id = ?1",
+                        rusqlite::params![did],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or_default();
+                let vid: i64 = c
+                    .query_row(
+                        "SELECT COALESCE(current_version_id, 0) FROM documents WHERE id = ?1",
+                        rusqlite::params![did],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                (ft, vid)
+            };
+            let data: Vec<u8> = {
+                let c = db_task.conn_lock();
+                c.query_row(
+                    "SELECT fo.blob_data FROM document_versions dv
+                     JOIN file_objects fo ON fo.id = dv.file_object_id
+                     WHERE dv.doc_id = ?1 ORDER BY dv.version_no DESC LIMIT 1",
+                    rusqlite::params![did],
+                    |r| r.get(0),
+                )
+                .unwrap_or_default()
+            };
+            if data.is_empty() {
+                let c = db_task.conn_lock();
+                let _ = c.execute(
+                    "UPDATE processing_jobs SET stage='failed', error='文件数据为空' WHERE id = ?1",
+                    rusqlite::params![jid],
+                );
+                continue;
+            }
+            crate::kb::handlers::docs::process_document_for_retry(
+                db_task.clone(),
+                did,
+                version_id,
+                jid,
+                file_type,
+                data,
+                provider_model.0.clone(),
+                provider_model.1.clone(),
+            )
+            .await;
+        }
+    });
+
+    Ok(serde_json::json!({ "retried": count }))
 }

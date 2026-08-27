@@ -12,7 +12,7 @@ use std::sync::Mutex;
 use super::modules::common;
 
 mod crud;
-pub(crate) use crud::*;
+pub use crud::*;
 mod retrieve;
 pub(crate) use retrieve::*;
 

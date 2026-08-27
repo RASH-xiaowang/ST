@@ -211,6 +211,7 @@ pub async fn agent_execute(
                 top_k: 5,
                 mode: "hybrid",
                 chunk_overrides: None,
+                session_id: None,
             },
         )
         .await
@@ -341,6 +342,7 @@ pub async fn agent_chat_stream(
                 top_k: 5,
                 mode: "hybrid",
                 chunk_overrides: None,
+                session_id: None,
             },
         )
         .await

@@ -36,6 +36,14 @@ pub(crate) async fn health(State(state): State<Arc<ApiServerState>>) -> Json<ser
         "auth": state.current_token().is_some(),
         "monitor": { "running": monitor_running },
         "database": { "ready": db_ready },
+        "rateLimit": {
+            "trackedIps": state.rate_limiter.tracked_ips(),
+            "policy": "60/min read, 10/min write",
+        },
+        "security": {
+            "cipherReady": crate::security::AppCipher::is_ready(),
+            "vectorIndex": crate::vector_index::VECTOR_INDEX.stats(),
+        },
     }))
 }
 

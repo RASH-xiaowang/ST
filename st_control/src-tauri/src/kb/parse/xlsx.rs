@@ -10,25 +10,22 @@ use super::ParsedDoc;
 /// 简易 xlsx 解析：读取共享字符串表与第一个工作表，按行提取单元格文本。
 /// 复用现有 zip crate，不引入新依赖；仅覆盖常见文本型表格。
 pub(crate) fn parse_xlsx(data: &[u8]) -> Result<ParsedDoc, String> {
-    use std::io::Read;
     let cursor = std::io::Cursor::new(data);
     let mut zip = zip::ZipArchive::new(cursor).map_err(|e| format!("xlsx 解压失败: {}", e))?;
+    // 安全：条目数量与单条目解压大小都设上限，防御 zip-bomb
+    super::check_zip_entry_count(&zip)?;
     // 共享字符串表（shared strings）
-    let shared: Vec<String> = if let Ok(mut f) = zip.by_name("xl/sharedStrings.xml") {
-        let mut buf = String::new();
-        f.read_to_string(&mut buf)
-            .map_err(|e| format!("读取 sharedStrings.xml 失败: {}", e))?;
+    let shared: Vec<String> = if let Ok(f) = zip.by_name("xl/sharedStrings.xml") {
+        let buf = super::read_zip_entry_text(f, "xl/sharedStrings.xml")?;
         extract_xlsx_shared_strings(&buf)
     } else {
         Vec::new()
     };
     // 第一个工作表
-    let mut f = zip
+    let f = zip
         .by_name("xl/worksheets/sheet1.xml")
         .map_err(|_| "未找到工作表 xl/worksheets/sheet1.xml".to_string())?;
-    let mut buf = String::new();
-    f.read_to_string(&mut buf)
-        .map_err(|e| format!("读取工作表失败: {}", e))?;
+    let buf = super::read_zip_entry_text(f, "xl/worksheets/sheet1.xml")?;
     let text = extract_xlsx_sheet_text(&buf, &shared);
     if text.trim().is_empty() {
         return Err("xlsx 未提取到文本内容（可能为空表或结构不受支持）".to_string());

@@ -19,6 +19,7 @@ pub enum ProviderType {
     OpenAI,
     Azure,
     Ollama,
+    Xiaomi,
     Custom,
 }
 
@@ -28,6 +29,7 @@ impl ProviderType {
             ProviderType::OpenAI => "openai",
             ProviderType::Azure => "azure",
             ProviderType::Ollama => "ollama",
+            ProviderType::Xiaomi => "xiaomi",
             ProviderType::Custom => "custom",
         }
     }
@@ -102,19 +104,61 @@ impl Default for ProviderConfig {
 /// 单个模型的元数据（类型 + 标签），用于切换模型时展示其能力
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ModelMeta {
-    /// 模型类型（对话 / 生图 / 视频 / 语音 / 嵌入 / 重排序 等），单选
+    /// 模型类型（对话 / 生图 / 视频 / 语音 / 嵌入 / 重排序等），单选
     #[serde(default)]
     pub model_type: Option<String>,
     /// 模型能力标签（视觉 / MoE / 推理 / Tools / FIM / Math / Coder 等），可多选
     #[serde(default)]
     pub tags: Vec<String>,
     /// 推理等级选择（DSH reasoningEfforts 迁移）：off / high / max 等。
-    /// 空 = 未声明（不展示等级选择，请求不带 reasoning_effort）
+    /// 空= 未声明（不展示等级选择，请求不带 reasoning_effort）
     #[serde(default)]
     pub reasoning_efforts: Vec<String>,
     /// 上下文窗口（token；DSH contextWindow 迁移；用于上下文仪表容量显示）
     #[serde(default)]
     pub context_window: Option<u64>,
+
+    // ─── 模态 (Modalities) ───
+    /// 输入模态：支持的输入类型，可多选
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    /// 输出模态：支持的输出类型，可多选
+    #[serde(default)]
+    pub output_modalities: Vec<String>,
+
+    // ─── 模型能力 (Capabilities) ───
+    /// 深度思考：是否支持深度推理
+    #[serde(default)]
+    pub reasoning: bool,
+    /// 工具调用：是否支持 function calling / tool use
+    #[serde(default)]
+    pub tool_use: bool,
+    /// 流式输出：是否支持 streaming
+    #[serde(default)]
+    pub streaming: bool,
+    /// 联网搜索：是否支持 web search
+    #[serde(default)]
+    pub web_search: bool,
+    /// 结构化输出：是否支持 JSON mode / structured output
+    #[serde(default)]
+    pub structured_output: bool,
+    /// Prompt 缓存：是否支持 prompt caching
+    #[serde(default)]
+    pub prompt_cache: bool,
+    /// 多模态分析：是否支持图片/音视频理解（用于知识库文件上传多模态分析）
+    #[serde(default)]
+    pub multimodal: bool,
+
+    // ─── 性能 (Performance) ───
+    /// 最大输出长度（tokens）
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// 每分钟请求数限制 (RPM)
+    #[serde(default)]
+    pub requests_per_minute: Option<u64>,
+    /// 每分钟 Token 数限制 (TPM)
+    #[serde(default)]
+    pub tokens_per_minute: Option<u64>,
 }
 
 /// 全局大模型配置：所有提供方列表 + 默认提供方

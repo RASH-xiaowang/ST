@@ -168,3 +168,30 @@ pub async fn restore_internal_db(
         "hint": "请先关闭应用，再将此文件改名为 control.db 覆盖原文件，然后重新启动。",
     }))
 }
+
+// ─────────────────────────────────────────────
+// 安全审计（数据完整性 / 加密状态）
+// ─────────────────────────────────────────────
+
+/// 应用安全状态概览
+/// 返回：加密器状态、向量索引状态、各数据库完整性（SHA-256 + PRAGMA integrity_check）
+#[tauri::command]
+pub async fn get_security_status(
+    db: tauri::State<'_, crate::db::Database>,
+) -> Result<serde_json::Value, String> {
+    let cipher_ready = crate::security::AppCipher::is_ready();
+    let vector_stats = crate::vector_index::VECTOR_INDEX.stats();
+    let control_db = crate::security::kb_integrity_report(&db.path());
+
+    let kb_db_path = std::path::PathBuf::from(crate::kb::db::KbDatabase::db_path_string());
+    let kb_db = crate::security::kb_integrity_report(&kb_db_path);
+
+    Ok(serde_json::json!({
+        "cipherReady": cipher_ready,
+        "vectorIndex": vector_stats,
+        "databases": {
+            "control": control_db,
+            "knowledgeBase": kb_db,
+        },
+    }))
+}

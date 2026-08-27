@@ -15,11 +15,6 @@ use crate::kb::db::KbDatabase;
 
 /// 将页面幂等写入全文索引（先删后插，供 create/update/generate 共用）
 pub(crate) fn sync_fts_upsert(conn: &rusqlite::Connection, page_id: i64) -> Result<(), String> {
-    conn.execute(
-        "DELETE FROM wiki_pages_fts WHERE rowid = ?1",
-        params![page_id],
-    )
-    .map_err(|e| e.to_string())?;
     let row: Option<(String, String, String)> = conn
         .query_row(
             "SELECT COALESCE(title,''), COALESCE(summary,''), COALESCE(content_md,'') FROM wiki_pages WHERE id = ?1",
@@ -28,16 +23,7 @@ pub(crate) fn sync_fts_upsert(conn: &rusqlite::Connection, page_id: i64) -> Resu
         )
         .ok();
     if let Some((title, summary, content)) = row {
-        conn.execute(
-            "INSERT INTO wiki_pages_fts (rowid, title, summary, content_md) VALUES (?1,?2,?3,?4)",
-            params![
-                page_id,
-                crate::kb::cjk_spaced(&title),
-                crate::kb::cjk_spaced(&summary),
-                crate::kb::cjk_spaced(&content)
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+        crate::kb::db::fts_update_wiki_page(conn, page_id, &title, &summary, &content)?;
     }
     Ok(())
 }
@@ -59,29 +45,15 @@ pub fn rebuild_fts(db: &KbDatabase) -> Result<(), String> {
         q.filter_map(|r| r.ok()).collect()
     };
     for (pid, title, summary, content) in rows {
-        conn.execute(
-            "INSERT INTO wiki_pages_fts (rowid, title, summary, content_md) VALUES (?1,?2,?3,?4)",
-            params![
-                pid,
-                crate::kb::cjk_spaced(&title),
-                crate::kb::cjk_spaced(&summary),
-                crate::kb::cjk_spaced(&content)
-            ],
-        )
-        .map_err(|e| e.to_string())?;
+        crate::kb::db::fts_insert_wiki_page(&conn, pid, &title, &summary, &content)?;
     }
     Ok(())
 }
 
-/// 将用户查询转为 FTS5 安全查询：按空白切词、逐词加引号，默认 AND 组合
+/// 将用户查询转为 FTS5 安全查询（共享实现，见 crate::kb::fts_safe_query；
+/// 支持中文整句按字 OR 召回，避免中文整句作为单一短语导致 0 命中）
 fn fts_match_query(query: &str) -> String {
-    query
-        .split_whitespace()
-        .map(|w| w.replace(['"', '(', ')', '*', '^', ':', '-'], " "))
-        .filter(|w| !w.is_empty())
-        .map(|w| format!("\"{}\"", crate::kb::cjk_spaced(&w)))
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::kb::fts_safe_query(query)
 }
 
 /// 在知识库内用 BM25 检索 Wiki 页面，按相关度返回（score 越低越相关）

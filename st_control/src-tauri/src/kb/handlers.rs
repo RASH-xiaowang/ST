@@ -7,27 +7,29 @@
 use crate::kb::db::KbDatabase;
 
 mod analytics_settings;
-pub(crate) use analytics_settings::*;
+pub use analytics_settings::*;
 mod analytics;
-pub(crate) use analytics::*;
+pub use analytics::*;
 mod jobs;
-pub(crate) use jobs::*;
+pub use jobs::*;
 mod qa;
-pub(crate) use qa::*;
+pub use qa::*;
 mod docs;
-pub(crate) use docs::*;
+pub use docs::*;
 mod versions;
-pub(crate) use versions::*;
+pub use versions::*;
 mod search;
-pub(crate) use search::*;
+pub use search::*;
 mod chunks;
-pub(crate) use chunks::*;
+pub use chunks::*;
 mod access;
-pub(crate) use access::*;
+pub use access::*;
 mod settings;
-pub(crate) use settings::*;
+pub use settings::*;
 mod wiki;
-pub(crate) use wiki::*;
+pub use wiki::*;
+mod export;
+pub use export::*;
 
 /// 清理不再被任何 document_versions 引用的 file_objects（孤儿原始文件 BLOB）。
 /// 必须先收集候选 id（在删除引用前），再在删除后调用。
@@ -101,14 +103,12 @@ pub(crate) fn log_metric_event(db: &KbDatabase, ev: &MetricEvent<'_>) {
 }
 
 /// 指标配置默认显示名
-pub(crate) const ANALYTICS_METRIC_DEFAULTS: [(&str, &str); 8] = [
+pub(crate) const ANALYTICS_METRIC_DEFAULTS: [(&str, &str); 6] = [
     ("messages", "消息量"),
     ("sessions", "会话量"),
     ("recall", "整体召回率"),
-    ("handoff", "转人工率"),
     ("faq", "常用问答"),
     ("llm", "LLM问答"),
-    ("task", "任务技能"),
     ("recommend", "问题推荐"),
 ];
 

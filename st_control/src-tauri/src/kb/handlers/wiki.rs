@@ -25,6 +25,7 @@ pub async fn kb_wiki_list_pages(
 }
 
 /// 列出知识库内的 Wiki 目录（含页面数，供前端按目录筛选）
+/// 只返回包含 Wiki 页面的目录，避免文档目录删除影响 Wiki 目录树
 #[tauri::command]
 pub async fn kb_wiki_dirs(
     db: State<'_, KbDatabase>,
@@ -36,11 +37,15 @@ pub async fn kb_wiki_dirs(
         return Err("无权限：你无权访问该知识库".to_string());
     }
     let conn = db.conn_lock();
+    // 只返回包含 Wiki 页面的目录（独立于文档目录树）
     let mut stmt = conn
         .prepare(
             "SELECT d.id, d.parent_id, d.name,
                     (SELECT COUNT(*) FROM wiki_pages p WHERE p.dir_id = d.id) AS cnt
-             FROM kb_directories d WHERE d.kb_id = ?1 ORDER BY d.name",
+             FROM kb_directories d
+             WHERE d.kb_id = ?1
+               AND EXISTS (SELECT 1 FROM wiki_pages p WHERE p.dir_id = d.id)
+             ORDER BY d.name",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -278,18 +283,30 @@ pub async fn kb_wiki_extract(
 }
 
 /// 批量提取知识库内尚未提取（或失败）页面的摘要与实体（后台执行）
+/// force=true 时先重置所有页面的 extract_status，再全量提取
 #[tauri::command]
 pub async fn kb_wiki_extract_all(
     db: State<'_, KbDatabase>,
     session: State<'_, crate::kb::auth::UserSession>,
     kb_id: i64,
+    force: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
     if !crate::kb::retrieval::can_manage_kb(&db, kb_id, uid) {
         return Err("无权限：仅知识库 owner/admin 可批量提取".to_string());
     }
+    let force = force.unwrap_or(false);
     let pages: Vec<i64> = {
         let conn = db.conn_lock();
+        // 强制模式：先重置所有页面的 extract_status 为空
+        if force {
+            conn.execute(
+                "UPDATE wiki_pages SET extract_status = '' WHERE kb_id = ?1",
+                rusqlite::params![kb_id],
+            )
+            .map_err(|e| e.to_string())?;
+            log::info!("[wiki] 强制重置知识库 {} 全部页面 extract_status", kb_id);
+        }
         let mut stmt = conn
             .prepare(
                 "SELECT id FROM wiki_pages WHERE kb_id = ?1 AND COALESCE(extract_status,'') != 'done' ORDER BY id",
@@ -321,7 +338,7 @@ pub async fn kb_wiki_extract_all(
             }
         }
     });
-    Ok(serde_json::json!({ "submitted": submitted }))
+    Ok(serde_json::json!({ "submitted": submitted, "force": force }))
 }
 
 /// 删除页面（仅 owner/admin）
@@ -396,4 +413,35 @@ fn wiki_page_kb_id(db: &KbDatabase, page_id: i64) -> Result<i64, String> {
         |r| r.get::<_, i64>(0),
     )
     .map_err(|_| "页面不存在".to_string())
+}
+
+/// 列出页面的版本历史
+#[tauri::command]
+pub async fn kb_wiki_list_versions(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    page_id: i64,
+) -> Result<Vec<crate::kb::wiki::WikiVersionItem>, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    let kb_id = wiki_page_kb_id(&db, page_id)?;
+    if !crate::kb::retrieval::can_access_kb(&db, kb_id, uid) {
+        return Err("无权限".to_string());
+    }
+    crate::kb::wiki::list_versions(&db, page_id)
+}
+
+/// 回滚页面到指定版本
+#[tauri::command]
+pub async fn kb_wiki_restore_version(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    page_id: i64,
+    version_id: i64,
+) -> Result<(), String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    let kb_id = wiki_page_kb_id(&db, page_id)?;
+    if !crate::kb::retrieval::can_manage_kb(&db, kb_id, uid) {
+        return Err("无权限：仅知识库 owner/admin 可回滚版本".to_string());
+    }
+    crate::kb::wiki::restore_version(&db, page_id, version_id)
 }

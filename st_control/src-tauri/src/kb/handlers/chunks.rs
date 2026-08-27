@@ -55,16 +55,7 @@ pub async fn kb_update_chunk(
             rusqlite::params![content, content.chars().count() as i64, chunk_id],
         )
         .map_err(|e| e.to_string())?;
-        conn.execute(
-            "DELETE FROM chunks_fts WHERE rowid = ?1",
-            rusqlite::params![chunk_id],
-        )
-        .map_err(|e| e.to_string())?;
-        conn.execute(
-            "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
-            rusqlite::params![chunk_id, crate::kb::cjk_spaced(&content)],
-        )
-        .map_err(|e| e.to_string())?;
+        crate::kb::db::fts_update_chunk(&conn, chunk_id, &content)?;
     }
     // 重新向量化该分块（失败则保持无向量，可稍后重处理）
     let (embedding_provider, embedding_model) = resolve_embedding_pair(&db, None, None);
@@ -164,11 +155,7 @@ pub async fn kb_reprocess_document(
             // 2) 清空旧分片（FTS 索引与向量一并删除），并创建处理任务
             let (version_id, job_id): (i64, i64) = {
                 let conn = db_block.conn_lock();
-                conn.execute(
-                    "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
-                    rusqlite::params![doc_id],
-                )
-                .map_err(|e| e.to_string())?;
+                crate::kb::db::fts_delete_chunks_by_doc(&conn, doc_id)?;
                 conn.execute("DELETE FROM document_chunks WHERE doc_id = ?1", rusqlite::params![doc_id])
                     .map_err(|e| e.to_string())?;
                 conn.execute(
@@ -291,9 +278,17 @@ pub async fn kb_reprocess_document(
         }
     }
     // record_embedding_meta 内部会加锁，必须在锁外调用
+    let mut embed_warning: Option<String> = None;
     if let Some(dim) = embed_dim {
-        let _ =
-            embed::record_embedding_meta(&db, kb_id, embedding_model.as_deref().unwrap_or(""), dim);
+        match embed::record_embedding_meta(
+            &db,
+            kb_id,
+            embedding_model.as_deref().unwrap_or(""),
+            dim,
+        ) {
+            Ok(w) => embed_warning = w,
+            Err(e) => log::warn!("记录嵌入元数据失败: {}", e),
+        }
     }
     // 源文档内容变化 → 自动刷新关联 Wiki 页面的摘要/实体
     if ok > 0 {
@@ -311,9 +306,13 @@ pub async fn kb_reprocess_document(
             detail: None,
         },
     );
-    Ok(serde_json::json!({
+    let mut result = serde_json::json!({
         "chunkCount": chunks.len(),
         "embedded": ok,
         "failedEmbed": fail,
-    }))
+    });
+    if let Some(ref w) = embed_warning {
+        result["embedWarning"] = serde_json::Value::String(w.clone());
+    }
+    Ok(result)
 }

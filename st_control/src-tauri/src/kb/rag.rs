@@ -6,11 +6,35 @@
 
 use crate::kb::db::KbDatabase;
 use crate::kb::retrieval::{
-    bm25_search, rerank_chunks, rrf_fuse, vector_search, visible_kb_ids, RetrievedChunk,
+    bm25_search, rerank_chunks, rrf_fuse, vector_search_capped, visible_kb_ids, RetrievedChunk,
 };
 use crate::llm::types::{ChatMessage, ChatRequest, ChatResult};
 use rusqlite::params;
 use serde::Serialize;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// RAG 流式生成取消机制（序列号方案）：
+/// RAG_SEQ 为全局递增序列号，每次 RAG 流式生成开始时分配唯一 ID；
+/// RAG_CANCEL_ID 为请求取消的目标 ID（0 = 无取消请求）。
+/// 比旧 AtomicBool 方案的优势：快速连续发起多个 RAG 请求时，取消信号精准匹配目标，
+/// 不会因 clear_rag_cancel() 误清除其他请求的取消标记。
+static RAG_SEQ: AtomicU64 = AtomicU64::new(1);
+static RAG_CANCEL_ID: AtomicU64 = AtomicU64::new(0);
+
+/// 分配一个新的 RAG 流式生成 ID（每次 rag_stream 开始时调用）
+pub fn next_rag_id() -> u64 {
+    RAG_SEQ.fetch_add(1, Ordering::SeqCst)
+}
+
+/// 请求取消指定 RAG 流式生成（精准取消，不影响其他并发请求）
+pub fn request_rag_cancel(rag_id: u64) {
+    RAG_CANCEL_ID.store(rag_id, Ordering::SeqCst);
+}
+
+/// 检查指定 RAG 流式生成是否已请求取消
+pub fn rag_cancel_requested(rag_id: u64) -> bool {
+    RAG_CANCEL_ID.load(Ordering::SeqCst) == rag_id
+}
 
 /// 分片 + 文档标题查询行（SELECT：kb_id, doc_id, doc_title, section, page_no, content）
 struct ChunkRow(i64, i64, String, Option<String>, Option<i64>, String);
@@ -27,6 +51,8 @@ pub struct RagRequest<'a> {
     pub top_k: usize,
     pub mode: &'a str,
     pub chunk_overrides: Option<&'a [(i64, Option<String>)]>,
+    /// 问答会话 ID（用于加载多轮对话历史）
+    pub session_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,26 +155,32 @@ pub async fn rag_answer(db: &KbDatabase, req: &RagRequest<'_>) -> Result<RagAnsw
     let (context, ctx_text) = rag_context(db, req).await?;
 
     // 4. 调用 LLM（复用 chat_with_llm）
-    let system_prompt = "你是企业知识库助手。请严格基于以下【知识上下文】回答用户问题，\
-        若上下文无法回答请如实说明，不要编造。回答中可适当引用来源文档。\n\n【知识上下文】"
-        .to_string()
-        + &ctx_text;
+    let base_prompt = {
+        let conn = db.conn_lock();
+        crate::kb::handlers::read_rag_system_prompt(&conn)
+    };
+    let system_prompt = base_prompt + "\n\n【知识上下文】" + &ctx_text;
+    // 加载多轮对话历史（最近 5 轮），实现上下文记忆
+    let history = req
+        .session_id
+        .map(|sid| load_conversation_history(db, sid, 5))
+        .unwrap_or_default();
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: system_prompt,
+        parts: None,
+    }];
+    messages.extend(history);
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: query.to_string(),
+        parts: None,
+    });
     let req = ChatRequest {
         provider_id: gen_provider_id.map(|s| s.to_string()),
         model: gen_model.map(|s| s.to_string()),
         role_id: None,
-        messages: vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: system_prompt,
-                parts: None,
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: query.to_string(),
-                parts: None,
-            },
-        ],
+        messages,
         max_tokens: None,
         temperature: Some(0.3),
         top_p: None,
@@ -193,13 +225,22 @@ pub(crate) async fn rag_context(
     let retrieve = async || -> Result<Vec<RetrievedChunk>, String> {
         let top = match mode {
             "vector" => {
-                vector_search(db, query, &visible, top_k, embed_provider_id, embed_model).await?
+                // 大知识库自动走 FTS 候选池预筛 + 向量精排
+                vector_search_capped(db, query, &visible, top_k, embed_provider_id, embed_model)
+                    .await?
             }
             "bm25" => bm25_search(db, query, &visible, top_k)?,
             _ => {
                 let bm25 = bm25_search(db, query, &visible, top_k)?;
-                match vector_search(db, query, &visible, top_k, embed_provider_id, embed_model)
-                    .await
+                match vector_search_capped(
+                    db,
+                    query,
+                    &visible,
+                    top_k,
+                    embed_provider_id,
+                    embed_model,
+                )
+                .await
                 {
                     Ok(vector) => rrf_fuse(vector, bm25, 60)
                         .into_iter()
@@ -285,13 +326,61 @@ pub(crate) async fn rag_context(
     Ok((context, ctx_text))
 }
 
+/// 加载会话最近 N 轮消息作为对话历史（排除当前轮）。
+/// 返回 (历史消息列表, 截断后的总 token 估算长度)。
+fn load_conversation_history(
+    db: &KbDatabase,
+    session_id: i64,
+    max_rounds: usize,
+) -> Vec<ChatMessage> {
+    let conn = db.conn_lock();
+    // 取最近 max_rounds*2 条消息（每轮 = user + assistant），排除最后一条（当前用户提问）
+    let limit = (max_rounds * 2) as i64;
+    let mut stmt = match conn.prepare(
+        "SELECT role, content FROM qa_messages WHERE session_id = ?1 AND content IS NOT NULL
+         ORDER BY id DESC LIMIT ?2",
+    ) {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows: Vec<(String, String)> = match stmt
+        .query_map(rusqlite::params![session_id, limit], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        }) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(_) => return Vec::new(),
+    };
+    // 按时间正序（查询是 DESC），跳过第一条（当前用户提问）
+    let mut history: Vec<ChatMessage> = Vec::new();
+    let mut total_len = 0usize;
+    const MAX_HISTORY_CHARS: usize = 4000; // 历史消息总长度上限，防止 token 溢出
+    for (role, content) in rows.into_iter().rev() {
+        // 跳过当前轮的用户消息（已在 req.query 中）
+        if history.is_empty() && role == "user" {
+            continue;
+        }
+        if total_len + content.len() > MAX_HISTORY_CHARS {
+            break;
+        }
+        total_len += content.len();
+        history.push(ChatMessage {
+            role,
+            content,
+            parts: None,
+        });
+    }
+    history
+}
+
 /// RAG 流式生成：检索并组装上下文后，通过 on_delta 回调逐段返回生成内容。
 /// 返回 (完整回答, 上下文, 生成提供方, 模型, prompt/completion/total tokens)，
 /// 并记录本次 LLM 用量。
+/// `rag_id` 为本次流式生成的唯一序列号（由 next_rag_id() 分配），用于精准取消。
 pub async fn rag_stream<F>(
     db: &KbDatabase,
     req: &RagRequest<'_>,
-    on_delta: F,
+    rag_id: u64,
+    mut on_delta: F,
 ) -> Result<(String, Vec<RagContextItem>, String, String, u64, u64, u64), String>
 where
     F: FnMut(&str),
@@ -300,22 +389,27 @@ where
     let gen_provider_id = req.gen_provider_id;
     let gen_model = req.gen_model;
     let (context, ctx_text) = rag_context(db, req).await?;
-    let system_prompt = "你是企业知识库助手。请严格基于以下【知识上下文】回答用户问题，\
-        若上下文无法回答请如实说明，不要编造。回答中可适当引用来源文档。\n\n【知识上下文】"
-        .to_string()
-        + &ctx_text;
-    let messages = vec![
-        ChatMessage {
-            role: "system".to_string(),
-            content: system_prompt,
-            parts: None,
-        },
-        ChatMessage {
-            role: "user".to_string(),
-            content: query.to_string(),
-            parts: None,
-        },
-    ];
+    let base_prompt = {
+        let conn = db.conn_lock();
+        crate::kb::handlers::read_rag_system_prompt(&conn)
+    };
+    let system_prompt = base_prompt + "\n\n【知识上下文】" + &ctx_text;
+    // 加载多轮对话历史（最近 5 轮），实现上下文记忆
+    let history = req
+        .session_id
+        .map(|sid| load_conversation_history(db, sid, 5))
+        .unwrap_or_default();
+    let mut messages = vec![ChatMessage {
+        role: "system".to_string(),
+        content: system_prompt,
+        parts: None,
+    }];
+    messages.extend(history);
+    messages.push(ChatMessage {
+        role: "user".to_string(),
+        content: query.to_string(),
+        parts: None,
+    });
     // 解析生成提供方与模型（与 chat_with_llm_stream 一致：未指定时用默认提供方/默认模型）
     let cfg = crate::llm::config::load_config();
     let provider_id = gen_provider_id
@@ -349,7 +443,15 @@ where
             tools: None,
             tool_choice: None,
         },
-        on_delta,
+        |delta: &str| {
+            if rag_cancel_requested(rag_id) {
+                // 用户点击「停止生成」：通知底层中断流式读取（精准匹配本次请求）
+                false
+            } else {
+                on_delta(delta);
+                true
+            }
+        },
     )
     .await?;
     // 用量与成本已由 client::chat_completion_stream 统一计入「大模型管理 → 流量与成本」

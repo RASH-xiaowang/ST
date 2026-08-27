@@ -325,11 +325,40 @@ CREATE INDEX IF NOT EXISTS idx_wiki_links_from ON wiki_links(from_page_id);
 CREATE INDEX IF NOT EXISTS idx_wiki_links_to   ON wiki_links(to_page_id);
 CREATE INDEX IF NOT EXISTS idx_wiki_links_kb   ON wiki_links(kb_id);
 
--- Wiki 页面全文检索（FTS5，普通表，由写入路径手动同步；见 chunks_fts 注释）
+-- ─── Wiki 页面版本控制 ───
+CREATE TABLE IF NOT EXISTS wiki_page_versions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    page_id     INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
+    version_no  INTEGER NOT NULL,
+    title       TEXT NOT NULL,
+    summary     TEXT DEFAULT '',
+    content_md  TEXT DEFAULT '',
+    note        TEXT,
+    created_by  INTEGER REFERENCES users(id),
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (page_id, version_no)
+);
+CREATE INDEX IF NOT EXISTS idx_wpv_page ON wiki_page_versions(page_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS wiki_pages_fts USING fts5(
     title,
     summary,
     content_md,
     tokenize='unicode61'
 );
+
+-- ─── 操作审计日志（关键操作留痕） ───
+CREATE TABLE IF NOT EXISTS kb_audit_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    username    TEXT,
+    action      TEXT NOT NULL,           -- login/logout/create_kb/delete_kb/create_user/delete_user/backup/...
+    target_type TEXT,                    -- kb/user/doc/backup/...
+    target_id   INTEGER,
+    detail      TEXT,                    -- 附加信息（JSON）
+    ip          TEXT,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_audit_user ON kb_audit_log(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON kb_audit_log(action);
+CREATE INDEX IF NOT EXISTS idx_audit_time ON kb_audit_log(created_at);
 

@@ -184,6 +184,7 @@ pub async fn chat_with_llm_stream(
         },
         |delta: &str| {
             let _ = on_chunk.send(json!({ "type": "delta", "content": delta }).to_string());
+            true
         },
     )
     .await?;

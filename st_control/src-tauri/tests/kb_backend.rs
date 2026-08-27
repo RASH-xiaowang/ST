@@ -274,7 +274,9 @@ fn test_wiki_pages_links_graph_and_search() {
     let detail = wiki::get_page(&db, p1).unwrap();
     assert_eq!(detail.out_links.len(), 1, "出链应解析到分片策略页");
     assert_eq!(detail.out_links[0].page_id, p2);
-    assert_eq!(detail.in_links.len(), 0);
+    // 自动反链：A→B 时会补建 B→A（rebuild_kb_links 双向连接），故 p1 也有 1 条入链（来自 p2）
+    assert_eq!(detail.in_links.len(), 1, "自动反链：p2 指向 p1");
+    assert_eq!(detail.in_links[0].page_id, p2);
 
     let detail2 = wiki::get_page(&db, p2).unwrap();
     assert_eq!(detail2.in_links.len(), 1, "入链应包含架构设计页");
@@ -282,8 +284,10 @@ fn test_wiki_pages_links_graph_and_search() {
 
     let g = wiki::graph(&db, kb_id).unwrap();
     assert_eq!(g.nodes.len(), 2);
-    assert_eq!(g.edges.len(), 1);
+    // 正向 p1→p2 + 自动反链 p2→p1
+    assert_eq!(g.edges.len(), 2);
     assert!(g.edges.iter().any(|e| e.from == p1 && e.to == p2));
+    assert!(g.edges.iter().any(|e| e.from == p2 && e.to == p1));
 
     // Wiki 全文检索（2 字中文子串也可命中）
     let found = wiki::search_pages(&db, kb_id, "分片", 10).unwrap();
@@ -636,7 +640,7 @@ fn test_migration_drops_dead_tables() {
     assert_eq!(has_ref, 0, "file_objects.ref_count 应已移除");
 }
 
-/// P2 埋点：事件写入后 analytics_for 的 8 项指标按口径聚合（今日值 + 序列）
+/// P2 埋点：事件写入后 analytics_for 的 6 项指标按口径聚合（今日值 + 序列）
 #[test]
 fn test_metric_events_and_analytics() {
     let db = temp_db();
@@ -695,8 +699,8 @@ fn test_metric_events_and_analytics() {
     let metrics = v
         .get("metrics")
         .and_then(|m| m.as_array())
-        .expect("应有 8 项指标");
-    assert_eq!(metrics.len(), 8);
+        .expect("应有 6 项指标");
+    assert_eq!(metrics.len(), 6);
     let find = |key: &str| -> &serde_json::Value {
         metrics
             .iter()
@@ -712,9 +716,14 @@ fn test_metric_events_and_analytics() {
     assert_eq!(today_of("faq"), 1, "FAQ 命中事件数");
     assert_eq!(today_of("llm"), 1, "RAG 事件数");
     assert_eq!(today_of("recommend"), 1, "推荐点击数");
-    assert_eq!(today_of("task"), 1, "任务完成数");
+    // task / handoff 指标已随首页仪表盘合并移除，此处确认不再暴露
+    assert!(metrics
+        .iter()
+        .all(|m| m.get("key").and_then(|k| k.as_str()) != Some("task")));
+    assert!(metrics
+        .iter()
+        .all(|m| m.get("key").and_then(|k| k.as_str()) != Some("handoff")));
     assert_eq!(today_of("recall"), 50, "召回率 = 1/2 有结果检索");
-    assert_eq!(today_of("handoff"), 33, "转人工率 = 1/3 提问（search+rag）");
     // 序列应补零为 7 天
     assert_eq!(
         find("messages")
@@ -987,4 +996,64 @@ fn test_stats_for_counts() {
     assert_eq!(s.wiki_page_count, 1);
     assert_eq!(s.doc_ready, 1);
     assert_eq!(s.doc_processing, 0);
+}
+
+/// P1 越权矩阵：统一 require_kb_role / editable_kb_ids 的角色门槛。
+/// 覆盖 owner / editor / viewer / 非成员四类用户对 owner / editor / viewer 三个门槛的判定。
+#[test]
+fn test_role_authorization_matrix() {
+    let db = temp_db();
+    let owner = 1i64;
+    let editor = 9001i64;
+    let viewer = 9002i64;
+    let outsider = 9003i64;
+    {
+        let c = db.conn_lock();
+        for (id, name) in [
+            (editor, "editor_u"),
+            (viewer, "viewer_u"),
+            (outsider, "outsider_u"),
+        ] {
+            c.execute(
+                "INSERT INTO users (id, username) VALUES (?1,?2)",
+                params![id, name],
+            )
+            .unwrap();
+        }
+    }
+    let kb_id = insert_kb(&db, "权限库", owner);
+    {
+        let c = db.conn_lock();
+        c.execute(
+            "INSERT INTO kb_members (kb_id, user_id, role) VALUES (?1,?2,'editor')",
+            params![kb_id, editor],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO kb_members (kb_id, user_id, role) VALUES (?1,?2,'viewer')",
+            params![kb_id, viewer],
+        )
+        .unwrap();
+    }
+
+    // owner：owner / editor / viewer 门槛全部放行
+    assert!(retrieval::require_kb_role(&db, kb_id, owner, "owner").is_ok());
+    assert!(retrieval::require_kb_role(&db, kb_id, owner, "editor").is_ok());
+    assert!(retrieval::require_kb_role(&db, kb_id, owner, "viewer").is_ok());
+    // editor：editor / viewer 放行，owner 拒绝
+    assert!(retrieval::require_kb_role(&db, kb_id, editor, "owner").is_err());
+    assert!(retrieval::require_kb_role(&db, kb_id, editor, "editor").is_ok());
+    assert!(retrieval::require_kb_role(&db, kb_id, editor, "viewer").is_ok());
+    // viewer：viewer 放行，editor / owner 拒绝
+    assert!(retrieval::require_kb_role(&db, kb_id, viewer, "owner").is_err());
+    assert!(retrieval::require_kb_role(&db, kb_id, viewer, "editor").is_err());
+    assert!(retrieval::require_kb_role(&db, kb_id, viewer, "viewer").is_ok());
+    // 非成员：任何门槛都拒绝
+    assert!(retrieval::require_kb_role(&db, kb_id, outsider, "viewer").is_err());
+
+    // editable_kb_ids：owner 与 editor 可见，viewer / 非成员不可见
+    assert!(retrieval::editable_kb_ids(&db, owner).contains(&kb_id));
+    assert!(retrieval::editable_kb_ids(&db, editor).contains(&kb_id));
+    assert!(!retrieval::editable_kb_ids(&db, viewer).contains(&kb_id));
+    assert!(!retrieval::editable_kb_ids(&db, outsider).contains(&kb_id));
 }

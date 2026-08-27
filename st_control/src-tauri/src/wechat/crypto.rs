@@ -309,13 +309,9 @@ pub fn verify_key(wx_key_bin: &[u8], page1: &[u8]) -> (bool, bool) {
     // 1. PBKDF2 派生加密密钥
     let mut derived_key = vec![0u8; KEY_SZ];
     let _ = pbkdf2::pbkdf2::<Hmac<Sha512>>(wx_key_bin, salt, PBKDF2_ITERS, &mut derived_key);
-    eprintln!("[rust] wx_key_bin={}", hex::encode(wx_key_bin));
-    eprintln!("[rust] salt={}", hex::encode(salt));
-    eprintln!("[rust] derived_key={}", hex::encode(&derived_key));
 
     // 2. HMAC 验证
     let mac_key = derive_mac_key(&derived_key, salt);
-    eprintln!("[rust] mac_key={}", hex::encode(&mac_key));
 
     // 手工计算 HMAC 并比较
     let hmac_data = &page1[16..PAGE_SZ - RESERVE_SZ + IV_SZ]; // 16..4032
@@ -326,10 +322,6 @@ pub fn verify_key(wx_key_bin: &[u8], page1: &[u8]) -> (bool, bool) {
     let computed = mac.finalize().into_bytes();
     let computed_slice: &[u8] = computed.as_slice();
     let hmac_ok = computed_slice == stored_hmac;
-    eprintln!("[rust] hmac_data_len={}", hmac_data.len());
-    eprintln!("[rust] stored_hmac={}", hex::encode(stored_hmac));
-    eprintln!("[rust] computed_hmac={}", hex::encode(computed_slice));
-    eprintln!("[rust] hmac_match={}", hmac_ok);
 
     // 3. AES 解密验证 (修正 IV)
     let first_block_dec = aes256_ecb_decrypt_block(&derived_key, &page1[16..32]);
@@ -341,9 +333,9 @@ pub fn verify_key(wx_key_bin: &[u8], page1: &[u8]) -> (bool, bool) {
     let encrypted = &page1[16..PAGE_SZ - RESERVE_SZ];
     let decrypted = aes256_cbc_decrypt(&derived_key, &corrected_iv, encrypted);
     let aes_ok = decrypted.starts_with(SQLITE_HDR);
-    eprintln!(
-        "[rust] corrected_iv={} aes_ok={}",
-        hex::encode(&corrected_iv),
+    log::debug!(
+        "[crypto] verify_key: hmac_ok={}, aes_ok={}",
+        hmac_ok,
         aes_ok
     );
 

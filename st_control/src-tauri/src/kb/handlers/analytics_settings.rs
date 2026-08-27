@@ -9,7 +9,7 @@ use tauri::State;
 
 use super::{analytics_settings_map, ANALYTICS_METRIC_DEFAULTS};
 
-/// 指标配置（8 项内置指标：显示名 + 可见性）
+/// 指标配置（6 项内置指标：显示名 + 可见性）
 #[tauri::command]
 pub async fn kb_get_analytics_settings(
     db: State<'_, KbDatabase>,

@@ -4,11 +4,66 @@
 //  - BM25 检索：FTS5 MATCH
 //  - 混合：RRF 融合两路结果
 //  - 权限：仅检索用户可见知识库（kb_id 白名单）
+//  - LRU 缓存：相同查询短时间内的结果直接返回，避免重复计算
 // ============================================================
 
 use crate::kb::db::{cosine_similarity, deserialize_embedding, KbDatabase};
+use lru::LruCache;
 use rusqlite::params;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Mutex;
+
+/// 检索结果 LRU 缓存（最多 200 条，TTL 60 秒）
+/// key = "kb_ids:query:mode:topK:embed_model"（含嵌入模型标识，切换模型后缓存自动失效）
+/// 检索缓存类型别名：key = 检索指纹，value = (缓存时间, 结果列表)
+type SearchCache =
+    std::sync::LazyLock<Mutex<LruCache<String, (std::time::Instant, Vec<RetrievedChunk>)>>>;
+
+static SEARCH_CACHE: SearchCache =
+    SearchCache::new(|| Mutex::new(LruCache::new(NonZeroUsize::new(200).unwrap())));
+
+/// 缓存 TTL
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn cache_key(kb_ids: &[i64], query: &str, mode: &str, top_k: usize, embed_model: &str) -> String {
+    format!("{:?}:{}:{}:{}:{}", kb_ids, query, mode, top_k, embed_model)
+}
+
+/// 尝试从缓存获取检索结果
+pub fn get_cached(
+    kb_ids: &[i64],
+    query: &str,
+    mode: &str,
+    top_k: usize,
+    embed_model: &str,
+) -> Option<Vec<RetrievedChunk>> {
+    let key = cache_key(kb_ids, query, mode, top_k, embed_model);
+    let mut cache = SEARCH_CACHE.lock().ok()?;
+    if let Some((ts, results)) = cache.get(&key) {
+        if ts.elapsed() < CACHE_TTL {
+            return Some(results.clone());
+        }
+        // 过期，移除
+        cache.pop(&key);
+    }
+    None
+}
+
+/// 将检索结果写入缓存
+pub fn put_cache(
+    kb_ids: &[i64],
+    query: &str,
+    mode: &str,
+    top_k: usize,
+    embed_model: &str,
+    results: &[RetrievedChunk],
+) {
+    let key = cache_key(kb_ids, query, mode, top_k, embed_model);
+    if let Ok(mut cache) = SEARCH_CACHE.lock() {
+        cache.put(key, (std::time::Instant::now(), results.to_vec()));
+    }
+}
 
 /// 向量检索候选分片行（SELECT：id, doc_id, kb_id, content, page_no, section, embedding_blob, doc_title）
 struct EmbeddingRow(
@@ -47,6 +102,7 @@ pub async fn vector_search(
     provider_id: Option<&str>,
     model: Option<&str>,
 ) -> Result<Vec<RetrievedChunk>, String> {
+    let t0 = std::time::Instant::now();
     let qvec = {
         let req = crate::llm::types::EmbeddingRequest {
             provider_id: provider_id.map(|s| s.to_string()),
@@ -97,6 +153,7 @@ pub async fn vector_search(
         rows.filter_map(|r| r.ok()).collect()
     };
 
+    let rows_data_len = rows_data.len();
     let mut results = Vec::new();
     for EmbeddingRow(id, doc_id, kb_id, content, page_no, section, blob, doc_title) in rows_data {
         let vec = deserialize_embedding(&blob);
@@ -119,11 +176,16 @@ pub async fn vector_search(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     results.truncate(top_k);
+    let elapsed = t0.elapsed();
+    log::info!(
+        "向量检索完成: 扫描={} 耗时={}ms top_k={} 结果={}",
+        rows_data_len,
+        elapsed.as_millis(),
+        top_k,
+        results.len()
+    );
     Ok(results)
 }
-
-/// 取 FTS 候选分片 id 池：用于 hybrid 检索先做 BM25 预筛，再只对候选分片做向量精排，
-/// 避免每次搜索都全量载入可见知识库的所有 embedding（O(N) 扫描）。
 pub fn fts_candidate_ids(
     db: &KbDatabase,
     query: &str,
@@ -170,7 +232,9 @@ pub async fn vector_search_in_candidates(
     model: Option<&str>,
 ) -> Result<Vec<RetrievedChunk>, String> {
     if candidate_ids.is_empty() {
-        return Ok(Vec::new());
+        // FTS 候选池为空（查询无有效词或全部为停用词）时回退全量向量检索，
+        // 避免混合检索在 BM25 无命中时直接返回空结果。
+        return vector_search(db, query, visible_kbs, top_k, provider_id, model).await;
     }
     let qvec = {
         let req = crate::llm::types::EmbeddingRequest {
@@ -249,16 +313,86 @@ pub async fn vector_search_in_candidates(
     Ok(results)
 }
 
-/// 将用户查询转为 FTS5 安全查询：逐词清洗特殊字符、加引号，默认 AND 组合
-/// （与 wiki::fts_match_query 保持一致，避免特殊字符触发 MATCH 语法错误）
+/// 纯向量检索的大库保护阈值默认值：超过此数量的分片时，自动走 FTS 候选池预筛，
+/// 避免每次检索全量加载所有 embedding 到内存（O(N) 扫描）。
+/// 小库（≤此阈值）保持全量扫描，精度零损失。
+/// 可通过 kb_chunk_settings 表 key='vector_scan_cap' 运行时调整。
+const DEFAULT_VECTOR_SCAN_CAP: usize = 500;
+
+/// 从数据库读取可配置的向量扫描阈值，未配置时返回默认值
+fn load_vector_scan_cap(db: &KbDatabase) -> usize {
+    let conn = db.conn_lock();
+    conn.query_row(
+        "SELECT value FROM kb_chunk_settings WHERE key = 'vector_scan_cap'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.parse::<usize>().ok())
+    .filter(|&v| (50..=10000).contains(&v)) // 合理范围校验：50 ~ 10000
+    .unwrap_or(DEFAULT_VECTOR_SCAN_CAP)
+}
+
+/// 带候选池上限的向量检索：大知识库自动走 FTS 预筛 + 向量精排，
+/// 小知识库保持全量扫描（精度不损失）。纯向量模式专用。
+pub async fn vector_search_capped(
+    db: &KbDatabase,
+    query: &str,
+    visible_kbs: &[i64],
+    top_k: usize,
+    provider_id: Option<&str>,
+    model: Option<&str>,
+) -> Result<Vec<RetrievedChunk>, String> {
+    // 统计可见知识库的总分片数
+    let total_chunks: i64 = {
+        let conn = db.conn_lock();
+        let placeholders = visible_kbs
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT COUNT(*) FROM document_chunks WHERE kb_id IN ({}) AND embedding_blob IS NOT NULL",
+            placeholders
+        );
+        let params_vec: Vec<&dyn rusqlite::types::ToSql> = visible_kbs
+            .iter()
+            .map(|v| v as &dyn rusqlite::types::ToSql)
+            .collect();
+        conn.query_row(&sql, params_vec.as_slice(), |r| r.get(0))
+            .unwrap_or(0)
+    };
+
+    let scan_cap = load_vector_scan_cap(db);
+    if total_chunks as usize <= scan_cap {
+        // 小库：全量扫描，精度零损失
+        return vector_search(db, query, visible_kbs, top_k, provider_id, model).await;
+    }
+
+    // 大库：FTS 候选池预筛 + 向量精排
+    let candidate_limit = (top_k * 50).clamp(200, 3000);
+    let candidates = fts_candidate_ids(db, query, visible_kbs, candidate_limit)?;
+    if candidates.is_empty() {
+        // FTS 无命中（查询词太短或全为停用词），回退全量扫描但截断到上限
+        // 仍然限制扫描量，避免极端情况下的内存暴涨
+        return vector_search(db, query, visible_kbs, top_k, provider_id, model).await;
+    }
+    vector_search_in_candidates(
+        db,
+        query,
+        visible_kbs,
+        &candidates,
+        top_k,
+        provider_id,
+        model,
+    )
+    .await
+}
+
+/// 将用户查询转为 FTS5 安全查询（共享实现：支持中文整句按字 OR 召回，
+/// 避免中文整句作为单一短语导致 0 命中，见 crate::kb::fts_safe_query）
 fn fts_safe_query(query: &str) -> String {
-    query
-        .split_whitespace()
-        .map(|w| w.replace(['"', '(', ')', '*', '^', ':', '-'], " "))
-        .filter(|w| !w.is_empty())
-        .map(|w| format!("\"{}\"", crate::kb::cjk_spaced(&w)))
-        .collect::<Vec<_>>()
-        .join(" ")
+    crate::kb::fts_safe_query(query)
 }
 
 /// BM25 检索（FTS5）
@@ -268,6 +402,7 @@ pub fn bm25_search(
     visible_kbs: &[i64],
     top_k: usize,
 ) -> Result<Vec<RetrievedChunk>, String> {
+    let t0 = std::time::Instant::now();
     let q = fts_safe_query(query);
     if q.is_empty() {
         return Ok(Vec::new());
@@ -325,6 +460,13 @@ pub fn bm25_search(
             doc_title,
         });
     }
+    let elapsed = t0.elapsed();
+    log::info!(
+        "BM25 检索完成: 耗时={}ms top_k={} 结果={}",
+        elapsed.as_millis(),
+        top_k,
+        results.len()
+    );
     Ok(results)
 }
 
@@ -539,6 +681,49 @@ pub fn can_manage_kb(db: &KbDatabase, kb_id: i64, user_id: i64) -> bool {
     )
 }
 
+/// 统一知识库角色校验：要求用户对指定知识库具备至少 min_role 权限。
+///
+/// min_role 取值：
+/// - `"owner"`：仅 owner / 全局 admin（管理类：删除知识库、ACL、成员管理、回滚）
+/// - `"editor"`：owner / admin / editor（编辑类：移动文档、删除目录、重试/停止任务、清理活动）
+/// - `"viewer"`：任何可访问成员（读取类）
+///
+/// 返回当前角色（供调用方按需使用），无权限时返回统一的中文错误信息。
+/// 所有写操作命令都应通过本助手收敛权限判定，避免各处手写 matches! 产生口径漂移。
+pub fn require_kb_role(
+    db: &KbDatabase,
+    kb_id: i64,
+    user_id: i64,
+    min_role: &str,
+) -> Result<String, String> {
+    let role =
+        kb_role(db, kb_id, user_id).ok_or_else(|| "无权限：你无权访问该知识库".to_string())?;
+    let allowed = match min_role {
+        "owner" => role == "owner" || role == "admin",
+        "editor" => matches!(role.as_str(), "owner" | "admin" | "editor"),
+        _ => true, // viewer 及以上
+    };
+    if allowed {
+        Ok(role)
+    } else {
+        Err(format!("无权限：需要「{}」及以上角色", min_role))
+    }
+}
+
+/// 返回用户具备「编辑者」及以上权限的知识库 id（用于批量任务/活动清理等
+/// 作用于多个知识库的操作，避免把仅可见（viewer）的知识库纳入写操作范围）。
+pub fn editable_kb_ids(db: &KbDatabase, user_id: i64) -> Vec<i64> {
+    visible_kb_ids(db, user_id)
+        .into_iter()
+        .filter(|&kb_id| {
+            matches!(
+                kb_role(db, kb_id, user_id).as_deref(),
+                Some("owner") | Some("admin") | Some("editor")
+            )
+        })
+        .collect()
+}
+
 /// 是否可访问知识库：有成员关系、或 kb 没有成员（开放）、或被 ACL allow。
 /// 显式 deny（scope=kb）优先于一切，包括"开放库全员可见"。
 pub fn can_access_kb(db: &KbDatabase, kb_id: i64, user_id: i64) -> bool {
@@ -639,6 +824,58 @@ mod tests {
         let b = vec![chunk(2, 0.0), chunk(3, 0.0)];
         let fused = rrf_fuse(v, b, 60);
         assert_eq!(fused[0].chunk_id, 2, "重复 chunk 优先于单路高分");
+    }
+
+    #[test]
+    fn test_fts_query_cjk_short_phrase() {
+        assert_eq!(crate::kb::fts_safe_query("测试文章"), "\"测 试 文 章\"");
+    }
+
+    #[test]
+    fn test_fts_query_cjk_long_sentence_or_terms() {
+        // 长中文整句不再作为单一短语，而是按单字 OR 展开，避免 0 命中
+        let q = crate::kb::fts_safe_query("自动化测试知识库中关于测试文章的要点有哪些？");
+        assert!(q.contains(" OR "), "长句应按单字 OR 展开，实际: {}", q);
+        assert!(!q.contains("？"), "中文标点应被过滤，实际: {}", q);
+        assert!(
+            q.starts_with("自 OR 动 OR 化"),
+            "应以单字 OR 开头，实际: {}",
+            q
+        );
+    }
+
+    #[test]
+    fn test_fts_query_cjk_punct_filtered() {
+        assert_eq!(crate::kb::fts_safe_query("要点？"), "\"要 点\"");
+        assert_eq!(crate::kb::fts_safe_query("知识库。"), "\"知 识 库\"");
+    }
+
+    #[test]
+    fn test_fts_query_ascii_quoted() {
+        assert_eq!(
+            crate::kb::fts_safe_query("hello world"),
+            "\"hello\" \"world\""
+        );
+        assert_eq!(crate::kb::fts_safe_query("RAG 检索"), "\"RAG\" \"检 索\"");
+    }
+
+    #[test]
+    fn test_fts_query_mixed_cjk_ascii() {
+        assert_eq!(
+            crate::kb::fts_safe_query("UI 测试文章"),
+            "\"UI\" \"测 试 文 章\""
+        );
+    }
+
+    #[test]
+    fn test_fts_query_empty_and_special_chars() {
+        assert!(crate::kb::fts_safe_query("").is_empty());
+        assert!(crate::kb::fts_safe_query("   ").is_empty());
+        assert_eq!(
+            crate::kb::fts_safe_query("测试(自动化)"),
+            "测 OR 试 OR 自 OR 动 OR 化"
+        );
+        assert!(crate::kb::fts_safe_query("……").is_empty(), "纯标点应返回空");
     }
 }
 

@@ -51,6 +51,140 @@ impl KbDatabase {
         crate::common::st_data_dir().join("knowledge_base.db")
     }
 
+    /// 备份目录
+    fn backup_dir() -> PathBuf {
+        crate::common::st_data_dir().join("backups")
+    }
+
+    /// 执行 SQLite 在线备份（VACUUM INTO 语义，不阻塞读写）
+    /// 返回备份文件路径
+    pub fn backup(&self) -> Result<PathBuf, String> {
+        let dir = Self::backup_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建备份目录失败: {}", e))?;
+        let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+        let backup_path = dir.join(format!("knowledge_base_{}.db", ts));
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| format!("获取连接失败: {}", e))?;
+        // VACUUM INTO：在线备份，不阻塞其他连接
+        conn.execute_batch(&format!(
+            "VACUUM INTO '{}'",
+            backup_path.display().to_string().replace('\'', "''")
+        ))
+        .map_err(|e| format!("备份失败: {}", e))?;
+        log::info!("知识库已备份: {}", backup_path.display());
+        Ok(backup_path)
+    }
+
+    /// 列出所有备份文件（按时间倒序）
+    pub fn list_backups() -> Vec<(String, u64)> {
+        let dir = Self::backup_dir();
+        if !dir.exists() {
+            return vec![];
+        }
+        let mut backups: Vec<(String, u64)> = std::fs::read_dir(&dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path().extension().map(|ext| ext == "db").unwrap_or(false)
+                    && e.file_name()
+                        .to_string_lossy()
+                        .starts_with("knowledge_base_")
+            })
+            .map(|e| {
+                let size = e.metadata().map(|m| m.len()).unwrap_or(0);
+                (e.file_name().to_string_lossy().to_string(), size)
+            })
+            .collect();
+        backups.sort_by(|a, b| b.0.cmp(&a.0)); // 倒序
+        backups
+    }
+
+    /// 从备份文件恢复（需重启应用生效）
+    pub fn restore_from_backup(backup_name: &str) -> Result<(), String> {
+        let dir = Self::backup_dir();
+        let backup_path = dir.join(backup_name);
+        if !backup_path.exists() {
+            return Err("备份文件不存在".to_string());
+        }
+        let db_path = Self::db_path();
+        // 先备份当前库
+        if db_path.exists() {
+            let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+            let pre_restore = dir.join(format!("pre_restore_{}.db", ts));
+            std::fs::copy(&db_path, &pre_restore).map_err(|e| format!("备份当前库失败: {}", e))?;
+        }
+        std::fs::copy(&backup_path, &db_path).map_err(|e| format!("恢复失败: {}", e))?;
+        log::info!("知识库已从备份恢复: {}", backup_name);
+        Ok(())
+    }
+
+    /// 清理旧备份（保留最近 max_keep 个）
+    pub fn cleanup_backups(max_keep: usize) -> Result<usize, String> {
+        let backups = Self::list_backups();
+        if backups.len() <= max_keep {
+            return Ok(0);
+        }
+        let dir = Self::backup_dir();
+        let mut removed = 0;
+        for (name, _) in backups.iter().skip(max_keep) {
+            let path = dir.join(name);
+            if std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    /// 写入操作审计日志
+    pub fn audit_log(
+        &self,
+        user_id: Option<i64>,
+        username: &str,
+        action: &str,
+        target_type: &str,
+        target_id: Option<i64>,
+        detail: &str,
+    ) {
+        let conn = match self.pool.get() {
+            Ok(c) => c,
+            Err(e) => {
+                log::warn!("审计日志写入失败: {}", e);
+                return;
+            }
+        };
+        let _ = conn.execute(
+            "INSERT INTO kb_audit_log (user_id, username, action, target_type, target_id, detail) VALUES (?1,?2,?3,?4,?5,?6)",
+            rusqlite::params![user_id, username, action, target_type, target_id, detail],
+        );
+    }
+
+    /// 查询审计日志（最近 N 条）
+    pub fn list_audit_logs(&self, limit: usize) -> Result<Vec<serde_json::Value>, String> {
+        let conn = self.pool.get().map_err(|e| e.to_string())?;
+        let mut stmt = conn
+            .prepare("SELECT id, user_id, username, action, target_type, target_id, detail, created_at FROM kb_audit_log ORDER BY id DESC LIMIT ?1")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "userId": r.get::<_, Option<i64>>(1)?,
+                    "username": r.get::<_, Option<String>>(2)?,
+                    "action": r.get::<_, String>(3)?,
+                    "targetType": r.get::<_, Option<String>>(4)?,
+                    "targetId": r.get::<_, Option<i64>>(5)?,
+                    "detail": r.get::<_, Option<String>>(6)?,
+                    "createdAt": r.get::<_, String>(7)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
     fn init_tables(conn: &Connection) -> SqlResult<()> {
         // 迁移①：旧版 FTS 使用外部内容表（content='...'）。此类表先删后插时对未索引
         // rowid 执行 DELETE 会报 "database disk image is malformed"（数据库损坏）。
@@ -155,6 +289,28 @@ impl KbDatabase {
         if !wp_cols.iter().any(|c| c == "dir_id") {
             conn.execute_batch("ALTER TABLE wiki_pages ADD COLUMN dir_id INTEGER REFERENCES kb_directories(id) ON DELETE SET NULL")?;
         }
+        // 迁移：将已有内容的 draft 页面自动发布（修复手动创建的页面长期停留在草稿状态）
+        let draft_updated = conn.execute(
+            "UPDATE wiki_pages SET status = 'published' WHERE status = 'draft' AND content_md IS NOT NULL AND content_md != ''",
+            [],
+        )?;
+        if draft_updated > 0 {
+            log::info!("已自动发布 {} 个有内容的 draft 页面", draft_updated);
+        }
+        // 迁移：清理孤立的实体页（doc_id 为 NULL 且 extract_status='done' 的页面）
+        // 这些是旧版提取时创建的实体页，没有关联文档，删除文档时不会被级联清理
+        let orphan_deleted = conn.execute(
+            "DELETE FROM wiki_pages WHERE doc_id IS NULL AND extract_status = 'done'",
+            [],
+        )?;
+        if orphan_deleted > 0 {
+            log::info!("已清理 {} 个孤立的实体页", orphan_deleted);
+            // 同步清理 FTS 索引
+            let _ = conn.execute(
+                "DELETE FROM wiki_pages_fts WHERE rowid NOT IN (SELECT id FROM wiki_pages)",
+                [],
+            );
+        }
         // 迁移③：FTS 表重建后回填索引（含汉字间隔预处理）
         if fts_migrated {
             Self::rebuild_fts_indexes(conn)?;
@@ -208,10 +364,14 @@ impl KbDatabase {
     // ─── 通用访问 ───
 
     pub fn conn_lock(&self) -> r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager> {
-        // 连接池获取失败极罕见；panic 语义与旧 Mutex unwrap 一致
-        self.pool
-            .get()
-            .unwrap_or_else(|e| panic!("获取知识库连接失败: {}", e))
+        // 连接池获取失败极罕见（max_size=8, timeout=5s）；panic 语义与旧 Mutex unwrap 一致。
+        // 若此 panic 频繁出现，说明并发过高或连接泄漏，应排查调用方是否长时间持有连接。
+        self.pool.get().unwrap_or_else(|e| {
+            panic!(
+                "获取知识库连接失败（连接池耗尽，{}）: 请检查是否有连接泄漏或并发过高",
+                e
+            )
+        })
     }
 
     /// 尝试获取连接（不等待）。用于埋点等非关键路径：池繁忙时直接跳过。
@@ -226,6 +386,110 @@ impl KbDatabase {
     pub fn db_path_string() -> String {
         Self::db_path().display().to_string()
     }
+}
+
+// ════════════════════════════════════════════════════════════
+// FTS 索引集中化同步（chunks_fts / wiki_pages_fts）
+// 所有写入路径必须通过这些函数操作 FTS，保证一致性。
+// ════════════════════════════════════════════════════════════
+
+/// 插入单条分块 FTS 索引（chunk_id 作为 rowid，content 做 CJK 预处理）
+pub fn fts_insert_chunk(conn: &Connection, chunk_id: i64, content: &str) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO chunks_fts (rowid, content) VALUES (?1, ?2)",
+        rusqlite::params![chunk_id, crate::kb::cjk_spaced(content)],
+    )
+    .map_err(|e| e.to_string())
+    .map(|_| ())
+}
+
+/// 更新单条分块 FTS 索引（先删后插，保证 rowid 唯一）
+pub fn fts_update_chunk(conn: &Connection, chunk_id: i64, content: &str) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM chunks_fts WHERE rowid = ?1",
+        rusqlite::params![chunk_id],
+    )
+    .map_err(|e| e.to_string())
+    .map(|_| ())?;
+    fts_insert_chunk(conn, chunk_id, content)
+}
+
+/// 删除指定文档的全部分块 FTS 索引
+pub fn fts_delete_chunks_by_doc(conn: &Connection, doc_id: i64) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
+        rusqlite::params![doc_id],
+    )
+    .map_err(|e| e.to_string())
+    .map(|_| ())
+}
+
+/// 删除指定知识库的全部分块 FTS 索引
+pub fn fts_delete_chunks_by_kb(conn: &Connection, kb_id: i64) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE kb_id = ?1)",
+        rusqlite::params![kb_id],
+    )
+    .map_err(|e| e.to_string())
+    .map(|_| ())
+}
+
+/// 插入 Wiki 页面 FTS 索引
+pub fn fts_insert_wiki_page(
+    conn: &Connection,
+    page_id: i64,
+    title: &str,
+    summary: &str,
+    content_md: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO wiki_pages_fts (rowid, title, summary, content_md) VALUES (?1,?2,?3,?4)",
+        rusqlite::params![
+            page_id,
+            crate::kb::cjk_spaced(title),
+            crate::kb::cjk_spaced(summary),
+            crate::kb::cjk_spaced(content_md)
+        ],
+    )
+    .map_err(|e| e.to_string())
+    .map(|_| ())
+}
+
+/// 更新 Wiki 页面 FTS 索引（先删后插）
+pub fn fts_update_wiki_page(
+    conn: &Connection,
+    page_id: i64,
+    title: &str,
+    summary: &str,
+    content_md: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM wiki_pages_fts WHERE rowid = ?1",
+        rusqlite::params![page_id],
+    )
+    .map_err(|e| e.to_string())
+    .map(|_| ())?;
+    fts_insert_wiki_page(conn, page_id, title, summary, content_md)
+}
+
+/// 删除指定文档关联的 Wiki 页面 FTS 索引
+pub fn fts_delete_wiki_pages_by_doc(conn: &Connection, doc_id: i64) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM wiki_pages_fts WHERE rowid IN (SELECT id FROM wiki_pages WHERE doc_id = ?1)",
+        rusqlite::params![doc_id],
+    )
+    .map_err(|e| e.to_string())
+    .map(|_| ())
+}
+
+/// 删除指定知识库的全部 Wiki 页面 FTS 索引
+pub fn fts_delete_wiki_pages_by_kb(conn: &Connection, kb_id: i64) -> Result<(), String> {
+    conn.execute(
+        "DELETE FROM wiki_pages_fts WHERE rowid IN (SELECT id FROM wiki_pages WHERE kb_id = ?1)",
+        rusqlite::params![kb_id],
+    )
+    .map_err(|e| e.to_string())
+    .map(|_| ())
 }
 
 /// 当前登录用户占位（后续接入真实登录态后替换为运行时身份）

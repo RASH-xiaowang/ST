@@ -50,6 +50,7 @@ mod resolve_tests {
                         tags: vec![],
                         reasoning_efforts: Vec::new(),
                         context_window: None,
+                        ..Default::default()
                     },
                 ),
                 (
@@ -59,6 +60,7 @@ mod resolve_tests {
                         tags: vec![],
                         reasoning_efforts: Vec::new(),
                         context_window: None,
+                        ..Default::default()
                     },
                 ),
                 (
@@ -68,6 +70,7 @@ mod resolve_tests {
                         tags: vec![],
                         reasoning_efforts: Vec::new(),
                         context_window: None,
+                        ..Default::default()
                     },
                 ),
             ]
@@ -127,6 +130,7 @@ mod resolve_tests {
                     tags: vec![],
                     reasoning_efforts: Vec::new(),
                     context_window: None,
+                    ..Default::default()
                 },
             )]
             .into_iter()

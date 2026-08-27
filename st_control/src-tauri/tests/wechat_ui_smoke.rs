@@ -79,7 +79,7 @@ fn val_len(v: &serde_json::Value, keys: &[&str]) -> Option<usize> {
 }
 
 fn first_friend_username(cfg: &WeChatConfig) -> Option<String> {
-    let page = contacts::get_contacts_page(&cfg.decrypted_dir, "friend", 0, 200).ok()?;
+    let page = contacts::get_contacts_page(&cfg.decrypted_dir, "friend", 0, 200, None).ok()?;
     page.contacts
         .into_iter()
         .find(|c| !c.username.is_empty())
@@ -308,7 +308,7 @@ fn wechat_ui_smoke_all_interfaces() {
         ("通讯录-公众号", "official"),
         ("通讯录-服务号", "service"),
     ] {
-        match contacts::get_contacts_page(dir, cat, 0, 1000) {
+        match contacts::get_contacts_page(dir, cat, 0, 1000, None) {
             Ok(page) => {
                 if page.total > 0 {
                     report.pass(label, format!("共 {} 个", page.total));
@@ -337,7 +337,7 @@ fn wechat_ui_smoke_all_interfaces() {
     }
 
     // ── 朋友圈 ──
-    match moments::get_moments_page(dir, &self_username, 0, 10) {
+    match moments::get_moments_page(dir, &self_username, 0, 10, None) {
         Ok(page) => {
             if page.total > 0 {
                 report.pass(

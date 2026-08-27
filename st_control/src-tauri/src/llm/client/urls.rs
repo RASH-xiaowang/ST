@@ -115,7 +115,19 @@ pub(crate) fn rerank_url(provider: &ProviderConfig) -> String {
 }
 
 pub(crate) fn speech_url(provider: &ProviderConfig) -> String {
-    format!("{}/audio/speech", api_base(provider))
+    match provider.provider_type {
+        ProviderType::Xiaomi => {
+            // 小米 MiMo TTS：端点为 {base}/mimo-v2-5-tts（非 OpenAI /audio/speech）
+            let base = normalize_base_url(&provider.base_url);
+            // 若用户已把模型路径写在 base_url（如 .../mimo-v2-5-tts），直接使用
+            if base.ends_with("-tts") {
+                base
+            } else {
+                format!("{}/mimo-v2-5-tts", base)
+            }
+        }
+        _ => format!("{}/audio/speech", api_base(provider)),
+    }
 }
 
 pub(crate) fn transcription_url(provider: &ProviderConfig) -> String {

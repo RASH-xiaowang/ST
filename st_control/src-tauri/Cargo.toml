@@ -66,6 +66,12 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # ── 知识库：多格式文档解析（doc/ppt/xls/odt/rtf/epub/pdf → GFM Markdown，MIT） ──
 anydoc = "0.1"
 
+# ── 知识库：检索结果 LRU 缓存 ──
+lru = "0.12"
+
+# ── 知识库：图片预压缩（OCR 前缩放大图，减少处理时间） ──
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
+
 # ── 图文识别：开源 OCR 预检（RapidOCR PP-OCRv6，Apache-2.0；模型首启自动下载缓存） ──
 rapidocr-core = { version = "0.2", optional = true }
 

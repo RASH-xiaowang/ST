@@ -10,6 +10,7 @@ fn main() {
     let t0 = std::time::Instant::now();
     let v = st_control_lib::wechat::insights::build_relationship_graph(
         &cfg.decrypted_dir,
+        &cfg.wechat_base_dir,
         &self_username,
         Some(80),
         Some(27),
@@ -41,6 +42,7 @@ fn main() {
     let t1 = std::time::Instant::now();
     let v2 = st_control_lib::wechat::insights::build_relationship_graph(
         &cfg.decrypted_dir,
+        &cfg.wechat_base_dir,
         &self_username,
         Some(80),
         Some(27),

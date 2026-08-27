@@ -157,7 +157,9 @@ async fn generate_video_inner(
     // 3) 仍无法解析：打印真实响应，便于定位接口结构
     let preview = data.to_string();
     let preview = if preview.len() > 1000 {
-        format!("{}…(已截断)", &preview[..1000])
+        // 安全截断：按字符边界切分，避免多字节 UTF-8 字符 panic
+        let truncated: String = preview.chars().take(1000).collect();
+        format!("{}…(已截断)", truncated)
     } else {
         preview
     };
@@ -260,7 +262,8 @@ async fn submit_video_task(
     } else {
         let preview = data.to_string();
         let preview = if preview.len() > 1000 {
-            format!("{}…(已截断)", &preview[..1000])
+            let truncated: String = preview.chars().take(1000).collect();
+            format!("{}…(已截断)", truncated)
         } else {
             preview
         };

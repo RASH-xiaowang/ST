@@ -88,7 +88,8 @@ fn collect_local_md5s(cfg: &WeChatConfig) -> HashSet<String> {
                 .to_string_lossy()
                 .to_lowercase();
             if name.len() >= 32 {
-                set.insert(name[..32].to_string());
+                // 安全截断：按字符边界切分，避免多字节 UTF-8 字符 panic
+                set.insert(name.chars().take(32).collect());
             }
         }
     }
@@ -102,7 +103,7 @@ fn collect_local_md5s(cfg: &WeChatConfig) -> HashSet<String> {
             .to_string_lossy()
             .to_lowercase();
         if name.len() >= 32 {
-            set.insert(name[..32].to_string());
+            set.insert(name.chars().take(32).collect());
         }
     }
     set

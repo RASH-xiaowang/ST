@@ -22,7 +22,8 @@ pub struct AclInput {
     pub grantee_type: String, // user / role / public
     pub user_id: Option<i64>,
     pub role_id: Option<i64>,
-    pub effect: String, // allow / deny
+    #[serde(default)]
+    pub effect: String, // allow / deny（kb_acl_delete 不传，默认空串）
 }
 
 #[tauri::command]
@@ -62,6 +63,47 @@ pub async fn kb_set_acl(
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         rusqlite::params![input.scope, input.doc_id, input.dir_id, input.kb_id, input.grantee_type, input.user_id, input.role_id, input.effect, uid],
     ).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 删除单条 ACL 规则（仅删除，不插入）。
+/// 此前前端删除复用 kb_set_acl(effect='allow')，而后端是「先删后插」，
+/// 导致删除操作把同一条规则又插回去，规则实际从未删除。
+#[tauri::command]
+pub async fn kb_acl_delete(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    input: AclInput,
+) -> Result<(), String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    let kb_id = input.kb_id.ok_or("缺少 kb_id")?;
+    if !crate::kb::retrieval::can_manage_kb(&db, kb_id, uid) {
+        return Err("无权限：仅知识库 owner/admin 可删除 ACL".to_string());
+    }
+    let conn = db.conn_lock();
+    let deleted = conn
+        .execute(
+            "DELETE FROM kb_acl WHERE scope=?1
+                AND COALESCE(doc_id,0)=COALESCE(?2,0)
+                AND COALESCE(dir_id,0)=COALESCE(?3,0)
+                AND COALESCE(kb_id,0)=COALESCE(?4,0)
+                AND grantee_type=?5
+                AND COALESCE(user_id,0)=COALESCE(?6,0)
+                AND COALESCE(role_id,0)=COALESCE(?7,0)",
+            rusqlite::params![
+                input.scope,
+                input.doc_id,
+                input.dir_id,
+                input.kb_id,
+                input.grantee_type,
+                input.user_id,
+                input.role_id
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    if deleted == 0 {
+        return Err("未找到匹配的 ACL 规则".to_string());
+    }
     Ok(())
 }
 
@@ -445,6 +487,13 @@ pub async fn kb_add_member(
         "owner" | "admin" | "editor" | "viewer" => role,
         _ => "viewer".to_string(),
     };
+    // 仅当前 owner 可分配 owner 角色，防止 admin 提升他人为 owner 导致多 owner
+    if role == "owner" {
+        let cur_role = crate::kb::retrieval::kb_role(&db, kb_id, uid);
+        if cur_role.as_deref() != Some("owner") {
+            return Err("无权限：仅知识库 owner 可分配 owner 角色".to_string());
+        }
+    }
     let conn = db.conn_lock();
     conn.execute(
         "INSERT INTO kb_members (kb_id, user_id, role) VALUES (?1,?2,?3)
@@ -597,10 +646,10 @@ pub fn ensure_system_kb(db: &KbDatabase) {
 pub async fn kb_list(
     db: State<'_, KbDatabase>,
     session: State<'_, crate::kb::auth::UserSession>,
-    user_id: i64,
+    _user_id: i64,
 ) -> Result<Vec<KbSummary>, String> {
-    // 以登录态为准（前端传入的 user_id 仅作兜底）
-    let uid = session.get().map(|u| u.id).unwrap_or(user_id);
+    // 以登录态为准，不允许回退到前端传入的 user_id（防越权）
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
     // 与检索侧一致：用 visible_kb_ids（成员 ∪ ACL allow − deny）过滤
     let visible = crate::kb::retrieval::visible_kb_ids(&db, uid);
     if visible.is_empty() {
@@ -671,17 +720,9 @@ pub(crate) fn delete_kb_clean(db: &KbDatabase, kb_id: i64) -> Result<(), String>
     // 2) 显式清理全部关联表（依赖顺序：先子后父；FTS 表无外键必须手动清理）
     //    即使外键级联已开启，显式删除也更稳、更快、不依赖 FK 配置。
     for doc_id in &doc_ids {
-        tx.execute(
-            "DELETE FROM chunks_fts WHERE rowid IN (SELECT id FROM document_chunks WHERE doc_id = ?1)",
-            rusqlite::params![doc_id],
-        )
-        .map_err(|e| e.to_string())?;
+        crate::kb::db::fts_delete_chunks_by_doc(&tx, *doc_id)?;
     }
-    tx.execute(
-        "DELETE FROM wiki_pages_fts WHERE rowid IN (SELECT id FROM wiki_pages WHERE kb_id = ?1)",
-        rusqlite::params![kb_id],
-    )
-    .map_err(|e| e.to_string())?;
+    crate::kb::db::fts_delete_wiki_pages_by_kb(&tx, kb_id)?;
     // 子表（无 kb_id 的按 doc_id / job_id / page_id 关联）
     tx.execute(
         "DELETE FROM qa_messages WHERE session_id IN (SELECT id FROM qa_sessions WHERE kb_id = ?1)",
@@ -849,6 +890,69 @@ pub async fn kb_set_pin(
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// 备份知识库数据库（仅全局管理员）
+#[tauri::command]
+pub async fn kb_backup(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+) -> Result<String, String> {
+    let user = session.get().ok_or("请先登录知识库")?;
+    if !is_global_admin(&db, user.id) {
+        return Err("无权限：仅全局管理员可备份".to_string());
+    }
+    let path = db.backup()?;
+    db.audit_log(
+        Some(user.id),
+        &user.username,
+        "backup",
+        "backup",
+        None,
+        &path.display().to_string(),
+    );
+    Ok(path.display().to_string())
+}
+
+/// 列出备份文件（仅全局管理员）
+#[tauri::command]
+pub async fn kb_list_backups(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+) -> Result<Vec<(String, u64)>, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    if !is_global_admin(&db, uid) {
+        return Err("无权限：仅全局管理员可查看备份".to_string());
+    }
+    Ok(KbDatabase::list_backups())
+}
+
+/// 清理旧备份（仅全局管理员）
+#[tauri::command]
+pub async fn kb_cleanup_backups(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    keep: usize,
+) -> Result<usize, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    if !is_global_admin(&db, uid) {
+        return Err("无权限：仅全局管理员可清理备份".to_string());
+    }
+    KbDatabase::cleanup_backups(keep)
+}
+
+/// 查询审计日志（仅全局管理员）
+#[tauri::command]
+pub async fn kb_list_audit_logs(
+    db: State<'_, KbDatabase>,
+    session: State<'_, crate::kb::auth::UserSession>,
+    limit: usize,
+) -> Result<Vec<serde_json::Value>, String> {
+    let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    if !is_global_admin(&db, uid) {
+        return Err("无权限：仅全局管理员可查看审计日志".to_string());
+    }
+    db.list_audit_logs(limit)
 }
 
 #[cfg(test)]
