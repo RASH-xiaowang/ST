@@ -21,6 +21,7 @@
     openai: SparklesIcon,
     azure: CloudIcon,
     ollama: ServerIcon,
+    xiaomi: SparklesIcon,
     custom: Settings2Icon,
   };
 

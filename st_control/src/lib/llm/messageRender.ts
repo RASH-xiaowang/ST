@@ -32,9 +32,24 @@ export function safeJson(s: string): ChartSpec | null {
   }
 }
 
-/** 最小 HTML 转义（& < >） */
+/** HTML 转义（含引号，防属性注入） */
 function esc(s: string): string {
-  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** URL 协议白名单校验（仅允许 http/https/data:image，拒绝 javascript: 等） */
+function safeUrl(raw: string): string {
+  try {
+    const u = new URL(raw, "http://localhost");
+    if (u.protocol === "http:" || u.protocol === "https:") return raw;
+    if (u.protocol === "data:" && /^data:image\/(png|jpe?g|gif|webp|bmp|svg\+xml);/i.test(raw)) return raw;
+    return ""; // 拒绝 javascript: / data:text / file: 等
+  } catch { return ""; }
 }
 
 /** 行内 markdown：行内代码 / 图片 / 链接 / 粗体 / 斜体。
@@ -51,22 +66,28 @@ export function inlineMd(s: string): string {
     /!\[([^\]]*)\]\(([^)]+)\)/g,
     (_, alt, url) => {
       const a = String(alt || "");
+      const su = safeUrl(url);
+      if (!su) return esc(`![${alt}](${url})`); // 不安全 URL，降为纯文本
       // 根据「媒体类型标记」或扩展名决定渲染方式（视频/音频链接常无扩展名）
       if (VID_EXT.test(url) || a.startsWith("🎬") || a.startsWith("📹")) {
-        return `<video class="llm-md-img" controls preload="metadata" src="${url}" title="${alt}"></video>`;
+        return `<video class="llm-md-img" controls preload="metadata" src="${esc(su)}" title="${esc(a)}"></video>`;
       }
       if (isAudioUrl(url) || a.startsWith("🎙") || a.startsWith("🔊")) {
-        return `<audio class="llm-md-img" controls preload="metadata" src="${url}" title="${alt}"></audio>`;
+        return `<audio class="llm-md-img" controls preload="metadata" src="${esc(su)}" title="${esc(a)}"></audio>`;
       }
-      return `<img class="llm-md-img" src="${url}" alt="${alt}">`;
+      return `<img class="llm-md-img" src="${esc(su)}" alt="${esc(a)}">`;
     },
   );
   x = x.replace(
     /\[([^\]]+)\]\(([^)]+)\)/g,
-    (_, t, url) => `<a class="llm-ext-link" href="${url}" target="_blank" rel="noreferrer">${t}</a>`,
+    (_, t, url) => {
+      const su = safeUrl(url);
+      if (!su) return esc(`[${t}](${url})`); // 不安全 URL，降为纯文本
+      return `<a class="llm-ext-link" href="${esc(su)}" target="_blank" rel="noreferrer">${esc(t)}</a>`;
+    },
   );
-  x = x.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
-  x = x.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>");
+  x = x.replace(/\*\*([^*]+)\*\*/g, (_, t) => `<b>${esc(t)}</b>`);
+  x = x.replace(/(^|[^*])\*([^*\n]+)\*/g, (_, pre, t) => `${pre}<i>${esc(t)}</i>`);
   // 2) 还原行内代码
   x = x.replace(/\u0000(\d+)\u0000/g, (_, i) => codeSpans[Number(i)] ?? "");
   return x;
@@ -88,11 +109,11 @@ export function miniMarkdown(src: string): string {
   let quoteBuf: string[] = [];
   const flush = () => {
     if (quoteBuf.length) {
-      html += `<blockquote>${quoteBuf.map((t) => inlineMd(t)).join("<br>")}</blockquote>`;
+      html += `<blockquote>${quoteBuf.map((t) => inlineMd(esc(t))).join("<br>")}</blockquote>`;
       quoteBuf = [];
     }
     if (listBuf.length) {
-      html += `<${listType}>${listBuf.map((t) => `<li>${inlineMd(t)}</li>`).join("")}</${listType}>`;
+      html += `<${listType}>${listBuf.map((t) => `<li>${inlineMd(esc(t))}</li>`).join("")}</${listType}>`;
       listBuf = [];
       listType = null;
     }
@@ -140,20 +161,23 @@ export function miniMarkdown(src: string): string {
       html += "<hr>";
       continue;
     }
-    // 裸媒体 URL 行：直接渲染为对应元素
+    // 裸媒体 URL 行：直接渲染为对应元素（URL 经协议白名单校验）
     if (MEDIA_RE.test(raw)) {
       flush();
-      if (IMG_EXT.test(raw)) {
-        html += `<img class="llm-md-img" src="${raw}" alt="">`;
+      const su = safeUrl(raw);
+      if (!su) {
+        html += `<p>${esc(raw)}</p>`;
+      } else if (IMG_EXT.test(raw)) {
+        html += `<img class="llm-md-img" src="${esc(su)}" alt="">`;
       } else if (VID_EXT.test(raw)) {
-        html += `<video class="llm-md-img" controls preload="metadata" src="${raw}" title=""></video>`;
+        html += `<video class="llm-md-img" controls preload="metadata" src="${esc(su)}" title=""></video>`;
       } else if (isAudioUrl(raw)) {
-        html += `<audio class="llm-md-img" controls preload="metadata" src="${raw}" title=""></audio>`;
+        html += `<audio class="llm-md-img" controls preload="metadata" src="${esc(su)}" title=""></audio>`;
       } else if (FILE_EXT.test(raw)) {
         const name = decodeURIComponent(raw.split("/").pop() || raw);
-        html += `<a class="llm-file-link" href="${raw}" target="_blank" rel="noreferrer" download>📎 ${name}</a>`;
+        html += `<a class="llm-file-link" href="${esc(su)}" target="_blank" rel="noreferrer" download>📎 ${esc(name)}</a>`;
       } else {
-        html += `<a class="llm-ext-link" href="${raw}" target="_blank" rel="noreferrer">${raw}</a>`;
+        html += `<a class="llm-ext-link" href="${esc(su)}" target="_blank" rel="noreferrer">${esc(raw)}</a>`;
       }
       continue;
     }
@@ -161,7 +185,7 @@ export function miniMarkdown(src: string): string {
     if ((m = /^(#{1,6})\s+(.*)$/.exec(raw))) {
       flush();
       const lvl = m[1].length;
-      html += `<h${lvl}>${inlineMd(m[2])}</h${lvl}>`;
+      html += `<h${lvl}>${inlineMd(esc(m[2]))}</h${lvl}>`;
       continue;
     }
     if (/^[-*]\s+/.test(raw)) {

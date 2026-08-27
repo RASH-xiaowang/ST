@@ -1,21 +1,22 @@
 <script lang="ts">
   import { kbApi } from './services/ipc';
   import { onMount, onDestroy, untrack } from 'svelte';
-  import type { DirNode, DocItem, DocView, KbVersion, UploadTask } from './kbTypes';
+  import type { DocItem, DocView, KbVersion, UploadTask } from './kbTypes';
   import { formatBytes, formatIsoTime } from '../format';
+  import { kbConfirm } from './KbConfirm.svelte';
   import { renderMd } from './markdown';
   import { downloadBlob } from '../download';
   import {
-    flattenDirs,
     fileIco,
     parseTags,
-    previewMime,
     SOURCE_LABEL as sourceLabel,
     STATUS_LABEL as statusLabel,
   } from './fileUtils';
   import KbIcon from './KbIcon.svelte';
   import KbModal from './KbModal.svelte';
-  import { RippleButton } from 'fancy-ui-svelte';
+  import KbDocUploadPanel from './KbDocUploadPanel.svelte';
+  import KbDocDetail from './KbDocDetail.svelte';
+  import ResourcePreview from './ResourcePreview.svelte';
   import { kbChunkCfg } from './kbChunkStore.svelte';
   import { Root as SelectRoot } from '../components/ui/select';
   import {
@@ -25,6 +26,12 @@
 } from '../components/ui/select';
   import { Checkbox } from '../components/ui/checkbox';
   import { Input } from '../components/ui/input';
+  import { Button } from '../components/ui/button';
+  import { Badge } from '../components/ui/badge';
+  import { Skeleton } from '../components/ui/skeleton';
+  import { Empty, EmptyTitle, EmptyDescription } from '../components/ui/empty';
+  import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
+  import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '../components/ui/dropdown-menu';
 
   interface Props {
     selectedKb: number | null;
@@ -35,12 +42,12 @@
     onTotalDocs?: (n: number) => void;
     // 外部（AI 问答引用跳转）指定打开文档
     openDocId?: { id: number; ts: number } | null;
+    // 顶部全局搜索框回车后传入的关键词（ts 用于重复触发）
+    searchInit?: { query: string; ts: number } | null;
   }
-  let { selectedKb, notify, refreshKbs, selProvider, selModel, onTotalDocs, openDocId }: Props = $props();
+  let { selectedKb, notify, refreshKbs, selProvider, selModel, onTotalDocs, openDocId, searchInit }: Props = $props();
 
-  let dirs = $state<DirNode[]>([]);
   let docs = $state<DocItem[]>([]);
-  let selectedDirId = $state<number | null>(null);
   let docFilter = $state('');
   let statusFilter = $state('');
   let batchMode = $state(false);
@@ -56,49 +63,42 @@
     }, 300);
   }
 
-  let uploadMenuOpen = $state(false);
   let fileInputRef = $state<HTMLInputElement | null>(null);
   let folderInputRef = $state<HTMLInputElement | null>(null);
+  let docsLoading = $state(false);
 
   let dragOver = $state(false);
   let uploadTasks = $state<UploadTask[]>([]);
-  // 上传任务悬浮面板：默认展开；折叠后仅显示标题栏，不占布局
-  let uploadPanelOpen = $state(true);
-  let uploadPanelEl = $state<HTMLElement | null>(null);
-  // 新任务加入时自动滚到底部，方便连续上传多个文件时查看最新进度
-  $effect(() => {
-    const n = uploadTasks.length;
-    if (n > 0 && uploadPanelOpen && uploadPanelEl) {
-      uploadPanelEl.scrollTop = uploadPanelEl.scrollHeight;
-    }
-  });
 
   let viewDoc = $state<DocView | null>(null);
-  let viewLoading = $state(false);
   let versions = $state<KbVersion[]>([]);
-  let detailTab = $state<'content' | 'chunks' | 'versions'>('content');
   let reprocessing = $state<number | null>(null);
 
-  let diffFromId = $state<number | null>(null);
-  let diffToId = $state<number | null>(null);
-  let diffData = $state<{ fromVersionNo: number; toVersionNo: number; added: string[]; removed: string[] } | null>(null);
-  let diffLoading = $state(false);
-  function resetDiff() { diffFromId = null; diffToId = null; diffData = null; diffLoading = false; }
-
   let moveDocId = $state<number | null>(null);
-  let moveTargetDir = $state<number | null>(null);
-  let flatDirs = $state<{ id: number; name: string; depth: number }[]>([]);
 
   // 后台任务轮询（异步上传/重处理后自动刷新文档状态）
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  // 指数退避：3s → 6s → 12s → 24s → 最大 30s，新任务或检测到处理中时重置
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
+  let pollInterval = 3000;
+  const POLL_MIN = 3000;
+  const POLL_MAX = 30000;
   function startPoll() {
     if (pollTimer) return;
-    pollTimer = setInterval(() => {
-      if (document.hidden) return; // 页面隐藏时暂停轮询
-      if (selectedKb !== null) loadDocs(selectedKb);
-    }, 3000);
+    pollInterval = POLL_MIN; // 新任务启动时重置为最快轮询
+    schedulePoll();
   }
-  function stopPoll() { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } }
+  function schedulePoll() {
+    if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      if (document.hidden) { schedulePoll(); return; } // 页面隐藏时跳过本轮，保持调度
+      if (selectedKb !== null) loadDocs(selectedKb);
+      // 退避：下次间隔翻倍（上限 30s）
+      pollInterval = Math.min(pollInterval * 2, POLL_MAX);
+      schedulePoll();
+    }, pollInterval);
+  }
+  function stopPoll() { if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; } }
 
   function totalPages(): number {
     return Math.max(1, Math.ceil(totalDocs / pageSize));
@@ -118,10 +118,8 @@
     return formatBytes(n, { nullPlaceholder: '-', units: ['B', 'KB', 'MB'] });
   }
 
-  async function loadDirs(kbId: number) {
-    try { dirs = await kbApi.listDirs(kbId); } catch { dirs = []; }
-  }
   async function loadDocs(kbId: number) {
+    docsLoading = true;
     try {
       const res = await kbApi.listDocuments({
         kbId,
@@ -130,12 +128,13 @@
         keyword: docFilter.trim() || null,
         status: statusFilter || null,
         tag: tagFilter || null,
-        dirId: selectedDirId,
+        dirId: null,
       });
       docs = res.items;
       totalDocs = res.total;
       onTotalDocs?.(res.total);
     } catch { docs = []; totalDocs = 0; }
+    finally { docsLoading = false; }
   }
   async function loadTags() {
     if (selectedKb === null) { allTags = []; return; }
@@ -146,14 +145,13 @@
   let tagFilter = $state('');
   $effect(() => {
     const kb = selectedKb;
-    viewDoc = null; versions = []; resetDiff(); selectedDirId = null; docs = []; dirs = [];
+    viewDoc = null; versions = []; docs = [];
     page = 1; totalDocs = 0; tagFilter = '';
     if (kb === null) return;
     // untrack：loadDocs 内部会读取 tagFilter/statusFilter/page 等筛选状态，
     // 若被跟踪，任何筛选/翻页变化都会重跑本 effect 并重置 tagFilter（标签筛选被弹回），
     // 还会造成重复加载。加载只应在知识库切换时触发。
     untrack(() => {
-      loadDirs(kb);
       loadDocs(kb);
       loadTags();
     });
@@ -200,15 +198,31 @@
     uploadTasks = [...uploadTasks, task];
     const idx = uploadTasks.length - 1;
     uploadTasks[idx].status = 'uploading';
+    pollInterval = POLL_MIN; // 新上传开始，重置轮询为最快
     try {
-      const buf = new Uint8Array(await file.arrayBuffer());
+      // 分块 base64 编码（内存有界）：用 Blob.slice 每次只读 2MB，编码完即释放，
+      // 不再持有整文件 ArrayBuffer，峰值内存 ≈ base64 长度（约 1.33× 文件大小），
+      // 远低于原先「整文件 ArrayBuffer + base64」的约 2.33×。32KB 子切片保证
+      // btoa 输入为 3 的倍数（无 padding）。
+      const READ_CHUNK = 2 * 1024 * 1024; // 每次读取 2MB
+      const B64_CHUNK = 32766; // base64 编码子切片（3 的倍数）
+      let base64 = '';
+      for (let off = 0; off < file.size; off += READ_CHUNK) {
+        const sliceBlob = file.slice(off, Math.min(off + READ_CHUNK, file.size));
+        const bytes = new Uint8Array(await sliceBlob.arrayBuffer());
+        for (let i = 0; i < bytes.length; i += B64_CHUNK) {
+          const s = bytes.subarray(i, Math.min(i + B64_CHUNK, bytes.length));
+          base64 += btoa(Array.from(s, (b) => String.fromCharCode(b)).join(''));
+        }
+        // 本片 bytes 出作用域后即可被 GC，不累积整文件副本
+      }
       const res = await kbApi.uploadDocument({
         input: {
           kbId: selectedKb,
-          dirId: selectedDirId,
+          dirId: null,
           title: file.name,
           fileType: ext,
-          data: Array.from(buf),
+          dataBase64: base64,
           embeddingProvider: selProvider || null,
           embeddingModel: selModel || null,
           chunkStrategy: kbChunkCfg.strategy,
@@ -235,7 +249,10 @@
   async function onFolderPick(e: Event) {
     const input = e.target as HTMLInputElement;
     if (input.files && selectedKb !== null) {
-      for (const f of Array.from(input.files)) await uploadFile(f);
+      // 上传所有文件（不保留目录结构）
+      for (const f of Array.from(input.files)) {
+        await uploadFile(f);
+      }
     }
     input.value = '';
   }
@@ -255,7 +272,7 @@
   async function batchDelete() {
     const ids = [...selectedDocs];
     if (ids.length === 0) return;
-    if (!confirm(`确认删除选中的 ${ids.length} 个文档？该操作不可撤销。`)) return;
+    if (!await kbConfirm({ message: `确认删除选中的 ${ids.length} 个文档？该操作不可撤销。`, danger: true, confirmText: '确认删除' })) return;
     let ok = 0, err = 0;
     for (const id of ids) {
     try { await kbApi.deleteDocument(id); ok++; } catch { err++; }
@@ -316,25 +333,112 @@
     batchTagBusy = false;
   }
 
-  // ─── 网页抓取 ───
+  // ─── 全屏预览 ───
+  let previewDoc = $state<{ id: number; title: string; fileType: string | null } | null>(null);
+  let previewData = $state<{ type: string; url?: string; text?: string; base64?: string } | null>(null);
+  let previewLoading = $state(false);
+  async function openPreview(doc: { id: number; title: string; fileType: string | null }) {
+    previewDoc = doc; previewLoading = true; previewData = null;
+    try {
+      const res = await kbApi.downloadDocument(doc.id);
+      const ft = (doc.fileType ?? '').toLowerCase();
+      const isMedia = ['mp3', 'wav', 'm4a', 'ogg', 'flac', 'aac', 'mp4', 'avi', 'mov', 'mkv', 'webm'].includes(ft);
+      const isImage = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(ft);
+      const isPdf = ft === 'pdf';
+      const isOffice = ['docx', 'doc', 'xlsx', 'xls', 'pptx', 'ppt', 'odt', 'ods', 'odp', 'rtf', 'epub'].includes(ft);
+
+      if (isImage || isPdf || isMedia) {
+        // 媒体类型：传递 base64 给 ResourcePreview 组件自行处理
+        previewData = { type: isImage ? 'image' : isPdf ? 'pdf' : 'media', base64: res.dataBase64 };
+      } else if (isOffice) {
+        // Office 文档：提取文本内容用于预览
+        let text = '';
+        try {
+          const dv = await kbApi.getDocument(doc.id);
+          text = dv.content ?? '';
+        } catch { /* 忽略 */ }
+        previewData = { type: 'office', text };
+      } else {
+        let text = '';
+        try {
+          const dv = await kbApi.getDocument(doc.id);
+          text = dv.content ?? '';
+        } catch { /* 忽略 */ }
+        if (!text) {
+          const bin = Uint8Array.from(atob(res.dataBase64), (c) => c.charCodeAt(0));
+          text = new TextDecoder().decode(bin);
+        }
+        previewData = { type: 'text', text };
+      }
+    } catch (e: unknown) { notify('预览失败：' + e, 'error'); }
+    finally { previewLoading = false; }
+  }
+  function closePreview() {
+    if (previewData?.url) URL.revokeObjectURL(previewData.url);
+    previewDoc = null; previewData = null;
+  }
+
+  // ─── 网页抓取（单个） ───
   let fetchUrlOpen = $state(false);
   let fetchUrlVal = $state('');
   let fetchUrlBusy = $state(false);
   let fetchUrlErr = $state('');
+  let fetchUrlStep = $state(''); // 当前步骤：connecting / downloading / extracting / saving / done
   async function doFetchUrl() {
     if (selectedKb === null || fetchUrlBusy) return;
     const url = fetchUrlVal.trim();
     if (!url) { fetchUrlErr = '请输入 URL'; return; }
-    fetchUrlBusy = true; fetchUrlErr = '';
+    fetchUrlBusy = true; fetchUrlErr = ''; fetchUrlStep = 'connecting';
     try {
+      // 模拟步骤进度（后端是同步调用，前端展示步骤让用户感知进度）
+      const stepTimer = setTimeout(() => { if (fetchUrlStep === 'connecting') fetchUrlStep = 'downloading'; }, 500);
+      const extractTimer = setTimeout(() => { if (fetchUrlStep === 'downloading') fetchUrlStep = 'extracting'; }, 2000);
+      const saveTimer = setTimeout(() => { if (fetchUrlStep === 'extracting') fetchUrlStep = 'saving'; }, 4000);
+
       const res = await kbApi.fetchUrl({
-        input: { url, kbId: selectedKb, dirId: selectedDirId, embeddingProvider: selProvider || null, embeddingModel: selModel || null },
+        input: { url, kbId: selectedKb, dirId: null, embeddingProvider: selProvider || null, embeddingModel: selModel || null },
       });
+
+      clearTimeout(stepTimer); clearTimeout(extractTimer); clearTimeout(saveTimer);
+      fetchUrlStep = 'done';
+      await new Promise(r => setTimeout(r, 600)); // 短暂展示完成状态
+
       fetchUrlOpen = false; fetchUrlVal = '';
       notify(`已提交网页抓取：${res.title}`);
       if (selectedKb !== null) { page = 1; await loadDocs(selectedKb); }
     } catch (e: unknown) { fetchUrlErr = '抓取失败：' + e; }
-    finally { fetchUrlBusy = false; }
+    finally { fetchUrlBusy = false; fetchUrlStep = ''; }
+  }
+
+  // ─── 批量网页抓取 ───
+  let batchFetchOpen = $state(false);
+  let batchFetchUrls = $state('');
+  let batchFetchBusy = $state(false);
+  let batchFetchErr = $state('');
+  let batchFetchProgress = $state({ current: 0, total: 0, currentUrl: '' });
+  async function doBatchFetch() {
+    if (selectedKb === null || batchFetchBusy) return;
+    const urls = batchFetchUrls.split('\n').map((u) => u.trim()).filter((u) => u.length > 0);
+    if (urls.length === 0) { batchFetchErr = '请输入至少一个 URL（每行一个）'; return; }
+    batchFetchBusy = true; batchFetchErr = '';
+    batchFetchProgress = { current: 0, total: urls.length, currentUrl: '' };
+    try {
+      // 逐个抓取以提供进度反馈
+      let ok = 0, err = 0;
+      for (let i = 0; i < urls.length; i++) {
+        batchFetchProgress = { current: i + 1, total: urls.length, currentUrl: urls[i] };
+        try {
+          await kbApi.fetchUrl({
+            input: { url: urls[i], kbId: selectedKb, dirId: null, embeddingProvider: selProvider || null, embeddingModel: selModel || null },
+          });
+          ok++;
+        } catch { err++; }
+      }
+      batchFetchOpen = false; batchFetchUrls = '';
+      notify(`批量抓取完成：成功 ${ok} 个${err ? `，失败 ${err} 个` : ''}`);
+      if (selectedKb !== null) { page = 1; await loadDocs(selectedKb); }
+    } catch (e: unknown) { batchFetchErr = '批量抓取失败：' + e; }
+    finally { batchFetchBusy = false; batchFetchProgress = { current: 0, total: 0, currentUrl: '' }; }
   }
 
   // ─── Markdown 新建文档（编辑器 + 预览） ───
@@ -358,7 +462,7 @@
       const buf = new TextEncoder().encode(md);
       await kbApi.uploadDocument({
         input: {
-          kbId: selectedKb, dirId: selectedDirId, title: title + '.md', fileType: 'md',
+          kbId: selectedKb, dirId: null, title: title + '.md', fileType: 'md',
           data: Array.from(buf),
           embeddingProvider: selProvider || null, embeddingModel: selModel || null,
           chunkStrategy: kbChunkCfg.strategy, chunkSize: kbChunkCfg.size, chunkOverlap: kbChunkCfg.overlap,
@@ -371,55 +475,6 @@
     finally { mdDocBusy = false; }
   }
 
-  // ─── 分块编辑 ───
-  let editChunk = $state<{ id: number; content: string } | null>(null);
-  let editChunkVal = $state('');
-  let editChunkBusy = $state(false);
-  async function doSaveChunk() {
-    if (editChunk === null || editChunkBusy) return;
-    editChunkBusy = true;
-    try {
-      const res = await kbApi.updateChunk(editChunk.id, editChunkVal);
-      if (res?.warning) notify(res.warning, 'warn');
-      else notify('分块已更新并重新向量化');
-      editChunk = null;
-      if (viewDoc) await openDoc(viewDoc.meta.id);
-    } catch (e: unknown) { notify('保存分块失败：' + e, 'error'); }
-    finally { editChunkBusy = false; }
-  }
-
-  // ─── 全屏预览 ───
-  let previewDoc = $state<{ id: number; title: string; fileType: string | null } | null>(null);
-  let previewData = $state<{ type: 'pdf' | 'image' | 'text'; url?: string; text?: string } | null>(null);
-  let previewLoading = $state(false);
-  async function openPreview(doc: { id: number; title: string; fileType: string | null }) {
-    previewDoc = doc; previewLoading = true; previewData = null;
-    try {
-      const res = await kbApi.downloadDocument(doc.id);
-      const bin = Uint8Array.from(atob(res.dataBase64), (c) => c.charCodeAt(0));
-      const ft = (doc.fileType ?? '').toLowerCase();
-      if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp'].includes(ft)) {
-        previewData = { type: 'image', url: URL.createObjectURL(new Blob([bin], { type: previewMime(ft) })) };
-      } else if (ft === 'pdf') {
-        previewData = { type: 'pdf', url: URL.createObjectURL(new Blob([bin], { type: 'application/pdf' })) };
-      } else {
-        // 文本类（含 docx/xlsx）：优先用后端解析后的正文，避免显示乱码二进制
-        let text = '';
-        try {
-      const dv = await kbApi.getDocument(doc.id);
-          text = dv.content ?? '';
-        } catch {
-          /* 忽略，走原始解码兜底 */
-        }
-        previewData = { type: 'text', text: text || new TextDecoder().decode(bin) };
-      }
-    } catch (e: unknown) { notify('预览失败：' + e, 'error'); }
-    finally { previewLoading = false; }
-  }
-  function closePreview() {
-    if (previewData?.url) URL.revokeObjectURL(previewData.url);
-    previewDoc = null; previewData = null;
-  }
   async function retryUpload(i: number) {
     const t = uploadTasks[i];
     if (!t) return;
@@ -429,12 +484,11 @@
   function clearTasks() { uploadTasks = []; }
 
   async function openDoc(docId: number) {
-    viewLoading = true; viewDoc = null; versions = []; resetDiff(); detailTab = 'content';
+    viewDoc = null; versions = [];
     try {
     viewDoc = await kbApi.getDocument(docId);
     versions = await kbApi.listVersions(docId);
     } catch (e: unknown) { notify('查看失败：' + e, 'error'); }
-    finally { viewLoading = false; }
   }
   async function downloadDoc(id: number) {
     try {
@@ -473,7 +527,7 @@
     finally { reprocessing = null; }
   }
   async function removeDoc(docId: number) {
-    if (!confirm('确认删除该文档？该操作不可撤销。')) return;
+    if (!await kbConfirm({ message: '确认删除该文档？该操作不可撤销。', danger: true, confirmText: '确认删除' })) return;
     try {
   await kbApi.deleteDocument(docId);
       if (selectedKb !== null) { await loadDocs(selectedKb); refreshKbs(); }
@@ -481,42 +535,15 @@
       notify('文档已删除');
     } catch (e: unknown) { notify('删除失败：' + e, 'error'); }
   }
-  async function restoreVersion(versionId: number) {
-    if (!confirm('回滚到该版本？将生成新的版本并重新向量化。')) return;
-    try {
-  await kbApi.restoreVersion(versionId);
-      notify('版本回滚完成');
-      if (viewDoc) await openDoc(viewDoc.meta.id);
-      if (selectedKb !== null) { await loadDocs(selectedKb); refreshKbs(); }
-    } catch (e: unknown) { notify('回滚失败：' + e, 'error'); }
-  }
-  function pickDiffFrom(id: number) {
-    diffFromId = id;
-    if (diffToId === id) diffToId = versions.find((v) => v.id !== id)?.id ?? null;
-  }
-  function pickDiffTo(id: number) {
-    diffToId = id;
-    if (diffFromId === id) diffFromId = versions.find((v) => v.id !== id)?.id ?? null;
-  }
-  async function doVersionDiff() {
-    if (viewDoc === null || diffFromId === null || diffToId === null) return;
-    diffLoading = true; diffData = null;
-    try {
-    diffData = await kbApi.versionDiff(viewDoc.meta.id, diffFromId, diffToId);
-    } catch (e: unknown) { notify('对比失败：' + e, 'error'); }
-    finally { diffLoading = false; }
-  }
 
   function openMoveDoc(id: number) {
     moveDocId = id;
-    moveTargetDir = selectedDirId;
-    flatDirs = flattenDirs(dirs);
   }
   async function doMoveDoc() {
     if (moveDocId === null) return;
     try {
-    await kbApi.moveDoc(moveDocId, moveTargetDir);
-      notify('文档已移动');
+    await kbApi.moveDoc(moveDocId, null);
+      notify('文档已移动到根目录');
       moveDocId = null;
       if (selectedKb !== null) await loadDocs(selectedKb);
     } catch (e: unknown) { notify('移动失败：' + e, 'error'); }
@@ -554,7 +581,7 @@
     const file = input.files?.[0];
     input.value = '';
     if (!file || viewDoc === null) return;
-    if (!confirm(`为「${viewDoc.meta.title}」上传新版本？\n\n将保留历史版本，并重新解析 → 分片 → 向量化。`)) return;
+    if (!await kbConfirm({ message: `为「${viewDoc.meta.title}」上传新版本？\n\n将保留历史版本，并重新解析 → 分片 → 向量化。` })) return;
     const ext = (file.name.split('.').pop() || 'txt').toLowerCase();
     if (!SUPPORTED_EXT.includes(ext)) {
       notify(`暂不支持的文件类型：.${ext}（支持 ${SUPPORTED_EXT_TEXT}）`, 'error');
@@ -562,12 +589,19 @@
     }
     newVersionBusy = true;
     try {
-      const buf = new Uint8Array(await file.arrayBuffer());
+      const rawBuf = await file.arrayBuffer();
+      const bytes = new Uint8Array(rawBuf);
+      const CHUNK = 32766; // 必须是 3 的倍数，保证 base64 无 padding
+      let base64 = '';
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        const slice = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
+        base64 += btoa(Array.from(slice, (b) => String.fromCharCode(b)).join(''));
+      }
       await kbApi.uploadNewVersion({
         input: {
           docId: viewDoc.meta.id,
           fileType: ext,
-          data: Array.from(buf),
+          dataBase64: base64,
           note: null,
           embeddingProvider: selProvider || null,
           embeddingModel: selModel || null,
@@ -587,7 +621,7 @@
   let wikiGenBusy = $state(false);
   async function generateWikiForDoc(docId: number) {
     if (selectedKb === null || wikiGenBusy) return;
-    if (!confirm('用 LLM 将本文档提炼为 Wiki 页面？已存在的同名页面会自动合并。')) return;
+    if (!await kbConfirm({ message: '用 LLM 将本文档提炼为 Wiki 页面？已存在的同名页面会自动合并。' })) return;
     wikiGenBusy = true;
     try {
       const res = await kbApi.wikiGenerate({ kbId: selectedKb, docId });
@@ -606,7 +640,18 @@
     const o = openDocId;
     if (o) openDoc(o.id);
   });
-  onMount(() => { if (selectedKb !== null) { loadDirs(selectedKb); loadDocs(selectedKb); } });
+  // 顶部全局搜索：关键词变化时填入文档过滤并立即检索（untrack 避免写回 docFilter 触发重跑）
+  $effect(() => {
+    const init = searchInit;
+    if (!init) return;
+    untrack(() => {
+      docFilter = init.query;
+      page = 1;
+      if (selectedKb !== null) loadDocs(selectedKb);
+    });
+  });
+
+  onMount(() => { if (selectedKb !== null) { loadDocs(selectedKb); } });
   onDestroy(stopPoll);
 </script>
 
@@ -618,7 +663,7 @@
   </div></div>
 {:else}
 <div style="display:flex;gap:14px;height:100%;min-height:0">
-  <!-- 中：文档列表 -->
+  <!-- 文档列表 -->
   <div class="kb-card" style="flex:1;min-width:0;display:flex;flex-direction:column;min-height:0">
     <div class="kb-card-hd" style="flex-direction:column;align-items:stretch;gap:10px;padding:12px 16px">
       <!-- 第一行：搜索 + 批量操作 / 添加文档 / 文档数 -->
@@ -633,24 +678,29 @@
           <Checkbox checked={batchMode} onCheckedChange={(c) => (batchMode = !!c)} />
           批量操作
         </label>
-        <div style="display:flex;gap:8px;align-items:center;position:relative">
-          <RippleButton onclick={() => { uploadMenuOpen = !uploadMenuOpen; }} rippleColor="#b8f5a8"
-            class="h-9 rounded-[6px] border-0 bg-[var(--kb-btn-bg)] px-4 text-[13px] font-medium text-white hover:brightness-110"><KbIcon name="plus" size={14} weight="bold" />添加文档</RippleButton>
-          {#if uploadMenuOpen}
-    <div
-      style="position:fixed;inset:0;z-index:60"
-      role="button"
-      aria-label="关闭上传菜单"
-      tabindex="-1"
-      onclick={(e) => { if (e.target === e.currentTarget) (() => uploadMenuOpen = false)(); }}
-      onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ' || e.key === 'Escape') uploadMenuOpen = false; }}
-    ></div>
-            <div class="kb-menu">
-              <button class="kb-menu-item" onclick={() => { uploadMenuOpen = false; fileInputRef?.click(); }}><KbIcon name="file" size={14} />上传文件</button>
-              <button class="kb-menu-item" onclick={() => { uploadMenuOpen = false; folderInputRef?.click(); }}><KbIcon name="folderOpen" size={14} />上传文件夹</button>
-              <button class="kb-menu-item" onclick={() => { uploadMenuOpen = false; fetchUrlVal = ''; fetchUrlErr = ''; fetchUrlOpen = true; }}><KbIcon name="link" size={14} />抓取网页</button>
-            </div>
-          {/if}
+        <div class="flex gap-2 items-center relative">
+          <DropdownMenu>
+            <DropdownMenuTrigger>
+              <Button size="sm">
+                <KbIcon name="plus" size={14} weight="bold" />添加文档
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onclick={() => fileInputRef?.click()}>
+                <KbIcon name="file" size={14} />上传文件
+              </DropdownMenuItem>
+              <DropdownMenuItem onclick={() => folderInputRef?.click()}>
+                <KbIcon name="folderOpen" size={14} />上传文件夹
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem onclick={() => { fetchUrlVal = ''; fetchUrlErr = ''; fetchUrlOpen = true; }}>
+                <KbIcon name="link" size={14} />抓取网页
+              </DropdownMenuItem>
+              <DropdownMenuItem onclick={() => { batchFetchUrls = ''; batchFetchErr = ''; batchFetchOpen = true; }}>
+                <KbIcon name="link" size={14} />批量抓取网页
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <input type="file" multiple hidden bind:this={fileInputRef} accept={ACCEPT_ATTR} onchange={onFilePick} />
           <input type="file" multiple hidden bind:this={folderInputRef} webkitdirectory onchange={onFolderPick} />
         </div>
@@ -688,8 +738,10 @@
             {/each}
           </SelectContent>
         </SelectRoot>
-        <div style="flex:1"></div>
-        <button class="kb-btn-md" onclick={() => { mdDocTitle = ''; mdDocBody = ''; mdDocErr = ''; mdDocOpen = true; }}><KbIcon name="edit" size={14} />新建文档</button>
+        <div class="flex-1"></div>
+        <Button variant="outline" size="sm" onclick={() => { mdDocTitle = ''; mdDocBody = ''; mdDocErr = ''; mdDocOpen = true; }}>
+          <KbIcon name="edit" size={14} />新建文档
+        </Button>
       </div>
     </div>
 
@@ -715,220 +767,166 @@
       </div>
 
       {#if batchMode}
-        <div style="display:flex;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap;flex:none">
-          <label style="display:inline-flex;align-items:center;gap:6px;font-size:12.5px;color:var(--kb-text-2);cursor:pointer">
+        <div class="flex items-center gap-2 mt-2.5 flex-wrap flex-shrink-0">
+          <label class="inline-flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer">
             <Checkbox checked={allSelected} onCheckedChange={toggleSelectAll} />
             全选（{docs.length}）
           </label>
           {#if selectedDocs.size > 0}
-            <span class="kb-badge kb-badge-info">已选 {selectedDocs.size}</span>
-            <button class="kb-btn-sm" onclick={() => { batchMoveDir = selectedDirId; batchMoveOpen = true; }}><KbIcon name="move" size={12} />批量移动</button>
-            <button class="kb-btn-sm" onclick={() => { batchTagVal = ''; batchTagOpen = true; }}><KbIcon name="tag" size={12} />批量打标签</button>
-            <button class="kb-btn-sm" onclick={batchDownload} disabled={batchBusy}><KbIcon name="download" size={12} />{batchBusy ? '打包中…' : '批量下载'}</button>
-            <button class="kb-btn-sm kb-dang" onclick={batchDelete}><KbIcon name="trash" size={12} />批量删除</button>
+            <Badge variant="secondary">已选 {selectedDocs.size}</Badge>
+            <Button variant="outline" size="sm" onclick={() => { batchMoveDir = null; batchMoveOpen = true; }}>
+              <KbIcon name="move" size={12} />批量移动
+            </Button>
+            <Button variant="outline" size="sm" onclick={() => { batchTagVal = ''; batchTagOpen = true; }}>
+              <KbIcon name="tag" size={12} />批量标签
+            </Button>
+            <Button variant="outline" size="sm" onclick={batchDownload} disabled={batchBusy}>
+              <KbIcon name="download" size={12} />{batchBusy ? '打包中…' : '批量下载'}
+            </Button>
+            <Button variant="destructive" size="sm" onclick={batchDelete}>
+              <KbIcon name="trash" size={12} />批量删除
+            </Button>
           {/if}
-          <div style="flex:1"></div>
-          <span style="font-size:11.5px;color:var(--kb-text-3)">勾选文档后可批量移动 / 删除 / 下载</span>
+          <span class="flex-1"></span>
+          <span class="text-[11px] text-muted-foreground">勾选文档后可批量移动 / 删除 / 下载</span>
         </div>
       {/if}
       <div style="flex:1;min-height:0;overflow:auto;margin-top:10px">
-        <table class="kb-table">
-          <thead>
-            <tr>
-              {#if batchMode}<th style="width:34px"></th>{/if}
-              <th>名称</th>
-              <th style="width:96px">状态</th>
-              <th style="width:88px">大小</th>
-              <th style="width:72px">类型</th>
-              <th style="width:96px">来源</th>
-              <th style="width:132px">更新时间</th>
-              <th style="width:150px">操作</th>
-            </tr>
-          </thead>
-          <tbody>
+        {#if docsLoading}
+          <div style="display:flex;flex-direction:column;gap:8px;padding:16px 0">
+            {#each Array(6) as _}
+              <Skeleton class="h-[48px] rounded-lg" />
+            {/each}
+          </div>
+        {:else if docs.length === 0}
+          <Empty class="min-h-[200px]">
+            <KbIcon name="file" size={28} color="var(--kb-text-3)" />
+            <EmptyTitle>{totalDocs === 0 ? '暂无文档' : '没有匹配的文档'}</EmptyTitle>
+            <EmptyDescription>{totalDocs === 0 ? '拖拽文件到此处或点击上方「添加文档」开始' : '尝试调整搜索条件或筛选器'}</EmptyDescription>
+          </Empty>
+        {:else}
+        <Table>
+          <TableHeader>
+            <TableRow>
+              {#if batchMode}<TableHead class="w-[34px]"></TableHead>{/if}
+              <TableHead>名称</TableHead>
+              <TableHead class="w-[96px]">状态</TableHead>
+              <TableHead class="w-[88px]">大小</TableHead>
+              <TableHead class="w-[72px] hidden md:table-cell">类型</TableHead>
+              <TableHead class="w-[96px] hidden lg:table-cell">来源</TableHead>
+              <TableHead class="w-[132px] hidden sm:table-cell">更新时间</TableHead>
+              <TableHead class="w-[150px]">操作</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {#each docs as doc}
-              <tr class:kb-row-selected={selectedDocs.has(doc.id)}>
+              <TableRow class={selectedDocs.has(doc.id) ? 'bg-muted/50' : ''}>
                 {#if batchMode}
-                  <td><Checkbox checked={selectedDocs.has(doc.id)} onCheckedChange={() => toggleSelect(doc.id)} /></td>
+                  <TableCell><Checkbox checked={selectedDocs.has(doc.id)} onCheckedChange={() => toggleSelect(doc.id)} /></TableCell>
                 {/if}
-                <td>
-                  <div style="display:flex;align-items:center;gap:8px;min-width:0">
-                    <span style="flex:none;color:var(--kb-accent-bright)"><KbIcon name={fileIco(doc.fileType)} size={16} /></span>
-          <span
-            style="font-size:13px;color:var(--kb-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer"
-            role="button"
-            tabindex="0"
-            title={doc.title}
-            onclick={(e) => { if (e.target === e.currentTarget) (() => openDoc(doc.id))(); }}
-            onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDoc(doc.id); } }}
-          >{doc.title}</span>
+                <TableCell>
+                  <div class="flex items-center gap-2 min-w-0">
+                    <span class="text-accent-foreground flex-shrink-0"><KbIcon name={fileIco(doc.fileType)} size={16} /></span>
+                    <button class="text-sm text-foreground truncate cursor-pointer hover:underline text-left"
+                      title={doc.title} onclick={() => openDoc(doc.id)}>
+                      {doc.title}
+                    </button>
                     {#each (doc.tags ?? []) as tg}
-                      <span class="kb-badge kb-badge-info" style="font-size:11.5px;padding:0 6px">{tg}</span>
+                      <Badge variant="secondary" class="text-[10px] px-1.5 py-0">{tg}</Badge>
                     {/each}
                   </div>
-                </td>
-                <td style="white-space:nowrap">
-                  <div style="display:inline-flex;gap:4px;align-items:center;flex-wrap:wrap">
-                    <span class="kb-badge" class:kb-badge-ok={doc.status === 'ready'}
-                      class:kb-badge-warn={doc.status === 'processing' || doc.status === 'pending'}
-                      class:kb-badge-err={doc.status === 'failed'}>{statusLabel[doc.status] ?? doc.status}</span>
+                  {#if doc.snippet}
+                    <div class="text-xs text-muted-foreground truncate mt-0.5">
+                      {#each doc.snippet.split(/(【.+?】)/) as part}
+                        {#if part.startsWith('【') && part.endsWith('】')}<span class="bg-yellow-100 dark:bg-yellow-900/30 rounded px-0.5">{part.slice(1, -1)}</span>{:else}{part}{/if}
+                      {/each}
+                    </div>
+                  {/if}
+                </TableCell>
+                <TableCell>
+                  <div class="inline-flex gap-1 items-center flex-wrap">
+                    <Badge variant={doc.status === 'ready' ? 'default' : doc.status === 'failed' ? 'destructive' : 'secondary'}>
+                      {statusLabel[doc.status] ?? doc.status}
+                    </Badge>
                     {#if doc.status === 'ready' && doc.processStatus === 'no_embedding'}
-                      <span class="kb-badge kb-badge-warn" title="未配置嵌入模型：文档已解析但未向量化，仅可全文检索">未向量化</span>
+                      <Badge variant="outline" class="text-[10px]" title="未配置嵌入模型">未向量化</Badge>
                     {:else if doc.status === 'ready' && doc.processStatus === 'embed_error'}
-                      <span class="kb-badge kb-badge-err" title="向量化失败：文档已解析但未向量化，请检查嵌入配置后重新处理">向量化失败</span>
+                      <Badge variant="destructive" class="text-[10px]" title="向量化失败">向量化失败</Badge>
                     {/if}
                   </div>
-                </td>
-                <td style="font-size:12.5px;color:var(--kb-text-2)">{fmtBytes(doc.fileSize)}</td>
-                <td><span class="kb-badge kb-badge-mute">.{doc.fileType ?? '?'}</span></td>
-                <td style="font-size:12.5px;color:var(--kb-text-2)">{sourceLabel[doc.source ?? 'upload'] ?? '文件上传'}</td>
-                <td style="font-size:12px;color:var(--kb-text-3)">{fmtTime(doc.updatedAt ?? doc.createdAt)}</td>
-                <td>
-                  <div style="display:flex;gap:6px;align-items:center">
-                    <button class="kb-btn-sm" onclick={() => openPreview(doc)} title="预览"><KbIcon name="eye" size={12} /></button>
-                    <button class="kb-btn-sm" onclick={() => openDoc(doc.id)} title="查看"><KbIcon name="file" size={12} /></button>
-                    <button class="kb-btn-sm" onclick={() => tagModal = { docId: doc.id, docTitle: doc.title, tags: (doc.tags ?? []).join('、') }} title="标签"><KbIcon name="tag" size={12} /></button>
-                    <button class="kb-btn-sm kb-dang" onclick={() => removeDoc(doc.id)} title="删除"><KbIcon name="trash" size={12} /></button>
+                </TableCell>
+                <TableCell class="text-xs text-muted-foreground">{fmtBytes(doc.fileSize)}</TableCell>
+                <TableCell class="hidden md:table-cell"><Badge variant="outline" class="text-[10px]">.{doc.fileType ?? '?'}</Badge></TableCell>
+                <TableCell class="text-xs text-muted-foreground hidden lg:table-cell">{sourceLabel[doc.source ?? 'upload'] ?? '文件上传'}</TableCell>
+                <TableCell class="text-xs text-muted-foreground hidden sm:table-cell">{fmtTime(doc.updatedAt ?? doc.createdAt)}</TableCell>
+                <TableCell>
+                  <div class="flex gap-1 items-center">
+                    <Button variant="ghost" size="icon-sm" onclick={() => openPreview(doc)} title="预览">
+                      <KbIcon name="eye" size={12} />
+                    </Button>
+                    <Button variant="ghost" size="icon-sm" onclick={() => openDoc(doc.id)} title="查看">
+                      <KbIcon name="file" size={12} />
+                    </Button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger>
+                        <Button variant="ghost" size="icon-sm"><KbIcon name="more" size={12} /></Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onclick={() => tagModal = { docId: doc.id, docTitle: doc.title, tags: (doc.tags ?? []).join('、') }}>
+                          <KbIcon name="tag" size={12} />编辑标签
+                        </DropdownMenuItem>
+                        <DropdownMenuItem onclick={() => reprocessDoc(doc.id)}>
+                          <KbIcon name="refresh" size={12} />重新处理
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <DropdownMenuItem class="text-destructive" onclick={() => removeDoc(doc.id)}>
+                          <KbIcon name="trash" size={12} />删除
+                        </DropdownMenuItem>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                   </div>
-                </td>
-              </tr>
+                </TableCell>
+              </TableRow>
             {/each}
-          </tbody>
-        </table>
-        {#if docs.length === 0}
-          <div class="kb-empty" style="min-height:200px"><span class="kb-empty-ico"><KbIcon name="file" size={22} /></span><span>{totalDocs === 0 ? '暂无文档，拖拽文件或点击添加文档' : '没有匹配的文档'}</span></div>
+          </TableBody>
+        </Table>
         {/if}
       </div>
     </div>
-    <!-- 分页：固定底部右下角，不随内容滚动 -->
-    <div class="kb-pagination">
-      <span style="font-size:12px;color:var(--kb-text-3)">共 {totalDocs} 条 · 第 {page} / {totalPages()} 页</span>
-      <button class="kb-btn-sm" onclick={prevPage} disabled={page <= 1}>上一页</button>
-      <button class="kb-btn-sm" onclick={nextPage} disabled={page * pageSize >= totalDocs}>下一页</button>
+    <!-- 分页：固定底部 -->
+    <div class="flex items-center gap-2 justify-end px-4 py-2.5 border-t border-border flex-shrink-0 bg-background">
+      <span class="text-xs text-muted-foreground">共 {totalDocs} 条 · 第 {page}/{totalPages()} 页</span>
+      <Button variant="outline" size="sm" onclick={prevPage} disabled={page <= 1}>上一页</Button>
+      <Button variant="outline" size="sm" onclick={nextPage} disabled={page * pageSize >= totalDocs}>下一页</Button>
     </div>
   </div>
 
   <!-- 右：详情抽屉 -->
   {#if viewDoc}
-    <div class="kb-card" style="flex:none;width:420px;display:flex;flex-direction:column;min-height:0">
-      <div class="kb-card-hd" style="justify-content:space-between">
-        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={viewDoc.meta.title}>{viewDoc.meta.title}</span>
-        <button class="kb-btn-sm kb-btn-ghost" onclick={() => { viewDoc = null; versions = []; }}><KbIcon name="close" size={14} /></button>
-      </div>
-      <div style="display:flex;gap:8px;padding:10px 12px;border-bottom:1px solid var(--kb-border);flex-wrap:wrap;align-items:center">
-        <span class="kb-badge kb-badge-mute">{viewDoc.meta.fileType ?? '?'}</span>
-        <span class="kb-badge" class:kb-badge-ok={viewDoc.meta.status === 'ready'} class:kb-badge-err={viewDoc.meta.status === 'failed'}>{viewDoc.meta.status}</span>
-        <div style="flex:1"></div>
-        <button class="kb-btn-sm" onclick={() => viewDoc && downloadDoc(viewDoc.meta.id)}><KbIcon name="download" size={12} />下载</button>
-        <button class="kb-btn-sm" onclick={() => viewDoc && openRenameDoc(viewDoc.meta)}><KbIcon name="edit" size={12} />重命名</button>
-        <button class="kb-btn-sm" onclick={() => viewDoc && openMoveDoc(viewDoc.meta.id)}><KbIcon name="move" size={12} />移动</button>
-        <label class="kb-btn-sm" style="cursor:pointer" title="上传新版本并重新向量化">
-          <KbIcon name="fileUp" size={12} />{newVersionBusy ? '处理中…' : '新版本'}
-          <input type="file" hidden accept={ACCEPT_ATTR} onchange={onNewVersionPick} />
-        </label>
-        <button class="kb-btn-sm" onclick={() => viewDoc && generateWikiForDoc(viewDoc.meta.id)}
-          disabled={wikiGenBusy || viewDoc.meta.status !== 'ready'}
-          title={viewDoc.meta.status === 'ready' ? '用 LLM 将本文档提炼为 Wiki 页面' : '仅就绪文档可提炼'}><KbIcon name="sparkle" size={12} />提炼</button>
-        <button class="kb-btn-sm" onclick={() => viewDoc && reprocessDoc(viewDoc.meta.id)} disabled={reprocessing !== null}><KbIcon name="refresh" size={12} />重处理</button>
-      </div>
-      {#if viewDoc.meta.processStatus === 'no_embedding'}
-        <div class="kb-msg warn" style="margin:10px 12px 0"><KbIcon name="warn" size={14} />未配置嵌入模型：本文档已解析但未向量化，无法参与语义检索。配置 Embeddings 模型后点击「重处理」。</div>
-      {:else if viewDoc.meta.processStatus === 'embed_error'}
-        <div class="kb-msg warn" style="margin:10px 12px 0"><KbIcon name="warn" size={14} />向量化失败：本文档已解析但未向量化。请检查嵌入模型配置后点击「重处理」。</div>
-      {/if}
-      <div class="kb-seg" style="margin:10px 12px 0">
-        <button class="kb-seg-item" class:active={detailTab === 'content'} onclick={() => detailTab = 'content'}>正文</button>
-        <button class="kb-seg-item" class:active={detailTab === 'chunks'} onclick={() => detailTab = 'chunks'}>分片 {viewDoc.chunks.length}</button>
-        <button class="kb-seg-item" class:active={detailTab === 'versions'} onclick={() => detailTab = 'versions'}>版本 {versions.length}</button>
-      </div>
-      <div class="kb-scroll" style="flex:1;overflow:auto;padding:12px">
-        {#if viewLoading}
-          <div class="kb-empty">加载中…</div>
-        {:else if detailTab === 'content'}
-          <pre style="font-size:12.5px;line-height:1.7;white-space:pre-wrap;word-break:break-all;margin:0;color:var(--app-color-secondary)">{viewDoc.content ?? '（无法解析正文，可能为扫描版 PDF）'}</pre>
-        {:else if detailTab === 'chunks'}
-          <div style="display:flex;flex-direction:column;gap:8px">
-            {#each viewDoc.chunks as c}
-              <div style="border:1px solid var(--kb-border);border-radius:8px;padding:8px 10px">
-                <div style="display:flex;gap:8px;font-size:11.5px;color:var(--app-color-muted);margin-bottom:4px">
-                  <span class="kb-badge kb-badge-info">#{c.seq}</span><span>{c.tokens} tok</span>
-                  <button class="kb-btn-sm" style="margin-left:auto" onclick={() => { editChunk = { id: c.id, content: c.content }; editChunkVal = c.content; }}><KbIcon name="edit" size={11} />编辑</button>
-                </div>
-                <p style="margin:0;font-size:12.5px;line-height:1.6;color:var(--app-color-secondary);word-break:break-all">{c.content}</p>
-              </div>
-            {/each}
-          </div>
-        {:else if detailTab === 'versions'}
-          <div style="display:flex;flex-direction:column;gap:8px">
-            {#each versions as v}
-              <div style="display:flex;align-items:center;gap:8px;border:1px solid var(--kb-border);border-radius:8px;padding:7px 10px;font-size:12.5px;flex-wrap:wrap">
-                <button class="kb-btn-sm" class:kb-diff-on={diffFromId === v.id} onclick={() => pickDiffFrom(v.id)} title="设为对比基准"><KbIcon name="arrowLeft" size={12} /></button>
-                <button class="kb-btn-sm" class:kb-diff-on={diffToId === v.id} onclick={() => pickDiffTo(v.id)} title="设为对比目标"><KbIcon name="arrowRight" size={12} /></button>
-                <span style="font-weight:600">v{v.versionNo}</span>
-                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--app-color-muted)" title={v.note ?? ''}>{v.note ?? ''}</span>
-                <span style="font-size:11.5px;color:var(--app-color-muted)">{fmtTime(v.createdAt)}</span>
-                <button class="kb-btn-sm" onclick={() => restoreVersion(v.id)}>回滚</button>
-              </div>
-            {/each}
-            {#if versions.length >= 2}
-              <div style="display:flex;gap:6px;align-items:center">
-                <button class="kb-btn-sm" onclick={doVersionDiff} disabled={diffLoading || diffFromId === null || diffToId === null}>{diffLoading ? '对比中…' : '对比所选版本'}</button>
-                <button class="kb-btn-sm" onclick={resetDiff}>清空</button>
-              </div>
-            {/if}
-            {#if diffData}
-              <div style="border:1px solid var(--kb-border);border-radius:8px;overflow:hidden">
-                <div style="padding:6px 10px;font-size:12px;color:var(--app-color-muted);border-bottom:1px solid var(--kb-border)">v{diffData.fromVersionNo} → v{diffData.toVersionNo}：+{diffData.added.length} / -{diffData.removed.length}</div>
-                <div style="max-height:240px;overflow:auto;font-size:12px;line-height:1.6">
-                  {#each diffData.removed as line}<div style="padding:1px 10px;background:color-mix(in srgb, var(--app-danger) 14%, transparent);color:#ff8587;word-break:break-all">- {line}</div>{/each}
-                  {#each diffData.added as line}<div style="padding:1px 10px;background:color-mix(in srgb, var(--app-success) 14%, transparent);color:#7bd95c;word-break:break-all">+ {line}</div>{/each}
-                  {#if diffData.added.length === 0 && diffData.removed.length === 0}<div style="padding:8px 10px;color:var(--app-color-muted)">两个版本内容一致</div>{/if}
-                </div>
-              </div>
-            {/if}
-          </div>
-        {/if}
-      </div>
-    </div>
+    <KbDocDetail
+      doc={viewDoc}
+      versions={versions}
+      {selProvider}
+      {selModel}
+      {notify}
+      onClose={() => { viewDoc = null; versions = []; }}
+      onRefresh={async () => { if (viewDoc) await openDoc(viewDoc.meta.id); if (selectedKb !== null) await loadDocs(selectedKb); }}
+      onDownload={downloadDoc}
+      onRename={openRenameDoc}
+      onMove={openMoveDoc}
+      onReprocess={reprocessDoc}
+      onGenerateWiki={generateWikiForDoc}
+      {reprocessing}
+      {wikiGenBusy}
+      {newVersionBusy}
+      onNewVersionPick={onNewVersionPick}
+      {ACCEPT_ATTR}
+    />
   {/if}
 </div>
 
-<!-- 上传任务悬浮面板：右下角固定显示，不占布局；文件多时内部滚动，避免撑满列表区 -->
-{#if uploadTasks.length > 0}
-  <div class="kb-upload-panel" class:kb-upload-collapsed={!uploadPanelOpen}>
-    <div class="kb-upload-panel-hd">
-      <span style="display:inline-flex;align-items:center;gap:6px;font-size:13px;font-weight:600">
-        <KbIcon name="upload" size={14} color="var(--kb-accent-bright)" />
-        上传任务
-        <span class="kb-badge kb-badge-info">{uploadTasks.length}</span>
-      </span>
-      <div style="display:flex;align-items:center;gap:4px">
-        <button class="kb-btn-sm" onclick={clearTasks} title="清空记录"><KbIcon name="trash" size={12} />清空</button>
-        <button class="kb-btn-sm kb-btn-ghost" onclick={() => uploadPanelOpen = !uploadPanelOpen}
-          title={uploadPanelOpen ? '收起任务列表' : '展开任务列表'}>
-          <KbIcon name={uploadPanelOpen ? 'caretDown' : 'caretRight'} size={12} />
-        </button>
-      </div>
-    </div>
-    {#if uploadPanelOpen}
-      <div class="kb-upload-panel-body" bind:this={uploadPanelEl}>
-        {#each uploadTasks as t, i}
-          <div class="kb-upload-item">
-            <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={t.file.name}>{t.file.name}</span>
-            {#if t.status === 'pending'}<span class="kb-badge kb-badge-mute">等待中</span>
-            {:else if t.status === 'uploading'}<span class="kb-badge kb-badge-warn">处理中…</span>
-            {:else if t.status === 'done'}<span class="kb-badge kb-badge-ok"><KbIcon name="check" size={11} />{t.msg}</span>
-            {:else}<span class="kb-badge kb-badge-err"><KbIcon name="close" size={11} />{t.msg}</span>
-            {/if}
-            {#if t.status === 'error'}
-              <button class="kb-btn-sm" onclick={() => retryUpload(i)}>重试</button>
-            {/if}
-          </div>
-        {/each}
-      </div>
-    {/if}
-  </div>
-{/if}
+<!-- 上传任务悬浮面板 -->
+<KbDocUploadPanel tasks={uploadTasks} onClear={clearTasks} onRetry={retryUpload} />
 
 <!-- 移动文档 -->
 {#if moveDocId !== null}
@@ -936,16 +934,11 @@
       <div class="kb-modal">
       <div class="kb-modal-hd"><span>移动文档</span></div>
       <div class="kb-modal-bd">
-        <select class="kb-select" bind:value={moveTargetDir}>
-          <option value={null}>根目录</option>
-          {#each flatDirs as d}
-            <option value={d.id}>{'　'.repeat(d.depth)}{d.name}</option>
-          {/each}
-        </select>
+        <p class="text-sm text-muted-foreground">文档将移动到根目录（目录功能已移除）</p>
       </div>
       <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => moveDocId = null}>取消</button>
-        <button class="kb-btn" onclick={doMoveDoc}>确认移动</button>
+        <Button variant="outline" onclick={() => moveDocId = null}>取消</Button>
+        <Button onclick={doMoveDoc}>确认移动</Button>
       </div>
     </div>
     </KbModal>
@@ -963,8 +956,8 @@
         {#if renameDocErr}<div class="kb-msg err" style="margin-top:8px">{renameDocErr}</div>{/if}
       </div>
       <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => renameDocOpen = false} disabled={renameDocBusy}>取消</button>
-        <button class="kb-btn" onclick={doRenameDoc} disabled={renameDocBusy}>{renameDocBusy ? '保存中…' : '保存'}</button>
+        <Button variant="outline" onclick={() => renameDocOpen = false} disabled={renameDocBusy}>取消</Button>
+        <Button onclick={doRenameDoc} disabled={renameDocBusy}>{renameDocBusy ? '保存中…' : '保存'}</Button>
       </div>
     </div>
   </KbModal>
@@ -976,16 +969,11 @@
     <div class="kb-modal">
       <div class="kb-modal-hd"><KbIcon name="move" size={16} color="var(--kb-accent-bright)" />批量移动（{selectedDocs.size} 个文档）</div>
       <div class="kb-modal-bd">
-        <select class="kb-select" bind:value={batchMoveDir}>
-          <option value={null}>根目录</option>
-          {#each flatDirs as d}
-            <option value={d.id}>{'　'.repeat(d.depth)}{d.name}</option>
-          {/each}
-        </select>
+        <p class="text-sm text-muted-foreground">文档将移动到根目录（目录功能已移除）</p>
       </div>
       <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => batchMoveOpen = false}>取消</button>
-        <button class="kb-btn" onclick={doBatchMove}>确认移动</button>
+        <Button variant="outline" onclick={() => batchMoveOpen = false}>取消</Button>
+        <Button onclick={doBatchMove}>确认移动</Button>
       </div>
     </div>
   </KbModal>
@@ -1012,8 +1000,8 @@
         {#if tagModalErr}<div class="kb-msg err" style="margin-top:8px">{tagModalErr}</div>{/if}
       </div>
       <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => tagModal = null} disabled={tagModalBusy}>取消</button>
-        <button class="kb-btn" onclick={doSaveDocTags} disabled={tagModalBusy}>{tagModalBusy ? '保存中…' : '保存'}</button>
+        <Button variant="outline" onclick={() => tagModal = null} disabled={tagModalBusy}>取消</Button>
+        <Button onclick={doSaveDocTags} disabled={tagModalBusy}>{tagModalBusy ? '保存中…' : '保存'}</Button>
       </div>
     </div>
     </KbModal>
@@ -1029,8 +1017,8 @@
           onkeydown={(e) => e.key === 'Enter' && doBatchTags()} />
       </div>
       <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => batchTagOpen = false} disabled={batchTagBusy}>取消</button>
-        <button class="kb-btn" onclick={doBatchTags} disabled={batchTagBusy}>{batchTagBusy ? '处理中…' : '应用'}</button>
+        <Button variant="outline" onclick={() => batchTagOpen = false} disabled={batchTagBusy}>取消</Button>
+        <Button onclick={doBatchTags} disabled={batchTagBusy}>{batchTagBusy ? '处理中…' : '应用'}</Button>
       </div>
     </div>
     </KbModal>
@@ -1044,17 +1032,81 @@
       <div class="kb-modal-bd">
         <label class="kb-label">网页地址
           <Input class="kb-input" placeholder="https://example.com/article" bind:value={fetchUrlVal}
-            onkeydown={(e) => e.key === 'Enter' && doFetchUrl()} />
+            onkeydown={(e) => e.key === 'Enter' && doFetchUrl()} disabled={fetchUrlBusy} />
         </label>
         <p style="font-size:12px;color:var(--kb-text-3);margin:8px 0 0;line-height:1.6">系统自动抓取网页标题与正文，转存为 Markdown 文档并进入解析流水线。</p>
+
+        {#if fetchUrlBusy}
+          <div style="margin-top:12px;display:flex;flex-direction:column;gap:8px">
+            <div style="display:flex;align-items:center;gap:8px;font-size:12.5px">
+              <span style="color:{fetchUrlStep === 'connecting' ? 'var(--kb-accent-bright)' : 'var(--kb-ok)'}; font-weight:{fetchUrlStep === 'connecting' ? '600' : '400'}">
+                {#if fetchUrlStep === 'connecting'}⏳{:else}✓{/if} 连接服务器
+              </span>
+              <span style="color:var(--kb-text-3)">→</span>
+              <span style="color:{fetchUrlStep === 'downloading' ? 'var(--kb-accent-bright)' : fetchUrlStep === 'extracting' || fetchUrlStep === 'saving' || fetchUrlStep === 'done' ? 'var(--kb-ok)' : 'var(--kb-text-3)'}; font-weight:{fetchUrlStep === 'downloading' ? '600' : '400'}">
+                {#if fetchUrlStep === 'downloading'}⏳{:else if fetchUrlStep === 'extracting' || fetchUrlStep === 'saving' || fetchUrlStep === 'done'}✓{:else}○{/if} 下载网页
+              </span>
+              <span style="color:var(--kb-text-3)">→</span>
+              <span style="color:{fetchUrlStep === 'extracting' ? 'var(--kb-accent-bright)' : fetchUrlStep === 'saving' || fetchUrlStep === 'done' ? 'var(--kb-ok)' : 'var(--kb-text-3)'}; font-weight:{fetchUrlStep === 'extracting' ? '600' : '400'}">
+                {#if fetchUrlStep === 'extracting'}⏳{:else if fetchUrlStep === 'saving' || fetchUrlStep === 'done'}✓{:else}○{/if} 提取正文
+              </span>
+              <span style="color:var(--kb-text-3)">→</span>
+              <span style="color:{fetchUrlStep === 'saving' ? 'var(--kb-accent-bright)' : fetchUrlStep === 'done' ? 'var(--kb-ok)' : 'var(--kb-text-3)'}; font-weight:{fetchUrlStep === 'saving' ? '600' : '400'}">
+                {#if fetchUrlStep === 'saving'}⏳{:else if fetchUrlStep === 'done'}✓{:else}○{/if} 保存入库
+              </span>
+            </div>
+            <div style="height:4px;border-radius:2px;background:var(--kb-border);overflow:hidden">
+              <div style="height:100%;border-radius:2px;background:var(--kb-accent-bright);transition:width 0.3s;width:{fetchUrlStep === 'connecting' ? '15%' : fetchUrlStep === 'downloading' ? '40%' : fetchUrlStep === 'extracting' ? '70%' : fetchUrlStep === 'saving' ? '90%' : '100%'}"></div>
+            </div>
+          </div>
+        {/if}
+
         {#if fetchUrlErr}<div class="kb-msg err" style="margin-top:8px">{fetchUrlErr}</div>{/if}
       </div>
       <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => fetchUrlOpen = false} disabled={fetchUrlBusy}>取消</button>
-        <button class="kb-btn" onclick={doFetchUrl} disabled={fetchUrlBusy}>{fetchUrlBusy ? '抓取中…' : '开始抓取'}</button>
+        <Button variant="outline" onclick={() => fetchUrlOpen = false} disabled={fetchUrlBusy}>取消</Button>
+        <Button onclick={doFetchUrl} disabled={fetchUrlBusy || !fetchUrlVal.trim()}>
+          {fetchUrlBusy ? '抓取中…' : '开始抓取'}
+        </Button>
       </div>
     </div>
     </KbModal>
+{/if}
+
+<!-- 批量网页抓取 -->
+{#if batchFetchOpen}
+  <KbModal open={batchFetchOpen} onClose={() => { if (!batchFetchBusy) batchFetchOpen = false; }} ariaLabel="关闭批量抓取弹窗">
+    <div class="kb-modal">
+      <div class="kb-modal-hd"><KbIcon name="link" size={16} color="var(--kb-accent-bright)" />批量抓取网页</div>
+      <div class="kb-modal-bd">
+        <label class="kb-label">网页地址（每行一个 URL）
+          <textarea class="kb-textarea" rows="6" placeholder="https://example.com/page1&#10;https://example.com/page2&#10;https://example.com/page3" bind:value={batchFetchUrls} disabled={batchFetchBusy}></textarea>
+        </label>
+        <p style="font-size:12px;color:var(--kb-text-3);margin:8px 0 0;line-height:1.6">每行一个 URL，系统自动抓取标题与正文并转存为 Markdown 文档。</p>
+
+        {#if batchFetchBusy}
+          <div style="margin-top:12px;display:flex;flex-direction:column;gap:8px">
+            <div style="display:flex;align-items:center;justify-content:space-between;font-size:12.5px">
+              <span style="color:var(--kb-accent-bright);font-weight:600">正在抓取第 {batchFetchProgress.current} / {batchFetchProgress.total} 个</span>
+              <span style="color:var(--kb-text-3)">{Math.round(batchFetchProgress.current / batchFetchProgress.total * 100)}%</span>
+            </div>
+            <div style="height:4px;border-radius:2px;background:var(--kb-border);overflow:hidden">
+              <div style="height:100%;border-radius:2px;background:var(--kb-accent-bright);transition:width 0.3s;width:{(batchFetchProgress.current / batchFetchProgress.total * 100)}%"></div>
+            </div>
+            <div style="font-size:11.5px;color:var(--kb-text-3);overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={batchFetchProgress.currentUrl}>
+              {batchFetchProgress.currentUrl || '准备中…'}
+            </div>
+          </div>
+        {/if}
+
+        {#if batchFetchErr}<div class="kb-msg err" style="margin-top:8px">{batchFetchErr}</div>{/if}
+      </div>
+      <div class="kb-modal-ft">
+        <Button variant="outline" onclick={() => batchFetchOpen = false} disabled={batchFetchBusy}>取消</Button>
+        <Button onclick={doBatchFetch} disabled={batchFetchBusy || !batchFetchUrls.trim()}>{batchFetchBusy ? '抓取中…' : '开始抓取'}</Button>
+      </div>
+    </div>
+  </KbModal>
 {/if}
 
 <!-- Markdown 新建文档（编辑器 + 实时预览） -->
@@ -1071,58 +1123,28 @@
         {#if mdDocErr}<div class="kb-msg err">{mdDocErr}</div>{/if}
       </div>
       <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => mdDocOpen = false} disabled={mdDocBusy}>取消</button>
-        <button class="kb-btn" onclick={doCreateMdDoc} disabled={mdDocBusy}>{mdDocBusy ? '提交中…' : '创建文档'}</button>
+        <Button variant="outline" onclick={() => mdDocOpen = false} disabled={mdDocBusy}>取消</Button>
+        <Button onclick={doCreateMdDoc} disabled={mdDocBusy}>{mdDocBusy ? '提交中…' : '创建文档'}</Button>
       </div>
     </div>
     </KbModal>
 {/if}
 
-<!-- 分块编辑 -->
-{#if editChunk}
-  <KbModal open={editChunk !== null} onClose={() => { if (!editChunkBusy) editChunk = null; }} ariaLabel="关闭编辑分块弹窗">
-    <div class="kb-modal">
-      <div class="kb-modal-hd"><KbIcon name="edit" size={16} color="var(--kb-accent-bright)" />编辑分块</div>
-      <div class="kb-modal-bd">
-        <textarea class="kb-textarea" style="min-height:220px;resize:vertical;font-size:12.5px;line-height:1.6" bind:value={editChunkVal}></textarea>
-        <p style="font-size:11.5px;color:var(--kb-text-3);margin:8px 0 0">保存后将更新全文索引并重新向量化该分块。</p>
-      </div>
-      <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => editChunk = null} disabled={editChunkBusy}>取消</button>
-        <button class="kb-btn" onclick={doSaveChunk} disabled={editChunkBusy}>{editChunkBusy ? '保存中…' : '保存'}</button>
-      </div>
-    </div>
-    </KbModal>
-{/if}
-
-<!-- 全屏预览 -->
+<!-- 全屏预览（使用 ResourcePreview 组件） -->
 {#if previewDoc}
-  <KbModal open={previewDoc !== null} onClose={() => closePreview()} ariaLabel="关闭预览弹窗">
-    <div class="kb-modal" style="width:min(920px, calc(100vw - 64px))">
-      <div class="kb-modal-hd" style="justify-content:space-between">
-        <span style="min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={previewDoc.title}>{previewDoc.title}</span>
-        <button class="kb-btn-sm kb-btn-ghost" onclick={closePreview}><KbIcon name="close" size={14} /></button>
-      </div>
-      <div class="kb-modal-bd" style="padding:0">
-        {#if previewLoading}
-          <div class="kb-empty">加载中…</div>
-        {:else if previewData?.type === 'pdf'}
-          <iframe src={previewData.url} title="文档预览" style="width:100%;height:72vh;border:none;display:block;background:#fff"></iframe>
-        {:else if previewData?.type === 'image'}
-          <div style="display:flex;justify-content:center;padding:16px;overflow:auto;max-height:72vh">
-            <img src={previewData.url} alt="文档预览" style="max-width:100%;max-height:68vh;border-radius:8px" />
-          </div>
-        {:else if previewData?.type === 'text'}
-          <pre style="padding:16px;margin:0;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.7;color:var(--kb-text);max-height:72vh;overflow:auto">{previewData.text}</pre>
-        {:else}
-          <div class="kb-empty">无法预览该格式，请下载查看</div>
-        {/if}
-      </div>
-      <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => previewDoc && downloadDoc(previewDoc.id)}><KbIcon name="download" size={13} />下载</button>
-      </div>
+  <KbModal open={previewDoc !== null} onClose={closePreview} ariaLabel="关闭预览弹窗">
+    <div class="kb-modal" style="width:min(960px, calc(100vw - 48px));height:min(85vh, 800px)">
+      <ResourcePreview
+        title={previewDoc.title}
+        fileType={previewDoc.fileType}
+        dataBase64={previewData?.base64 ?? null}
+        textContent={previewData?.type === 'text' ? previewData.text ?? null : null}
+        loading={previewLoading}
+        onClose={closePreview}
+        onDownload={() => previewDoc && downloadDoc(previewDoc.id)}
+      />
     </div>
-    </KbModal>
+  </KbModal>
 {/if}
 {/if}
 
@@ -1163,65 +1185,8 @@
     color: var(--kb-warn);
     line-height: 1.5;
   }
-  .kb-msg.warn {
-    display: flex;
-    align-items: flex-start;
-    gap: 6px;
-    padding: 8px 10px;
-    border: 1px solid color-mix(in srgb, var(--app-warning, #faad14) 45%, var(--kb-border));
-    border-radius: 8px;
-    background: color-mix(in srgb, var(--app-warning, #faad14) 10%, transparent);
-    color: var(--kb-warn);
-    font-size: 12.5px;
-    line-height: 1.6;
-  }
-  .kb-diff-on { background: var(--kb-hover-strong, #0a0f1e) !important; border-color: var(--app-accent, #1a73e8) !important; color: var(--kb-accent-bright, #6ea8ff) !important; }
 
-  /* ─── 上传任务悬浮面板（右下角固定，不占布局） ─── */
-  .kb-upload-panel {
-    position: fixed;
-    right: 18px;
-    bottom: 18px;
-    z-index: 61;
-    width: min(360px, calc(100vw - 36px));
-    display: flex;
-    flex-direction: column;
-    background: var(--app-bg-color);
-    border: 1px solid var(--kb-border-strong);
-    border-radius: 10px;
-    box-shadow: var(--kb-shadow-lg);
-    overflow: hidden;
-    animation: kb-pop .16s ease-out;
-  }
-  .kb-upload-panel-hd {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    padding: 8px 10px 8px 12px;
-    border-bottom: 1px solid var(--kb-border);
-    background: var(--app-bg-color);
-    flex: none;
-  }
-  .kb-upload-panel.kb-upload-collapsed .kb-upload-panel-hd { border-bottom: none; }
-  .kb-upload-panel-body {
-    max-height: min(280px, 34vh);
-    overflow: auto;
-    padding: 8px 10px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    background: var(--app-bg-color);
-  }
-  .kb-upload-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 12.5px;
-    padding: 6px 10px;
-    border: 1px solid var(--kb-border);
-    border-radius: 8px;
-    background: var(--app-bg-color);
-    flex: none;
-  }
+
+
+
 </style>

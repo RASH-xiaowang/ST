@@ -83,9 +83,9 @@
   // ── 力度参数映射：Wiki 滑杆语义 → d3-force 力度 ──
   // Wiki 面板持久化的力度字段沿用旧版量纲，这里折算为与社交图谱一致的
   // 力导向参数（默认值下等效于社交图谱：charge -300 / link×1 / center 0.1）。
-  const REPULSION_BASE = 2600;  // forceRepulsion 默认 → charge -300
-  const ATTRACTION_BASE = 0.04; // forceAttraction 默认 → link 强度倍率 1
-  const CENTRIPETAL_BASE = 0.02; // forceCentripetal 默认 → center 强度 0.1
+  const REPULSION_BASE = 1800;  // forceRepulsion 默认 → charge -207（降低，加快收敛）
+  const ATTRACTION_BASE = 0.05; // forceAttraction 默认 → link 强度倍率 1.25（略增，节点更紧凑）
+  const CENTRIPETAL_BASE = 0.03; // forceCentripetal 默认 → center 强度 0.15（略增，防止发散）
 
   function scheduleDraw() {
     if (drawRaf || !visible || document.hidden) return;
@@ -200,12 +200,13 @@ function endId(ep: string | WNode): string {
       const s = indexMap.get(es);
       const t = indexMap.get(et);
       if (!s || !t) continue;
+      const isCenterEdge = e.linkType === 'center';
       const active = !!focus && (es === focus || et === focus);
       const width = active
         ? Math.min(1.2 + e.weight * 0.4, 3) * settings.edgeWidth
         : Math.max(0.5, Math.min(0.7 + e.weight * 0.25, 2.2) * settings.edgeWidth);
-      const color = edgeColor(e);
-      const dash = edgeDash(e);
+      const color = isCenterEdge ? '#6366f1' : edgeColor(e);
+      const dash = isCenterEdge ? true : edgeDash(e);
       const key = groupKey(!!active, dash, color, width);
       let g = edgeGroups.get(key);
       if (!g) {
@@ -235,9 +236,10 @@ function endId(ep: string | WNode): string {
       const active = key.startsWith("a");
       const dash = key[1] === "d";
       const color = key.slice(2, 9);
+      const isCenter = color === '#6366f1'; // 中心节点连接线
       ctx.strokeStyle = active
-        ? withAlpha(color, settings.edgeOpacity)
-        : withAlpha(color, settings.edgeOpacity * 0.6);
+        ? withAlpha(color, isCenter ? settings.edgeOpacity * 0.3 : settings.edgeOpacity)
+        : withAlpha(color, isCenter ? settings.edgeOpacity * 0.15 : settings.edgeOpacity * 0.6);
       ctx.lineWidth = Number(key.slice(9));
       ctx.setLineDash(dash ? [6, 4] : []);
       ctx.beginPath();
@@ -270,10 +272,43 @@ function endId(ep: string | WNode): string {
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
     for (const n of nodes) {
-      const color = nodeColor(n);
+      const isCenter = n.pageId === 0;
+      const color = isCenter ? '#6366f1' : nodeColor(n); // 中心节点用紫色
       const isGhost = n.status === "missing";
       const dim = !!focus && n.id !== focus && !focusNeighbours.has(n.id);
       const r = n.radius;
+
+      // 中心节点：特殊绘制（更大、更亮、带光晕）
+      if (isCenter) {
+        ctx.globalAlpha = 0.15;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, r + 12, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.globalAlpha = dim ? 0.3 : 1;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+        ctx.fillStyle = color;
+        ctx.fill();
+        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = '#ffffff';
+        ctx.globalAlpha = dim ? 0.35 : 0.9;
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+        ctx.stroke();
+        // 标签
+        if (settings.showLabels) {
+          ctx.globalAlpha = 1;
+          const fontPx = Math.max(12, 13 / v.scale);
+          ctx.font = `700 ${fontPx}px var(--font-sans, sans-serif)`;
+          ctx.lineWidth = 3 / v.scale;
+          ctx.strokeStyle = labelHalo;
+          ctx.strokeText(n.label, n.x, n.y + r + fontPx * 0.9);
+          ctx.fillStyle = '#ffffff';
+          ctx.fillText(n.label, n.x, n.y + r + fontPx * 0.9);
+        }
+        continue;
+      }
 
       // 幽灵节点（尚未创建）：半透明填充 + 虚线描边，弱化存在感
       ctx.globalAlpha = dim ? 0.3 : isGhost ? 0.55 : 1;
@@ -381,17 +416,17 @@ function endId(ep: string | WNode): string {
     };
 
     const sim = forceSimulation<WNode>(graph.nodes)
-      .alpha(freshLayout ? 0.6 : 0.3)
-      .alphaDecay(0.035)
+      .alpha(freshLayout ? 0.5 : 0.2)  // 降低初始 alpha，加快收敛
+      .alphaDecay(0.05)                  // 增加衰减率，更快停止仿真
       .force("link", forceLink<WNode, WEdge>(graph.edges).id((d) => d.id).distance((d) => d.dist).strength(linkStrength))
-      .force("charge", forceManyBody<WNode>().strength(-300 * (settings.forceRepulsion / REPULSION_BASE)))
-      .force("collide", forceCollide<WNode>().radius((d) => d.radius + 3).iterations(1))
-      .force("center", forceCenter(0, 0).strength(0.1 * (settings.forceCentripetal / CENTRIPETAL_BASE)));
+      .force("charge", forceManyBody<WNode>().strength(-200 * (settings.forceRepulsion / REPULSION_BASE)))
+      .force("collide", forceCollide<WNode>().radius((d) => d.radius + 2).iterations(1))
+      .force("center", forceCenter(0, 0).strength(0.15 * (settings.forceCentripetal / CENTRIPETAL_BASE)));
     lastTickDraw = 0;
     sim.on("tick", () => {
-      // 仿真期间限流绘制：拖拽时 60fps（跟手），平时 30fps（省 CPU）
+      // 仿真期间限流绘制：拖拽时 30fps（跟手），平时 15fps（省 CPU/GPU）
       const now = performance.now();
-      const budget = dragNode ? 16 : 33;
+      const budget = dragNode ? 33 : 66;
       if (now - lastTickDraw >= budget) {
         lastTickDraw = now;
         scheduleDraw();
@@ -481,7 +516,7 @@ function endId(ep: string | WNode): string {
     (e.target as Element).setPointerCapture?.(e.pointerId);
     moved = 0;
     const hit = nodeAt(sx, sy);
-    if (hit) {
+    if (hit && hit.pageId !== 0) { // 中心节点不可拖拽
       dragNode = hit;
       const w = screenToWorld(sx, sy);
       hit.fx = w.x;
@@ -528,7 +563,7 @@ function endId(ep: string | WNode): string {
   function endPointer() {
     const node = dragNode;
     if (node) {
-      if (moved < 4) onSelect(node);
+      if (moved < 4 && node.pageId !== 0) onSelect(node); // 中心节点不可选中
       node.fx = null;
       node.fy = null;
       simulation?.alphaTarget(0);
@@ -569,7 +604,7 @@ function endId(ep: string | WNode): string {
     if (!wrapEl) return;
     const rect = wrapEl.getBoundingClientRect();
     const hit = nodeAt(e.clientX - rect.left, e.clientY - rect.top);
-    if (hit) onOpen(hit);
+    if (hit && hit.pageId !== 0) onOpen(hit); // 中心节点不可打开
   }
 
   /** 重置视图：恢复初始缩放并把世界原点放回画布正中 */

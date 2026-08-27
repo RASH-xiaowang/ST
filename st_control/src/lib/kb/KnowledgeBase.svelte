@@ -13,31 +13,49 @@
   import WikiPanel from './WikiPanel.svelte';
   import KbIcon from './KbIcon.svelte';
   import KbModal from './KbModal.svelte';
+  import KbLogin from './KbLogin.svelte';
+  import KbMembers from './KbMembers.svelte';
+  import KbFaq from './KbFaq.svelte';
+  import KbAcl from './KbAcl.svelte';
+  import KbHelp from './KbHelp.svelte';
+  import KbErrorBoundary from './KbErrorBoundary.svelte';
   import { loadKbChunkCfg } from './kbChunkStore.svelte';
+  import { confirmState, confirmOk, confirmCancel } from './KbConfirm.svelte';
+  import { Button } from '../components/ui/button';
+  import { Badge } from '../components/ui/badge';
+  import { Empty, EmptyTitle, EmptyDescription } from '../components/ui/empty';
+  import { ScrollArea } from '../components/ui/scroll-area';
+  import { TooltipProvider, Tooltip, TooltipContent, TooltipTrigger } from '../components/ui/tooltip';
   import './kbui.css';
 
   const NAV = [
     { id: 'home', ico: 'dashboard', label: '首页' },
     { id: 'chat', ico: 'chat', label: 'AI问答' },
-    { id: 'activity', ico: 'activity', label: '活动' },
-    { id: 'settings', ico: 'settings', label: '设置' },
+    { id: 'kb', ico: 'kb', label: '知识库' },
   ] as const;
-  // 'kb' / 'docs' / 'wiki' 不是导航项，而是“选择知识库后进入的工作区”内部视图
-  type NavId = (typeof NAV)[number]['id'] | 'kb' | 'docs' | 'wiki';
+  // 'docs' / 'wiki' 不是主导航项，而是选择知识库后的工作区视图
+  type NavId = (typeof NAV)[number]['id'] | 'activity' | 'settings' | 'docs' | 'wiki';
 
   // ─── 全局状态 ───
 let nav = $state<NavId>('home');
+  let sidebarOpen = $state(false);
   let kbs = $state<KbSummary[]>([]);
   let sessions = $state<QaSessionItem[]>([]);
   // 从侧边栏「历史对话」打开指定会话（ts 用于重复点击同一会话时仍触发）
   let chatTarget = $state<{ id: number; ts: number } | null>(null);
   // 从 AI 问答引用跳转打开指定文档（ts 用于重复触发）
   let pendingDoc = $state<{ id: number; ts: number } | null>(null);
+  // 顶部全局搜索回车后传入文档列表的关键词（ts 用于重复触发）
+  let kbSearchInit = $state<{ query: string; ts: number } | null>(null);
   let docTotal = $state(0);
   let selectedKb = $state<number | null>(null);
   let models = $state<ModelInfo[]>([]);
   let selProvider = $state('');
   let selModel = $state('');
+  let membersOpen = $state(false); // 成员管理弹窗
+  let faqOpen = $state(false); // FAQ 管理弹窗
+  let aclOpen = $state(false); // ACL 权限弹窗
+  let helpOpen = $state(false); // 帮助文档弹窗
 
   // ─── Toast 通知 ───
   let toasts = $state<{ id: number; type: 'success' | 'error' | 'warn'; msg: string }[]>([]);
@@ -188,7 +206,7 @@ let nav = $state<NavId>('home');
     selectedKb = id;
     nav = 'docs';
   }
-  const navTitle = $derived(NAV.find((n) => n.id === nav)?.label ?? (nav === 'docs' ? '文档' : nav === 'wiki' ? 'Wiki' : nav === 'kb' ? '知识库' : ''));
+  const navTitle = $derived(NAV.find((n) => n.id === nav)?.label ?? (nav === 'docs' ? '文档' : nav === 'wiki' ? 'Wiki' : ''));
   const curKbName = $derived(kbs.find((k) => k.id === selectedKb)?.name ?? '');
   async function togglePin(kb: KbSummary) {
     try {
@@ -197,124 +215,230 @@ let nav = $state<NavId>('home');
       notify(kb.pinned ? '已取消置顶' : '已置顶：' + kb.name);
     } catch (e: unknown) { notify('置顶失败：' + e, 'error'); }
   }
+
+  // ─── 导出知识库 ───
+  let exportBusy = $state(false);
+  async function doExportKb(kb: KbSummary) {
+    if (exportBusy) return;
+    exportBusy = true;
+    try {
+      notify('正在导出「' + kb.name + '」…');
+      const res = await kbApi.exportKb(kb.id);
+      const bin = Uint8Array.from(atob(res.dataBase64), (c) => c.charCodeAt(0));
+      const blob = new Blob([bin], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = res.fileName; a.click();
+      URL.revokeObjectURL(url);
+      notify('导出完成：' + res.fileName);
+    } catch (e: unknown) { notify('导出失败：' + e, 'error'); }
+    finally { exportBusy = false; }
+  }
+
+  // ─── 导入知识库 ───
+  let importBusy = $state(false);
+  async function onImportPick(e: Event) {
+    const input = e.target as HTMLInputElement;
+    const file = input.files?.[0];
+    input.value = '';
+    if (!file || importBusy) return;
+    importBusy = true;
+    try {
+      notify('正在导入「' + file.name + '」…');
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const CHUNK = 32766; // 必须是 3 的倍数，保证 base64 无 padding
+      let b64 = '';
+      for (let i = 0; i < bytes.length; i += CHUNK) {
+        const slice = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
+        b64 += btoa(Array.from(slice, (b) => String.fromCharCode(b)).join(''));
+      }
+      const res = await kbApi.importKb(b64);
+      await loadKbs();
+      notify(`导入完成：「${res.name}」（${res.documents} 文档，${res.wikiPages} Wiki 页）`);
+    } catch (err: unknown) { notify('导入失败：' + err, 'error'); }
+    finally { importBusy = false; }
+  }
 </script>
 
+<TooltipProvider>
 <div class="kb-root">
+  <!-- 移动端汉堡菜单按钮 -->
+  <button class="kb-mobile-menu-btn" onclick={() => sidebarOpen = !sidebarOpen}
+    aria-label={sidebarOpen ? '关闭导航' : '打开导航'}>
+    <KbIcon name={sidebarOpen ? 'close' : 'menu'} size={20} />
+  </button>
+
+  <!-- 移动端遮罩 -->
+  {#if sidebarOpen}
+    <div class="kb-sidebar-overlay" onclick={() => sidebarOpen = false} role="presentation"></div>
+  {/if}
+
   <!-- 左侧导航栏 -->
-  <aside class="kb-sidebar">
-    <div class="kb-brand" role="button" tabindex="0" title="回到首页"
-      onclick={() => nav = 'home'} onkeydown={(e) => e.key === 'Enter' && (nav = 'home')}>
+  <aside class="kb-sidebar" class:open={sidebarOpen}>
+    <div class="kb-brand" role="button" tabindex={0} title="回到首页"
+      onclick={() => { nav = 'home'; sidebarOpen = false; }}
+      onkeydown={(e) => e.key === 'Enter' && (nav = 'home')}>
       <span class="kb-brand-ico"><KbIcon name="kb" size={16} weight="bold" /></span>
       <span class="kb-brand-text">
         <span class="kb-brand-name">知识库中心</span>
         <span class="kb-brand-sub">本地知识库 · 语义检索</span>
       </span>
     </div>
+    <ScrollArea class="flex-1 min-h-0">
     <div class="kb-sidebar-scroll">
       <div class="kb-sidebar-section">主导航</div>
-      <button class="kb-sidebar-item" class:active={nav === 'home'} onclick={() => goNav('home')}>
-        <KbIcon name="dashboard" size={15} />首页
-      </button>
-      <button class="kb-sidebar-item" class:active={nav === 'kb'} onclick={() => goNav('kb')} title="管理全部知识库">
-        <KbIcon name="kb" size={15} />知识库
-      </button>
-      <button class="kb-sidebar-item" class:active={nav === 'chat'} onclick={() => goNav('chat')} title="选择知识库进行对话测试">
-        <KbIcon name="chat" size={15} />AI问答
-      </button>
-      <button class="kb-sidebar-item" class:active={nav === 'activity'} onclick={() => goNav('activity')} title="处理任务与检索历史">
-        <KbIcon name="activity" size={15} />活动
-      </button>
+      {#each NAV as item}
+        <Tooltip>
+          <TooltipTrigger>
+            {#snippet child({ props })}
+              <button {...props} class="kb-sidebar-item" class:active={nav === item.id}
+                onclick={() => { goNav(item.id); sidebarOpen = false; }}>
+                <KbIcon name={item.ico} size={15} /><span class="kb-sidebar-label">{item.label}</span>
+              </button>
+            {/snippet}
+          </TooltipTrigger>
+          <TooltipContent side="right" class="kb-sidebar-tooltip">{item.label}</TooltipContent>
+        </Tooltip>
+      {/each}
+
       <div class="kb-sidebar-section kb-sidebar-section-row">
         <span>历史对话</span>
-        <button class="kb-sidebar-add" onclick={() => { chatTarget = null; goNav('chat'); }} title="开始新对话"><KbIcon name="plus" size={13} weight="bold" /></button>
+        <button class="kb-sidebar-add" onclick={() => { chatTarget = null; goNav('chat'); sidebarOpen = false; }} title="开始新对话">
+          <KbIcon name="plus" size={13} weight="bold" />
+        </button>
       </div>
       {#each sessions as s}
         <button class="kb-sidebar-item" class:active={chatTarget?.id === s.id && nav === 'chat'}
-          onclick={() => openChatSession(s)} title={s.title ?? ''}>
+          onclick={() => { openChatSession(s); sidebarOpen = false; }} title={s.title ?? ''}>
           <span class="kb-sidebar-kb-ico"><KbIcon name="chatCircle" size={14} /></span>
           <span class="kb-sidebar-kb-name">{s.title ?? ('会话 #' + s.id)}</span>
           <span class="kb-sidebar-kb-count">{fmtSessionTime(s.updatedAt)}</span>
         </button>
       {/each}
       {#if sessions.length === 0}
-        <div class="kb-sidebar-empty">暂无历史对话<br>点击右上角 + 开始新对话</div>
+        <div class="kb-sidebar-empty">暂无历史对话</div>
       {/if}
     </div>
+    </ScrollArea>
     <div class="kb-sidebar-bottom">
-      <button class="kb-sidebar-item" class:active={nav === 'settings'} onclick={() => goNav('settings')} title="上传所需的模型与分块设置">
-        <KbIcon name="settings" size={15} />设置
-      </button>
+      <Tooltip>
+        <TooltipTrigger>
+          {#snippet child({ props })}
+            <button {...props} class="kb-sidebar-item" class:active={nav === 'activity'}
+              onclick={() => { goNav('activity'); sidebarOpen = false; }}>
+              <KbIcon name="activity" size={15} /><span class="kb-sidebar-label">活动</span>
+            </button>
+          {/snippet}
+        </TooltipTrigger>
+        <TooltipContent side="right" class="kb-sidebar-tooltip">处理任务与检索历史</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger>
+          {#snippet child({ props })}
+            <button {...props} class="kb-sidebar-item" onclick={() => { helpOpen = true; sidebarOpen = false; }}>
+              <KbIcon name="info" size={15} /><span class="kb-sidebar-label">帮助</span>
+            </button>
+          {/snippet}
+        </TooltipTrigger>
+        <TooltipContent side="right" class="kb-sidebar-tooltip">使用帮助</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger>
+          {#snippet child({ props })}
+            <button {...props} class="kb-sidebar-item" class:active={nav === 'settings'}
+              onclick={() => { goNav('settings'); sidebarOpen = false; }}>
+              <KbIcon name="settings" size={15} /><span class="kb-sidebar-label">设置</span>
+            </button>
+          {/snippet}
+        </TooltipTrigger>
+        <TooltipContent side="right" class="kb-sidebar-tooltip">模型与分块设置</TooltipContent>
+      </Tooltip>
     </div>
   </aside>
 
   <!-- 右侧内容区 -->
   <div class="kb-main">
     <header class="kb-contentbar">
-      <div class="kb-contentbar-title">
+      <!-- 面包屑导航 -->
+      <div class="kb-breadcrumb">
         {#if selectedKb !== null && (nav === 'docs' || nav === 'wiki')}
-          <span>知识库</span>
-          <span class="kb-contentbar-sep">/</span>
-          <span class="kb-contentbar-sub">{curKbName}</span>
+          <button class="kb-breadcrumb-link" onclick={() => goNav('home')}>知识库</button>
+          <span class="kb-breadcrumb-sep">/</span>
+          <span class="kb-breadcrumb-current">{curKbName}</span>
         {:else}
-          <span>{navTitle}</span>
+          <span class="kb-breadcrumb-current">{navTitle}</span>
         {/if}
       </div>
+
       <div style="flex:1"></div>
-      {#if nav === 'home' || nav === 'kb'}
-        <button class="kb-btn-md" onclick={openNewKb} title="新建知识库"><KbIcon name="plus" size={14} weight="bold" />新建</button>
-      {/if}
+
       {#if selectedKb !== null && (nav === 'docs' || nav === 'wiki')}
-        <div class="kb-seg kb-seg-tabs">
-          <button class="kb-seg-item" class:active={nav === 'docs'} onclick={() => goNav('docs')}><KbIcon name="docs" size={14} />文档列表 ({docTotal})</button>
-          <button class="kb-seg-item" class:active={nav === 'wiki'} onclick={() => goNav('wiki')}><KbIcon name="wiki" size={14} />Wiki<span class="kb-badge kb-badge-ok" style="font-size:11.5px;padding:0 5px;line-height:16px">NEW</span></button>
+        <div class="kb-tabs-bar">
+          <button class="kb-tab-item" class:active={nav === 'docs'} onclick={() => goNav('docs')}>
+            <KbIcon name="docs" size={14} />文档 ({docTotal})
+          </button>
+          <button class="kb-tab-item" class:active={nav === 'wiki'} onclick={() => goNav('wiki')}>
+            <KbIcon name="wiki" size={14} />Wiki
+            <Badge variant="default" class="text-[10px] px-1 py-0 ml-1">NEW</Badge>
+          </button>
+          <button class="kb-tab-item" onclick={() => membersOpen = true}>
+            <KbIcon name="users" size={14} />成员
+          </button>
+          <button class="kb-tab-item" onclick={() => faqOpen = true}>
+            <KbIcon name="list" size={14} />FAQ
+          </button>
+          <button class="kb-tab-item" onclick={() => aclOpen = true}>
+            <KbIcon name="shield" size={14} />权限
+          </button>
         </div>
       {/if}
-      <div class="kb-contentbar-user">
-        <span class="kb-avatar">{kbUser.user?.username?.charAt(0).toUpperCase() ?? 'A'}</span>
-        <div style="min-width:0">
-          <div class="kb-sidebar-user">{kbUser.user?.username ?? '本机'}{kbUser.user?.isAdmin ? ' · 管理员' : ''}</div>
-          <div class="kb-sidebar-sub">单机部署 · 无需登录</div>
+
+      <!-- 用户头像 -->
+      <div class="kb-user-area">
+        <div class="kb-avatar">{kbUser.user?.username?.charAt(0).toUpperCase() ?? 'A'}</div>
+        <div class="kb-user-info">
+          <div class="kb-user-name">{kbUser.user?.username ?? '本机'}{kbUser.user?.isAdmin ? ' · 管理员' : ''}</div>
+          <div class="kb-user-sub">单机部署</div>
         </div>
+        <KbLogin {notify} onLoginSuccess={() => { loadKbs(); loadSessions(); }} />
       </div>
     </header>
-    <main class="kb-content kb-scroll" style="display:flex;flex-direction:column;gap:14px">
+
+    <main class="kb-content kb-scroll">
+      <KbErrorBoundary>
       {#if nav === 'home'}
         <KbDashboard {kbs} {selectedKb} refreshKbs={loadKbs} onOpenKb={openKbFromDashboard}
-          onNewKb={openNewKb} onEditKb={openEditKb} onDeleteKb={openDeleteKb} onTogglePin={togglePin} {notify} />
+          onEditKb={openEditKb} onDeleteKb={openDeleteKb} onTogglePin={togglePin} onExportKb={doExportKb} {notify} isAdmin={kbUser.user?.isAdmin ?? false} />
       {:else if nav === 'kb'}
+        <!-- 知识库管理面板：新建/编辑/删除/置顶/导出 -->
         <KbDashboard {kbs} {selectedKb} refreshKbs={loadKbs} onOpenKb={openKbFromDashboard}
-          onNewKb={openNewKb} onEditKb={openEditKb} onDeleteKb={openDeleteKb} onTogglePin={togglePin} {notify} mode="kbs" />
+          onNewKb={openNewKb} onImportKb={onImportPick} onEditKb={openEditKb} onDeleteKb={openDeleteKb} onTogglePin={togglePin} onExportKb={doExportKb} {notify} mode="kbs" isAdmin={kbUser.user?.isAdmin ?? false} />
       {:else if nav === 'docs'}
         {#if selectedKb === null}
-          <div class="kb-card" style="display:flex;flex-direction:column;gap:16px;padding:18px">
-            <div class="kb-empty" style="padding:30px 18px">
-              <span class="kb-empty-ico"><KbIcon name="folderOpen" size={22} /></span>
-              <span>请先选择一个知识库开始管理文档</span>
-              <span class="kb-empty-sub">可在左侧导航栏选择，或从下方列表打开</span>
-            </div>
-            <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px">
+          <div class="kb-select-kb-prompt">
+            <Empty>
+              <KbIcon name="folderOpen" size={32} color="var(--kb-text-3)" />
+              <EmptyTitle>请先选择一个知识库</EmptyTitle>
+              <EmptyDescription>从下方列表打开知识库，开始管理文档</EmptyDescription>
+            </Empty>
+            <div class="kb-select-kb-grid">
               {#each kbs as kb}
-                <button class="kb-card" style="padding:12px 14px;text-align:left;cursor:pointer;display:flex;align-items:center;gap:10px;border:1px solid var(--kb-border);transition:border-color .12s"
-                  onmouseover={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--kb-accent)'}
-                  onmouseout={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--kb-border)'}
-                  onfocus={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--kb-accent)'}
-                  onblur={(e) => (e.currentTarget as HTMLElement).style.borderColor = 'var(--kb-border)'}
-                  onclick={() => openKbFromDashboard(kb.id)}>
-                  <span style="width:34px;height:34px;border-radius:9px;background:var(--kb-hover-strong);color:var(--kb-accent-bright);display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex:none">{kb.name.charAt(0).toUpperCase()}</span>
-                  <span style="flex:1;min-width:0">
-                    <span style="display:block;font-size:13px;font-weight:600;color:var(--kb-text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{kb.name}</span>
-                    <span style="font-size:11.5px;color:var(--kb-text-3)">{kb.docCount} 文档</span>
-                  </span>
-                  <KbIcon name="arrowRight" size={14} color="var(--kb-text-3)" />
-                </button>
+                <Button variant="outline" class="justify-start h-auto py-3" onclick={() => openKbFromDashboard(kb.id)}>
+                  <div class="kb-kb-monogram" style="width:28px;height:28px;font-size:12px;border-radius:6px">{kb.name.charAt(0).toUpperCase()}</div>
+                  <div class="text-left">
+                    <div class="text-sm font-semibold">{kb.name}</div>
+                    <div class="text-xs text-muted-foreground">{kb.docCount} 文档</div>
+                  </div>
+                </Button>
               {/each}
             </div>
             {#if kbs.length === 0}
-              <div style="font-size:12px;color:var(--kb-text-3);text-align:center">还没有知识库，请到「首页」或左侧导航栏点击「+」新建</div>
+              <p class="text-xs text-muted-foreground text-center mt-2">还没有知识库，请到「知识库」面板新建</p>
             {/if}
           </div>
         {:else}
-          <KbDocs {selectedKb} {notify} refreshKbs={loadKbs} {selProvider} {selModel} onTotalDocs={(n) => docTotal = n} openDocId={pendingDoc} />
+          <KbDocs {selectedKb} {notify} refreshKbs={loadKbs} {selProvider} {selModel} onTotalDocs={(n) => docTotal = n} openDocId={pendingDoc} searchInit={kbSearchInit} />
         {/if}
       {:else if nav === 'chat'}
         <KbChat {selectedKb} {kbs} {notify} {models} openSession={chatTarget}
@@ -325,8 +449,9 @@ let nav = $state<NavId>('home');
       {:else if nav === 'activity'}
         <KbActivity {selectedKb} {notify} />
       {:else if nav === 'settings'}
-        <KbSettings {models} {setModel} {notify} />
+        <KbSettings {models} {setModel} {notify} isAdmin={kbUser.user?.isAdmin ?? false} />
       {/if}
+      </KbErrorBoundary>
     </main>
   </div>
 
@@ -348,8 +473,8 @@ let nav = $state<NavId>('home');
           </div>
         </div>
         <div class="kb-modal-ft">
-          <button class="kb-btn-md" onclick={() => createKbOpen = false} disabled={createKbBusy}>取消</button>
-          <button class="kb-btn" onclick={doCreateKb} disabled={createKbBusy}>{createKbBusy ? '创建中…' : '创建'}</button>
+          <Button variant="outline" onclick={() => createKbOpen = false} disabled={createKbBusy}>取消</Button>
+          <Button onclick={doCreateKb} disabled={createKbBusy}>{createKbBusy ? '创建中…' : '创建'}</Button>
         </div>
       </div>
     </KbModal>
@@ -372,8 +497,8 @@ let nav = $state<NavId>('home');
           </div>
         </div>
         <div class="kb-modal-ft">
-          <button class="kb-btn-md" onclick={() => editKbOpen = false} disabled={editKbBusy}>取消</button>
-          <button class="kb-btn" onclick={doEditKb} disabled={editKbBusy}>{editKbBusy ? '保存中…' : '保存'}</button>
+          <Button variant="outline" onclick={() => editKbOpen = false} disabled={editKbBusy}>取消</Button>
+          <Button onclick={doEditKb} disabled={editKbBusy}>{editKbBusy ? '保存中…' : '保存'}</Button>
         </div>
       </div>
     </KbModal>
@@ -392,8 +517,76 @@ let nav = $state<NavId>('home');
           {#if delKbErr}<div class="kb-msg err">{delKbErr}</div>{/if}
         </div>
         <div class="kb-modal-ft">
-          <button class="kb-btn-md" onclick={() => delKbTarget = null} disabled={delKbBusy}>取消</button>
-          <button class="kb-btn kb-btn-danger" onclick={doDeleteKb} disabled={delKbBusy}>{delKbBusy ? '删除中…' : '确认删除'}</button>
+          <Button variant="outline" onclick={() => delKbTarget = null} disabled={delKbBusy}>取消</Button>
+          <Button variant="destructive" onclick={doDeleteKb} disabled={delKbBusy}>{delKbBusy ? '删除中…' : '确认删除'}</Button>
+        </div>
+      </div>
+    </KbModal>
+  {/if}
+
+  <!-- 成员管理弹窗 -->
+  {#if membersOpen && selectedKb !== null}
+    <KbModal open={membersOpen} onClose={() => membersOpen = false} ariaLabel="关闭成员管理弹窗">
+      <div class="kb-modal" style="min-width:480px">
+        <div class="kb-modal-hd"><KbIcon name="users" size={16} color="var(--kb-accent-bright)" />成员管理</div>
+        <div class="kb-modal-bd">
+          <KbMembers kbId={selectedKb} isAdmin={kbUser.user?.isAdmin ?? false} {notify} />
+        </div>
+        <div class="kb-modal-ft">
+          <Button onclick={() => membersOpen = false}>关闭</Button>
+        </div>
+      </div>
+    </KbModal>
+  {/if}
+
+  <!-- FAQ 管理弹窗 -->
+  {#if faqOpen && selectedKb !== null}
+    <KbModal open={faqOpen} onClose={() => faqOpen = false} ariaLabel="关闭 FAQ 管理弹窗">
+      <div class="kb-modal" style="min-width:560px">
+        <div class="kb-modal-hd"><KbIcon name="list" size={16} color="var(--kb-accent-bright)" />FAQ 问答对</div>
+        <div class="kb-modal-bd">
+          <KbFaq kbId={selectedKb} isAdmin={kbUser.user?.isAdmin ?? false} {notify} />
+        </div>
+        <div class="kb-modal-ft">
+          <Button onclick={() => faqOpen = false}>关闭</Button>
+        </div>
+      </div>
+    </KbModal>
+  {/if}
+
+  <!-- ACL 权限弹窗 -->
+  {#if aclOpen && selectedKb !== null}
+    <KbModal open={aclOpen} onClose={() => aclOpen = false} ariaLabel="关闭 ACL 权限弹窗">
+      <div class="kb-modal" style="min-width:500px">
+        <div class="kb-modal-hd"><KbIcon name="shield" size={16} color="var(--kb-accent-bright)" />ACL 权限管理</div>
+        <div class="kb-modal-bd">
+          <KbAcl kbId={selectedKb} {notify} />
+        </div>
+        <div class="kb-modal-ft">
+          <Button onclick={() => aclOpen = false}>关闭</Button>
+        </div>
+      </div>
+    </KbModal>
+  {/if}
+
+  <!-- 帮助文档弹窗 -->
+  <KbHelp open={helpOpen} onClose={() => helpOpen = false} />
+
+  <!-- 全局确认弹窗（替代原生 confirm） -->
+  {#if confirmState.open}
+    <KbModal open={confirmState.open} onClose={confirmCancel} ariaLabel="关闭确认弹窗">
+      <div class="kb-modal">
+        <div class="kb-modal-hd">
+          <KbIcon name={confirmState.danger ? 'trash' : 'warn'} size={16}
+            color={confirmState.danger ? 'var(--app-danger)' : 'var(--kb-accent-bright)'} />
+          {confirmState.title}
+        </div>
+        <div class="kb-modal-bd">
+          <p style="font-size:13px;line-height:1.7;white-space:pre-wrap">{confirmState.message}</p>
+        </div>
+        <div class="kb-modal-ft">
+          <Button variant="outline" onclick={confirmCancel}>{confirmState.cancelText}</Button>
+          <Button variant={confirmState.danger ? 'destructive' : 'default'} onclick={confirmOk}>{confirmState.confirmText}</Button>
         </div>
       </div>
     </KbModal>
@@ -406,3 +599,4 @@ let nav = $state<NavId>('home');
     {/each}
   </div>
 </div>
+</TooltipProvider>

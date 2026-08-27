@@ -95,29 +95,14 @@
       icon: MessageCircleIcon,
     },
     {
-      tab: 'kb', name: '知识库', slogan: '个人 RAG 问答中枢',
-      points: ['多格式文档导入与解析', '向量 + BM25 混合检索问答', 'Wiki 知识图谱与自动提炼'],
-      icon: LibraryIcon,
-    },
-    {
-      tab: 'llm', name: '大模型', slogan: '多提供商统一接入 · 含 AI 角色与文案',
-      points: ['OpenAI / Azure / Ollama / 自定义', '用量与成本管控', '语音合成 / 转写 / 图像视频生成', 'AI 角色：提示词与能力标签管理', 'AI 文案：场景模板一键生成'],
-      icon: BrainCircuitIcon,
-    },
-    {
-      tab: 'harness', name: 'AI 对话', slogan: '智能体 + 角色对话，一个界面',
-      points: ['流式输出与语音播报', '录音输入与打断监听', 'AI 角色注入与图表生成', '工具调用与治理审批'],
-      icon: MessagesSquareIcon,
-    },
-    {
       tab: 'agents', name: '智能体', slogan: '远程客户端协同',
       points: ['st_agent 安全连接', '任务下发与状态实时监控'],
       icon: BotIcon,
     },
     {
-      tab: 'automation', name: '自动化', slogan: '消息驱动的规则引擎 · 含消息通道',
-      points: ['实时消息监控规则', 'AI 字段提取与自动回复', '微信 iLink / QQ 官方机器人通道', '回复机器人：待回复队列自动发送'],
-      icon: WorkflowIcon,
+      tab: 'kb', name: '知识库', slogan: '个人 RAG 问答中枢',
+      points: ['多格式文档导入与解析', '向量 + BM25 混合检索问答', 'Wiki 知识图谱与自动提炼'],
+      icon: LibraryIcon,
     },
     {
       tab: 'data_dashboard', name: '系统监控', slogan: '首页实时性能监控',
@@ -125,14 +110,29 @@
       icon: GaugeIcon,
     },
     {
+      tab: 'llm', name: '大模型', slogan: '多提供商统一接入 · 含 AI 角色与文案',
+      points: ['OpenAI / Azure / Ollama / 自定义', '用量与成本管控', '语音合成 / 转写 / 图像视频生成', 'AI 角色：提示词与能力标签管理', 'AI 文案：场景模板一键生成'],
+      icon: BrainCircuitIcon,
+    },
+    {
       tab: 'db_manager', name: '数据库', slogan: 'SQLite 可视化工作台',
       points: ['多库浏览与 SQL 执行', '表详情 / 完整性 / 统计', '备份恢复与 CSV 导出'],
       icon: DatabaseIcon,
     },
     {
+      tab: 'harness', name: 'AI 对话', slogan: '智能体 + 角色对话，一个界面',
+      points: ['流式输出与语音播报', '录音输入与打断监听', 'AI 角色注入与图表生成', '工具调用与治理审批'],
+      icon: MessagesSquareIcon,
+    },
+    {
       tab: 'ocr', name: '图文识别', slogan: '批量 OCR 工作流',
       points: ['文本 / 表格 / 二维码识别', '批量任务与统计', '结果导出'],
       icon: ScanTextIcon,
+    },
+    {
+      tab: 'automation', name: '自动化', slogan: '消息驱动的规则引擎 · 含消息通道',
+      points: ['实时消息监控规则', 'AI 字段提取与自动回复', '微信 iLink / QQ 官方机器人通道', '回复机器人：待回复队列自动发送'],
+      icon: WorkflowIcon,
     },
   ];
 
@@ -861,10 +861,10 @@
   /* ── 功能全景 ── */
   .po-grid {
     display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
+    grid-template-columns: repeat(5, minmax(0, 1fr));
     gap: 12px;
-    /* 所有行等高：卡片内容多少不影响高度，整格齐整 */
-    grid-auto-rows: 1fr;
+    /* 同一行卡片等高，不同行可以不同高度 */
+    align-items: stretch;
   }
   /* CardSpotlight 外壳由子组件渲染，作用域规则打不中——
      用 :global 中和其硬编码背景，并让内容容器与卡片按钮撑满单元格 */
@@ -1200,11 +1200,14 @@
   /* ── 窄屏 ── */
   @media (max-width: 1180px) {
     .po-hero { grid-template-columns: 1fr; }
-    .po-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .po-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
   }
   @media (max-width: 880px) {
-    .po-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .po-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
     .po-manifesto, .po-flow-grid { grid-template-columns: 1fr; }
     .po-status-cols { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 680px) {
+    .po-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   }
 </style>

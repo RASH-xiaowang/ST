@@ -93,13 +93,17 @@ const emojiMemo = new Map<string, string>();
 const EMOJI_MEMO_MAX = 800;
 
 function renderEmojiTextImpl(text: string, emojiMap: Map<string, string>): string {
+  // 安全修复：先整体转义，杜绝任何原文中的 HTML 注入（XSS 防护）。
+  // escapeHtml 不影响 [xxx] 中的括号和中文，正则仍能正确匹配表情 token。
+  const escaped = escapeHtml(text);
   // 匹配 [任意字符]（表情名中不含 ]）
-  return text.replace(/\[([^\]]+)\]/g, (match, name: string) => {
+  return escaped.replace(/\[([^\]]+)\]/g, (match, name: string) => {
     const path = emojiMap.get(name.trim());
     if (path) {
-      return `<img src="${path}" class="wc-emoji-inline" alt="${escapeHtml(match)}">`;
+      // path 来自本地静态资源映射，已可信；alt 使用 match（已转义）
+      return `<img src="${escapeHtml(path)}" class="wc-emoji-inline" alt="${match}">`;
     }
-    // 未匹配到静态资源，原样保留但转义
-    return escapeHtml(match);
+    // 未匹配到静态资源，保留已转义文本
+    return match;
   });
 }

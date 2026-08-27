@@ -1,6 +1,8 @@
 <!-- 设置弹窗（仪表台：固定尺寸两栏框架 · 导航栏 + 页签内容） -->
 <script lang="ts">
   import { dbApi } from '../db/services/ipc';
+  import { errText } from '../format';
+  import { toast } from 'svelte-sonner';
   import { Button } from './ui/button';
   import Modal from './Modal.svelte';
   import PreferencesPanel from './PreferencesPanel.svelte';
@@ -38,23 +40,23 @@
   let cleanupResult = $state<{ deleted_events: number; deleted_agent: number; days: number } | null>(null);
 
   async function refreshDbInfo() {
-    try { dbInfo = (await dbApi.getDbInfo()) as typeof dbInfo; } catch { /* 忽略 */ }
+    try { dbInfo = (await dbApi.getDbInfo()) as typeof dbInfo; } catch (e) { toast.error(`加载数据库信息失败：${errText(e)}`); }
   }
   async function loadDbConfig() {
     try {
       dbConfigItems = await dbApi.getDbConfig();
       const rd = dbConfigItems.find((i) => i.key === 'retention_days');
       if (rd) retentionDays = parseInt(rd.value) || 90;
-    } catch { /* 忽略 */ }
+    } catch (e) { toast.error(`加载数据库配置失败：${errText(e)}`); }
   }
   async function saveConfig(key: string, value: string) {
     try {
       await dbApi.setDbConfig(key, value);
       await loadDbConfig();
-    } catch { /* 忽略 */ }
+    } catch (e) { toast.error(`保存配置失败：${errText(e)}`); }
   }
   async function triggerCleanup() {
-    try { cleanupResult = await dbApi.cleanupOldData(); } catch { /* 忽略 */ }
+    try { cleanupResult = await dbApi.cleanupOldData(); } catch (e) { toast.error(`清理失败：${errText(e)}`); }
   }
 
   $effect(() => {

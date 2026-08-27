@@ -2,28 +2,36 @@
   import { kbApi } from './services/ipc';
   import { untrack } from 'svelte';
   import { formatIsoTime } from '../format';
-  import type { WikiPageItem, WikiPageDetail, WikiGraph, WikiGraphNode, WikiDir } from './kbTypes';
+  import type { WikiPageItem, WikiPageDetail, WikiGraph, WikiDir, WikiVersionItem } from './kbTypes';
+  import { kbConfirm } from './KbConfirm.svelte';
   import { edgeLinkTypes, nodeDegreeMap, visibleNodeIds } from './graphUtils';
   import { buildWikiGraph, communityColor, type BuiltWikiGraph, type WEdge, type WNode } from './wikiGraphModel';
   import WikiGraphCanvas from './WikiGraphCanvas.svelte';
-  import { buildDirSubtree, buildDirTree, filterPagesByDir } from './dirTreeUtils';
+  import { buildDirSubtree, filterPagesByDir, wikiDirsToDirNodes } from './dirTreeUtils';
+  import DirTree from './DirTree.svelte';
   import { renderMd } from './markdown';
   import { lsGet, lsSet } from '../storage';
   import {
     NODE_TYPE_COLORS,
     edgeColor,
-    nodeColor,
     nodeTypeName,
   } from './graphStyle';
+  import { wikiNodeColor as wikiNodeColorFromUtils, wikiNodeTooltip, statusLabel } from './wikiPanelUtils';
   import KbIcon from './KbIcon.svelte';
   import { track } from './analytics.svelte';
   import { Checkbox } from '../components/ui/checkbox';
   import { Slider } from '../components/ui/slider';
+  import { Button } from '../components/ui/button';
+  import { Badge } from '../components/ui/badge';
+  import { Input } from '../components/ui/input';
+  import { Skeleton } from '../components/ui/skeleton';
+  import { Empty, EmptyTitle, EmptyDescription } from '../components/ui/empty';
 
   interface Props {
     kbId: number | null;
+    kbName?: string;
   }
-  let { kbId }: Props = $props();
+  let { kbId, kbName = '' }: Props = $props();
 
   // ─── 视图状态 ───
   type View = 'list' | 'detail' | 'edit' | 'graph';
@@ -36,6 +44,7 @@
   let err = $state('');
   let searchText = $state('');
   let searching = $state(false);
+  let searchTimer: ReturnType<typeof setTimeout> | null = null;
   let wikiDirs = $state<WikiDir[]>([]);
   let dirFilter = $state<number | ''>('');
   // 每个目录的子孙目录集合（含自身），用于「按目录筛选」与计数口径一致
@@ -43,12 +52,38 @@
   const filteredPages = $derived(
     filterPagesByDir(pages, dirFilter === '' ? null : dirFilter, dirSubtree),
   );
-  // 目录树（扁平数据 → 有序树列表）
-  const dirTree = $derived(buildDirTree(wikiDirs));
+  // 目录树（DirNode 格式，供 DirTree 组件使用）
+  const dirNodes = $derived(wikiDirsToDirNodes(wikiDirs));
+  // 目录展开状态
+  let dirExpanded = $state<Record<number, boolean>>({});
 
   // ─── 详情 ───
   let detail = $state<WikiPageDetail | null>(null);
   let detailLoading = $state(false);
+
+  // ─── 版本历史 ───
+  let versions = $state<WikiVersionItem[]>([]);
+  let versionsOpen = $state(false);
+  let versionsLoading = $state(false);
+  let restoreBusy = $state(false);
+  async function loadVersions(pageId: number) {
+    versionsLoading = true;
+    try { versions = await kbApi.wikiListVersions(pageId); }
+    catch { versions = []; }
+    finally { versionsLoading = false; }
+  }
+  async function restoreVersion(versionId: number) {
+    if (!detail || !await kbConfirm({ message: '回滚到该版本？当前内容会先保存为新版本。' })) return;
+    restoreBusy = true;
+    try {
+      await kbApi.wikiRestoreVersion(detail.id, versionId);
+      // 重新加载详情和版本列表
+      detail = await kbApi.wikiGetPage(detail.id);
+      await loadVersions(detail.id);
+      versionsOpen = false;
+    } catch (e: unknown) { err = '回滚失败：' + e; }
+    finally { restoreBusy = false; }
+  }
 
   // ─── 编辑 ───
   let editingId = $state<number | null>(null);
@@ -101,13 +136,13 @@
   let graphParams = $state({
     // ── 外观 ──
     nodeScale: 1.0,                         // 节点大小倍率
-    edgeWidth: 1.5,                         // 连线粗细
-    edgeOpacity: 0.85,                      // 连线透明度
+    edgeWidth: 1.2,                         // 连线粗细（略细，减少视觉噪音）
+    edgeOpacity: 0.75,                      // 连线透明度（略低，突出节点）
     showLabels: true,                       // 显示节点标签
-    showArrows: true,                       // 显示连线箭头
-    labelOpacity: 0.9,                      // 文本透明度
-    motion: true,                           // 灵动动画（力导向布局演化）
-    showImplicit: true,                     // 显示隐含关系（共享实体）
+    showArrows: false,                      // 默认关闭箭头（减少渲染开销）
+    labelOpacity: 0.85,                     // 文本透明度
+    motion: false,                          // 默认关闭动画（节省 CPU/GPU）
+    showImplicit: false,                    // 默认关闭隐含关系（减少边数和计算量）
     colorByCommunity: true,                 // 按社区着色（与社交图谱观感一致）
     // ── 筛选 ──
     showOrphans: true,                      // 显示孤立文件（无链接的笔记）
@@ -115,10 +150,10 @@
     ignorePatterns: '',                     // 忽略文件（每行一个，* 通配）
     colorGroups: [] as { query: string; color: string }[], // 颜色组
     // ── 力度（力导向） ──
-    forceRepulsion: 2600,                   // 力导向：斥力
-    forceAttraction: 0.04,                  // 力导向：引力
-    forceCentripetal: 0.02,                 // 力导向：向心力（把节点拉向中心）
-    forceEdgeLength: 1.0,                   // 力导向：连线长度（理想边长倍率）
+    forceRepulsion: 1800,                   // 力导向：斥力（降低，加快收敛）
+    forceAttraction: 0.05,                  // 力导向：引力（略增，节点更紧凑）
+    forceCentripetal: 0.03,                 // 力导向：向心力（略增，防止发散）
+    forceEdgeLength: 0.9,                   // 力导向：连线长度（略短，布局更紧凑）
   });
   function loadGraphParams() {
     try {
@@ -164,6 +199,15 @@
     localOnly,
     anchorId: graphSelect,
   }));
+  // 图谱节点口径：真实页面（status≠missing）与缺失链接（幽灵节点）分开统计，
+  // 否则列表「页面（159）」与图谱「显示 207 个页面」对不上（207 = 159 页 + 48 个未创建的 [[链接]] 目标）。
+  const graphNodeStats = $derived.by(() => {
+    const nodes = graph?.nodes ?? [];
+    const pages = nodes.filter((n) => n.status !== 'missing').length;
+    const ghosts = nodes.length - pages;
+    return { total: nodes.length, pages, ghosts, visible: graphVisible.size };
+  });
+
   const nodeTypeStats = $derived.by(() => {
     const m: Record<string, number> = {};
     if (graph) for (const nd of graph.nodes) { const t = nodeTypeName(nd); m[t] = (m[t] ?? 0) + 1; }
@@ -179,11 +223,12 @@
   }
   // Canvas 图谱：由可见节点 + 布局参数构建力导向模型（力度/外观参数由画布组件读取）
   let graphCanvasRef = $state<{ resetView: () => void; relayout: () => void } | undefined>();
+  let graphFullscreen = $state(false);
   const builtGraph: BuiltWikiGraph = $derived(buildWikiGraph(graph, graphVisible, {
     nodeScale: graphParams.nodeScale,
     forceEdgeLength: graphParams.forceEdgeLength,
     showImplicit: graphParams.showImplicit,
-  }));
+  }, kbName));
   // 着色模式/颜色组变化时递增，触发画布立即重绘（仿真关闭时也能即时生效）
   const graphRedrawKey = $derived(`${graphParams.colorByCommunity}:${JSON.stringify(graphParams.colorGroups ?? [])}`);
   // 选中节点被筛选隐藏时清除选中，避免画布整图置灰
@@ -192,17 +237,27 @@
       graphSelect = null;
     }
   });
+  // 纯逻辑见 wikiPanelUtils.ts（可单测）；此处仅做 WNode → 参数适配
   function wikiNodeColor(n: WNode): string {
-    if (graphParams.colorByCommunity) return communityColor(n.community);
-    const pseudo = { title: n.label, docTitle: n.docTitle, dirName: n.dirName } as WikiGraphNode;
-    return nodeColor(n.status, pseudo, graphParams.colorGroups ?? []);
+    return wikiNodeColorFromUtils({
+      status: n.status,
+      community: n.community,
+      colorByCommunity: graphParams.colorByCommunity,
+      colorGroups: graphParams.colorGroups ?? [],
+      label: n.label,
+      docTitle: n.docTitle,
+      dirName: n.dirName,
+    });
   }
   function tooltipFor(n: WNode): string {
-    const parts: string[] = [nodeTypeName({ title: n.label, docTitle: n.docTitle, dirName: n.dirName } as WikiGraphNode)];
-    parts.push(n.status === 'missing' ? '尚未创建' : n.status === 'draft' ? '草稿' : '已创建');
-    if (n.docTitle) parts.push('来源：' + n.docTitle);
-    parts.push(`入链 ${n.inDegree} · 出链 ${n.outDegree}`);
-    return parts.join(' · ');
+    return wikiNodeTooltip({
+      label: n.label,
+      status: n.status,
+      docTitle: n.docTitle,
+      dirName: n.dirName,
+      inDegree: n.inDegree,
+      outDegree: n.outDegree,
+    });
   }
   // ─── LLM 提炼 ───
   let genBusy = $state(false);
@@ -210,9 +265,15 @@
   // ─── 摘要与实体提取 ───
   let extractBusy = $state(false);
   let extractMsg = $state('');
+  let forceExtract = $state(false);
 
   async function doExtract() {
     if (!detail || extractBusy) return;
+    if (!await kbConfirm({
+      title: '摘要/实体提取',
+      message: `将对页面「${detail.title}」执行摘要与实体提取。\n\n⚠ 副作用说明：\n1. 页面摘要将被自动更新\n2. 可能自动创建「实体」目录与实体页面\n3. 当前页面正文可能被改写（添加回链）\n\n是否继续？`,
+      confirmText: '开始提取',
+    })) return;
     extractBusy = true; extractMsg = '';
     try {
     await kbApi.wikiExtract(detail.id);
@@ -234,11 +295,20 @@
 
   async function doExtractAll() {
     if (kbId === null || extractBusy) return;
-    if (!confirm('用 LLM 为知识库内尚未提取的页面生成摘要与实体？可能耗时较长。')) return;
+    const forceMsg = forceExtract
+      ? '\n\n⚠ 强制模式：将重置所有已完成页面的提取状态，重新提取全部页面。'
+      : '';
+    if (!await kbConfirm({
+      title: '批量摘要/实体提取',
+      message: `用 LLM 为知识库内${forceExtract ? '全部' : '尚未提取的'}页面生成摘要与实体？${forceMsg}\n\n⚠ 副作用说明：\n1. 各页面摘要将被自动更新\n2. 可能自动创建「实体」目录与实体页面（含回链来源页）\n3. 原文正文可能被改写\n\n可能耗时较长。是否继续？`,
+      confirmText: '开始提取',
+    })) return;
     extractBusy = true; extractMsg = '';
     try {
-    const res = await kbApi.wikiExtractAll(kbId);
-      extractMsg = res.submitted === 0 ? '所有页面均已提取过摘要与实体' : `已提交 ${res.submitted} 个页面的摘要与实体提取`;
+      const res = await kbApi.wikiExtractAll(kbId, forceExtract);
+      extractMsg = res.submitted === 0
+        ? '所有页面均已提取过摘要与实体'
+        : `已提交 ${res.submitted} 个页面的摘要与实体提取${res.force ? '（强制模式）' : ''}`;
     } catch (e: unknown) { extractMsg = '批量提取失败：' + e; }
     finally { extractBusy = false; }
   }
@@ -287,14 +357,36 @@
     }
   }
 
-  function statusLabel(s: string): string {
-    const map: Record<string, string> = { draft: '草稿', published: '已发布', archived: '已归档', ready: '就绪' };
-    return map[s] ?? s;
+  /** 实时搜索：输入防抖 300ms 后自动触发，无需再点「搜索」 */
+  function onSearchInput() {
+    if (searchTimer) clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      searchTimer = null;
+      doSearch();
+    }, 300);
   }
 
   function fmtTime(t: string): string {
     return formatIsoTime(t, { showYear: true, utc: true });
   }
+
+  // ─── 图谱全屏 ───
+  function toggleGraphFullscreen() {
+    const el = document.querySelector('.kb-wiki-graph-view') as HTMLElement | null;
+    if (!el) return;
+    if (!document.fullscreenElement) {
+      el.requestFullscreen().then(() => { graphFullscreen = true; }).catch(() => {});
+    } else {
+      document.exitFullscreen().then(() => { graphFullscreen = false; }).catch(() => {});
+    }
+  }
+
+  // 监听全屏状态变化（用户按 ESC 退出时更新状态）
+  $effect(() => {
+    const handler = () => { graphFullscreen = !!document.fullscreenElement; };
+    document.addEventListener('fullscreenchange', handler);
+    return () => document.removeEventListener('fullscreenchange', handler);
+  });
 
   // ─── 详情 ───
   async function openDetail(id: number) {
@@ -318,7 +410,7 @@
 
   async function deletePage() {
     if (!detail) return;
-    if (!confirm(`删除页面「${detail.title}」？此操作不可恢复。`)) return;
+    if (!await kbConfirm({ message: `删除页面「${detail.title}」？此操作不可恢复。`, danger: true, confirmText: '删除' })) return;
     try {
     await kbApi.wikiDeletePage(detail.id);
       detail = null;
@@ -409,15 +501,63 @@
 
 
   // ─── LLM 提炼 ───
+  let extractPreview = $state(false); // 提炼前预览模式
+  let extractAutoEntity = $state(true); // 是否自动创建实体页面
+
+  /** 提炼前诊断：检查前置条件 */
+  async function diagnoseGenerate(): Promise<string | null> {
+    if (kbId === null) return '未选择知识库';
+    // 尝试调用后端，让它返回具体错误
+    try {
+      await kbApi.wikiGenerate({ kbId, providerId: null, model: null });
+      return null; // 成功
+    } catch (e: unknown) {
+      const msg = String(e);
+      if (msg.includes('请先登录')) return '请先登录知识库（点击右上角「登录」）';
+      if (msg.includes('无权限')) return '无权限：仅知识库 owner/admin 可提炼';
+      if (msg.includes('没有已就绪')) return '知识库内没有已就绪的文档，请先上传文档并等待处理完成';
+      return '提炼失败：' + msg;
+    }
+  }
+
   async function doGenerate() {
     if (kbId === null || genBusy) return;
-    if (!confirm('将调用 LLM 提炼知识库中已就绪的文档为 Wiki 页面，已存在的页面会自动合并。\n\n是否继续？（可能耗时较长）')) return;
+    if (extractPreview) {
+      // 预览模式：诊断前置条件
+      genMsg = '正在检查前置条件…';
+      const issue = await diagnoseGenerate();
+      if (issue) {
+        genMsg = '⚠ ' + issue;
+      } else {
+        genMsg = '✅ 前置条件满足，可以开始提炼';
+      }
+      return;
+    }
+    const entityHint = extractAutoEntity
+      ? '\n\n⚠ 自动创建实体：将自动创建「实体」目录与实体页面（含回链来源页），原文正文可能被改写。'
+      : '\n\n仅生成 Wiki 页面，不创建实体页面。';
+    if (!await kbConfirm({
+      title: 'Wiki 提炼',
+      message: `将调用 LLM 把知识库中已就绪的文档提炼为 Wiki 页面（多页 + 双链），已存在的同名页面会自动合并。${entityHint}\n\n是否继续？（可能耗时较长）`,
+      confirmText: '开始提炼',
+    })) return;
     genBusy = true; genMsg = '';
+    const startTime = Date.now();
     try {
-    const res = await kbApi.wikiGenerate({ kbId, providerId: null, model: null });
-      genMsg = `已提交 ${res.submitted} 个文档的后台提炼，可在「活动 → 处理任务」查看进度`;
+      const res = await kbApi.wikiGenerate({ kbId, providerId: null, model: null });
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      genMsg = `✅ 已提交 ${res.submitted} 个文档的后台提炼（耗时 ${elapsed}s），可在「活动 → 处理任务」查看进度。并发度 5，长文档自动拆分处理。`;
     } catch (e: unknown) {
-      genMsg = '生成失败：' + e;
+      const msg = String(e);
+      if (msg.includes('请先登录')) {
+        genMsg = '❌ 请先登录知识库（点击右上角「登录」按钮）';
+      } else if (msg.includes('无权限')) {
+        genMsg = '❌ 无权限：仅知识库 owner/admin 可提炼';
+      } else if (msg.includes('没有已就绪')) {
+        genMsg = '❌ 知识库内没有已就绪的文档。请先上传文档并等待处理完成（状态为「就绪」）';
+      } else {
+        genMsg = '❌ 提炼失败：' + msg;
+      }
     } finally {
       genBusy = false;
     }
@@ -461,9 +601,13 @@
 </script>
 
 {#if kbId === null}
-  <div class="kb-wiki-empty">请先在顶栏选择一个知识库</div>
+  <Empty class="min-h-[200px]">
+    <KbIcon name="wiki" size={28} color="var(--kb-text-3)" />
+    <EmptyTitle class="text-sm">请先选择一个知识库</EmptyTitle>
+    <EmptyDescription>在顶栏选择知识库后即可管理 Wiki 页面</EmptyDescription>
+  </Empty>
 {:else}
-  <div style="flex:1;min-height:0;display:flex;flex-direction:column;gap:10px">
+  <div style="height:100%;min-height:0;display:flex;flex-direction:column;gap:10px">
   {#if view === 'list' || view === 'graph'}
     <!-- Wiki 工作区子页：页面 / 图谱（进入默认落在页面，图谱由子页签进入） -->
     <div style="display:flex;align-items:center;gap:10px;flex:none">
@@ -485,12 +629,16 @@
         <button class="kb-dir-item" class:active={dirFilter === ''} onclick={() => dirFilter = ''}>
           <KbIcon name="folderOpen" size={13} />全部页面（{pages.length}）
         </button>
-        {#each dirTree as d}
-          <button class="kb-dir-item" style="padding-left:{10 + d.depth * 16}px" class:active={dirFilter === d.id} onclick={() => dirFilter = d.id}>
-            <KbIcon name="folder" size={13} />{d.name}（{d.count}）
-          </button>
-        {/each}
-        {#if wikiDirs.length === 0}
+        {#if dirNodes.length > 0}
+          <DirTree
+            nodes={dirNodes}
+            expanded={dirExpanded}
+            onToggle={(id) => { dirExpanded[id] = !dirExpanded[id]; }}
+            onSelect={(id) => { dirFilter = id; }}
+            selectedId={dirFilter === '' ? null : dirFilter}
+            readOnly={true}
+          />
+        {:else}
           <div style="font-size:11.5px;color:var(--kb-text-3);text-align:center;padding:12px">暂无目录</div>
         {/if}
       </div>
@@ -501,26 +649,37 @@
   <div class="kb-wiki-head">
     <span class="kb-wiki-title"><KbIcon name="wiki" size={17} color="var(--kb-accent-bright)" />Wiki 页面</span>
     <div class="kb-wiki-head-btns">
-      <button class="kb-btn-sm" onclick={doGenerate} disabled={genBusy}><KbIcon name="sparkle" size={13} />{genBusy ? '提炼中…' : '提炼'}</button>
-      <button class="kb-btn-sm" onclick={doExtractAll} disabled={extractBusy}><KbIcon name="list" size={13} />{extractBusy ? '提取中…' : '摘要/实体'}</button>
-      <button class="kb-btn-sm kb-wiki-new" onclick={startCreate}><KbIcon name="plus" size={13} weight="bold" />新建</button>
+      <label class="kb-wiki-opt" title="提炼前预览将要处理的文档数量">
+        <Checkbox bind:checked={extractPreview} />预览
+      </label>
+      <label class="kb-wiki-opt" title="自动创建实体页面与目录">
+        <Checkbox bind:checked={extractAutoEntity} />实体
+      </label>
+      <Button size="sm" onclick={doGenerate} disabled={genBusy}>
+        <KbIcon name="sparkle" size={13} />{genBusy ? '提炼中…' : extractPreview ? '预览' : '提炼'}
+      </Button>
+      <label class="kb-wiki-opt" title="重置已完成页面的提取状态，重新提取全部页面">
+        <Checkbox bind:checked={forceExtract} />强制
+      </label>
+      <Button variant="outline" size="sm" onclick={doExtractAll} disabled={extractBusy}>
+        <KbIcon name="list" size={13} />{extractBusy ? '提取中…' : '摘要/实体'}
+      </Button>
+      <Button variant="outline" size="sm" onclick={startCreate}>
+        <KbIcon name="plus" size={13} weight="bold" />新建
+      </Button>
     </div>
   </div>
 
   <div class="kb-wiki-search">
-    <input
-      class="kb-input"
-      placeholder="搜索 Wiki 页面（BM25 全文）"
-      bind:value={searchText}
-      onkeydown={(e) => e.key === 'Enter' && doSearch()}
-    />
+    <Input placeholder="搜索 Wiki 页面（BM25 全文）" bind:value={searchText}
+      oninput={onSearchInput} onkeydown={(e: KeyboardEvent) => e.key === 'Enter' && doSearch()} />
     <select class="kb-select" style="width:auto" bind:value={dirFilter}>
       <option value={''}>全部目录</option>
       {#each wikiDirs as d}
         <option value={d.id}>{d.name}（{d.count}）</option>
       {/each}
     </select>
-    <button class="kb-btn" onclick={doSearch} disabled={searching}>{searching ? '…' : '搜索'}</button>
+    <Button size="sm" onclick={doSearch} disabled={searching}>{searching ? '…' : '搜索'}</Button>
   </div>
 
   {#if genMsg}<div class="kb-wiki-gen">{genMsg}</div>{/if}
@@ -529,20 +688,25 @@
 
   <div class="kb-wiki-list">
     {#if loading}
-      <div class="kb-empty">加载中…</div>
-    {:else if pages.length === 0}
-      <div class="kb-empty">
-        {searchText.trim() ? '未找到匹配页面' : '暂无 Wiki 页面'}
-        {#if !searchText.trim()}
-          <div class="kb-empty-sub">点击「提炼」从文档自动生成，或「新建」手动创建</div>
-        {/if}
+      <div class="flex flex-col gap-2 p-4">
+        {#each Array(5) as _}
+          <Skeleton class="h-[72px] rounded-lg" />
+        {/each}
       </div>
+    {:else if filteredPages.length === 0}
+      <Empty class="min-h-[150px]">
+        <KbIcon name="wiki" size={24} color="var(--kb-text-3)" />
+        <EmptyTitle class="text-sm">{searchText.trim() ? '未找到匹配页面' : '暂无 Wiki 页面'}</EmptyTitle>
+        {#if !searchText.trim()}
+          <EmptyDescription>点击「提炼」从文档自动生成，或「新建」手动创建</EmptyDescription>
+        {/if}
+      </Empty>
     {:else}
       {#each filteredPages as p}
         <button class="kb-wiki-item" type="button" onclick={() => openDetail(p.id)}>
           <div class="kb-wiki-item-title">
             <span class="kb-wiki-item-name">{p.title}</span>
-            <span class="kb-wiki-item-status" class:draft={p.status === 'draft'}>{statusLabel(p.status)}</span>
+            <Badge variant={p.status === 'draft' ? 'secondary' : 'default'} class="text-[10px]">{statusLabel(p.status)}</Badge>
           </div>
           {#if p.summary}<div class="kb-wiki-item-summary">{p.summary}</div>{/if}
           <div class="kb-wiki-item-meta">
@@ -560,7 +724,11 @@
   </div>
 {:else if view === 'detail'}
   {#if detailLoading}
-    <div class="kb-wiki-empty">读取中…</div>
+    <div class="flex flex-col gap-3 p-6">
+      <Skeleton class="h-8 w-2/3 rounded" />
+      <Skeleton class="h-4 w-1/3 rounded" />
+      <Skeleton class="h-[200px] rounded-lg" />
+    </div>
   {:else if detail}
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions —— 详情链接事件委托容器，链接本身可聚焦 -->
     <div
@@ -571,18 +739,27 @@
       onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); onDetailClick(e); } }}
     >
       <div class="kb-wiki-detail-head">
-        <button class="kb-btn-sm" onclick={() => { view = detailBack; detail = null; }}><KbIcon name="arrowLeft" size={13} />返回</button>
+        <Button variant="ghost" size="sm" onclick={() => { view = detailBack; detail = null; }}>
+          <KbIcon name="arrowLeft" size={13} />返回
+        </Button>
         <div class="kb-wiki-detail-btns">
-          <button class="kb-btn-sm" onclick={doExtract} disabled={extractBusy} title="用 LLM 提取摘要与实体">
+          <Button variant="outline" size="sm" onclick={doExtract} disabled={extractBusy}>
             <KbIcon name="list" size={13} />{extractBusy ? '提取中…' : '摘要/实体'}
-          </button>
-          <button class="kb-btn-sm" onclick={startEdit}><KbIcon name="edit" size={13} />编辑</button>
-          <button class="kb-btn-sm kb-dang" onclick={deletePage}><KbIcon name="trash" size={13} />删除</button>
+          </Button>
+          <Button variant="outline" size="sm" onclick={() => { if (!versionsOpen && detail) loadVersions(detail.id); versionsOpen = !versionsOpen; }}>
+            <KbIcon name="refresh" size={13} />版本{#if versionsOpen}▲{:else}▼{/if}
+          </Button>
+          <Button variant="outline" size="sm" onclick={startEdit}>
+            <KbIcon name="edit" size={13} />编辑
+          </Button>
+          <Button variant="destructive" size="sm" onclick={deletePage}>
+            <KbIcon name="trash" size={13} />删除
+          </Button>
         </div>
       </div>
       <h1 class="kb-wiki-detail-title">{detail.title}</h1>
       <div class="kb-wiki-detail-meta">
-        <span class="kb-wiki-item-status" class:draft={detail.status === 'draft'}>{statusLabel(detail.status)}</span>
+        <Badge variant={detail.status === 'draft' ? 'secondary' : 'default'}>{statusLabel(detail.status)}</Badge>
         {#if detail.docTitle}<span><KbIcon name="file" size={12} />来源：{detail.docTitle}</span>{/if}
         {#if detail.extractStatus === 'pending'}<span class="kb-badge kb-badge-warn">摘要/实体提取中…</span>
         {:else if detail.extractStatus === 'failed'}<span class="kb-badge kb-badge-err">摘要/实体提取失败</span>
@@ -661,6 +838,24 @@
           </div>
         </div>
       {/if}
+      {#if versionsOpen}
+        <div class="kb-wiki-links">
+          <div class="kb-wiki-links-title"><KbIcon name="refresh" size={13} />版本历史{#if versionsLoading}（加载中…）{/if}</div>
+          {#if versions.length === 0 && !versionsLoading}
+            <div style="font-size:12px;color:var(--kb-text-3);padding:8px 0">暂无版本记录（首次编辑后自动保存）</div>
+          {/if}
+          <div style="display:flex;flex-direction:column;gap:6px">
+            {#each versions as v}
+              <div style="display:flex;align-items:center;gap:8px;border:1px solid var(--kb-border);border-radius:8px;padding:7px 10px;font-size:12.5px">
+                <span class="kb-badge kb-badge-info">v{v.versionNo}</span>
+                <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--kb-text-2)">{v.title}</span>
+                <span style="font-size:11.5px;color:var(--kb-text-3)">{fmtTime(v.createdAt)}</span>
+                <Button variant="outline" size="sm" onclick={() => restoreVersion(v.id)} disabled={restoreBusy} title="回滚到此版本">回滚</Button>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
     </div>
   {:else}
     <div class="kb-wiki-empty">页面不存在</div>
@@ -669,7 +864,7 @@
   <div class="kb-wiki-edit">
     <div class="kb-wiki-edit-head">
       <span class="kb-wiki-edit-title">{editingId === null ? '新建页面' : '编辑页面'}</span>
-      <button class="kb-btn-sm" onclick={cancelEdit} disabled={saveBusy}>取消</button>
+      <Button variant="ghost" size="sm" onclick={cancelEdit} disabled={saveBusy}>取消</Button>
     </div>
     {#if err}<div class="kb-wiki-err">{err}</div>{/if}
     <input class="kb-input kb-wiki-edit-title-input" placeholder="页面标题" bind:value={editTitle} />
@@ -698,7 +893,7 @@
       {/if}
     </div>
     <div class="kb-wiki-edit-foot">
-      <button class="kb-btn" onclick={savePage} disabled={saveBusy}>{saveBusy ? '保存中…' : '保存'}</button>
+      <Button onclick={savePage} disabled={saveBusy}>{saveBusy ? '保存中…' : '保存'}</Button>
     </div>
   </div>
 {:else if view === 'graph'}
@@ -707,17 +902,20 @@
     <div class="kb-wiki-graph-head">
       <div style="display:flex;gap:6px;align-items:center">
         {#if graph && graph.nodes.length > 0}
-          <button class="kb-btn-sm" onclick={() => graphCanvasRef?.relayout()} title="按社区重新布局"><KbIcon name="refresh" size={13} />重新布局</button>
-          <button class="kb-btn-sm" onclick={() => graphCanvasRef?.resetView()} title="重置视图"><KbIcon name="arrowsOut" size={12} /></button>
-          <button class="kb-btn-sm" class:kb-graph-cfg-on={graphCfgOpen} onclick={() => graphCfgOpen = !graphCfgOpen} title="图谱设置"><KbIcon name="settings" size={15} /></button>
+          <Button variant="outline" size="sm" onclick={() => graphCanvasRef?.relayout()} title="按社区重新布局"><KbIcon name="refresh" size={13} />重新布局</Button>
+          <Button variant="ghost" size="icon-sm" onclick={() => graphCanvasRef?.resetView()} title="重置视图"><KbIcon name="arrowsOut" size={12} /></Button>
+          <Button variant="ghost" size="icon-sm" onclick={toggleGraphFullscreen} title={graphFullscreen ? '退出全屏' : '全屏显示'}>
+            <KbIcon name={graphFullscreen ? 'arrowsIn' : 'arrowsOut'} size={12} />
+          </Button>
+          <Button variant={graphCfgOpen ? 'default' : 'ghost'} size="icon-sm" onclick={() => graphCfgOpen = !graphCfgOpen} title="图谱设置"><KbIcon name="settings" size={15} /></Button>
         {/if}
-        <button class="kb-btn-sm" onclick={startCreate}><KbIcon name="plus" size={13} weight="bold" />新建</button>
+        <Button variant="outline" size="sm" onclick={startCreate}><KbIcon name="plus" size={13} weight="bold" />新建</Button>
       </div>
     </div>
     {#if err}<div class="kb-wiki-err">{err}</div>{/if}
     {#if graph && graph.nodes.length > 0}
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:8px;flex:none">
-        <span class="kb-wiki-graph-stats">显示 {graphVisible.size} / {graph.nodes.length} 个页面 · {builtGraph.edges.length} 条链接</span>
+        <span class="kb-wiki-graph-stats">显示 {graphNodeStats.visible} / {graphNodeStats.total} 个节点（{graphNodeStats.pages} 个页面 · {graphNodeStats.ghosts} 个缺失链接）· {builtGraph.edges.length} 条链接</span>
         <!-- 图例：按社区着色时展示社区簇，否则展示节点类型 -->
         {#if graphParams.colorByCommunity}
           <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
@@ -782,7 +980,7 @@
             }}
             nodeColor={wikiNodeColor}
             edgeColor={(e: WEdge) => edgeColor(e.linkType)}
-            edgeDash={(e: WEdge) => e.linkType === 'entity'}
+            edgeDash={(e: WEdge) => e.linkType === 'entity' || e.linkType === 'center'}
             tooltip={tooltipFor}
             redrawKey={graphRedrawKey}
           />
@@ -791,16 +989,16 @@
               <div style="display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:1px solid var(--kb-border);flex:none">
                 <span style="font-size:13px;font-weight:600;color:var(--kb-text)">图谱设置</span>
                 <div style="flex:1"></div>
-                <button class="kb-btn-sm" onclick={resetGraphParams} title="重置所有更改"><KbIcon name="refresh" size={12} />重置</button>
-                <button class="kb-btn-sm kb-btn-ghost" onclick={() => graphCfgOpen = false}><KbIcon name="close" size={14} /></button>
+                <Button variant="ghost" size="sm" onclick={resetGraphParams} title="重置所有更改"><KbIcon name="refresh" size={12} />重置</Button>
+                <Button variant="ghost" size="icon-sm" onclick={() => graphCfgOpen = false}><KbIcon name="close" size={14} /></Button>
               </div>
               <div class="kb-scroll" style="flex:1;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:16px">
                 <!-- 筛选 -->
                 <div class="kb-graph-cfg-group">
                   <div class="kb-graph-cfg-title">筛选</div>
-                  <div style="display:flex;flex-direction:column;gap:10px;align-items:stretch">
+                  <div class="kb-graph-cfg-items">
                     <label class="kb-label" style="min-width:0">搜索框
-                      <input class="kb-input" placeholder="搜索笔记（按标题 / 来源）…" bind:value={graphFilter} />
+                      <Input placeholder="搜索笔记（按标题 / 来源）…" bind:value={graphFilter} />
                     </label>
                     <label class="kb-check"><Checkbox checked={localOnly} onCheckedChange={(c) => (localOnly = !!c)} />仅显示邻居</label>
                     <label class="kb-check"><Checkbox checked={graphParams.createdOnly}
@@ -818,13 +1016,13 @@
                 <div class="kb-graph-cfg-group">
                   <div class="kb-graph-cfg-title" style="display:flex;justify-content:space-between;align-items:center">
                     <span>颜色组</span>
-                    <button class="kb-btn-sm" onclick={addColorGroup}><KbIcon name="plus" size={12} />新建颜色组</button>
+                    <Button variant="outline" size="sm" onclick={addColorGroup}><KbIcon name="plus" size={12} />新建颜色组</Button>
                   </div>
                   {#each graphParams.colorGroups ?? [] as g, gi}
                     <div style="display:flex;flex-direction:column;gap:8px;padding:8px;border:1px solid var(--kb-border-subtle);border-radius:6px;background:var(--app-bg-color)">
                       <div style="display:flex;gap:6px;align-items:center">
                         <input class="kb-input" style="flex:1;height:28px;font-size:12px" placeholder="搜索词，如：产品、AI…" bind:value={g.query} onchange={saveGraphParams} />
-                        <button class="kb-btn-sm kb-btn-ghost" onclick={() => removeColorGroup(gi)} title="删除该颜色组"><KbIcon name="close" size={12} /></button>
+                        <Button variant="ghost" size="icon-sm" onclick={() => removeColorGroup(gi)} title="删除该颜色组"><KbIcon name="close" size={12} /></Button>
                       </div>
                       <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
                         {#each COLOR_PALETTE as c}
@@ -841,7 +1039,7 @@
                 <!-- 外观 -->
                 <div class="kb-graph-cfg-group">
                   <div class="kb-graph-cfg-title">外观</div>
-                  <div class="kb-graph-cfg-items" style="flex-direction:column;align-items:stretch;gap:10px">
+                  <div class="kb-graph-cfg-items" style="flex-direction:column;align-items:stretch;gap:12px">
                     <label class="kb-label kb-graph-slider-label">节点大小
                       <Slider type="multiple" min={0.6} max={1.8} step={0.05} value={[graphParams.nodeScale]} onValueChange={(v: number[]) => { graphParams.nodeScale = v[0]; saveGraphParams(); }} />
                     </label>
@@ -851,29 +1049,31 @@
                     <label class="kb-label kb-graph-slider-label">文本透明度
                       <Slider type="multiple" min={0.2} max={1} step={0.05} value={[graphParams.labelOpacity]} onValueChange={(v: number[]) => { graphParams.labelOpacity = v[0]; saveGraphParams(); }} />
                     </label>
-                    <label class="kb-check"><Checkbox checked={graphParams.showArrows}
-                      onCheckedChange={(c) => { graphParams.showArrows = !!c; saveGraphParams(); }} />箭头</label>
-                    <label class="kb-check"><Checkbox checked={graphParams.showLabels}
-                      onCheckedChange={(c) => { graphParams.showLabels = !!c; saveGraphParams(); }} />显示标签</label>
-                    <label class="kb-check"><Checkbox checked={graphParams.motion}
-                      onCheckedChange={(c) => { graphParams.motion = !!c; saveGraphParams(); }} />播放动画</label>
-                    <label class="kb-check" title="按社区簇着色（与微信社交图谱观感一致）"><Checkbox checked={graphParams.colorByCommunity}
-                      onCheckedChange={(c) => { graphParams.colorByCommunity = !!c; saveGraphParams(); }} />按社区着色</label>
+                    <div style="display:flex;flex-wrap:wrap;gap:4px 16px">
+                      <label class="kb-check"><Checkbox checked={graphParams.showArrows}
+                        onCheckedChange={(c) => { graphParams.showArrows = !!c; saveGraphParams(); }} />箭头</label>
+                      <label class="kb-check"><Checkbox checked={graphParams.showLabels}
+                        onCheckedChange={(c) => { graphParams.showLabels = !!c; saveGraphParams(); }} />显示标签</label>
+                      <label class="kb-check" title="开启后图谱会持续演化，消耗更多 CPU/GPU"><Checkbox checked={graphParams.motion}
+                        onCheckedChange={(c) => { graphParams.motion = !!c; saveGraphParams(); }} />播放动画</label>
+                      <label class="kb-check" title="按社区簇着色（与微信社交图谱观感一致）"><Checkbox checked={graphParams.colorByCommunity}
+                        onCheckedChange={(c) => { graphParams.colorByCommunity = !!c; saveGraphParams(); }} />按社区着色</label>
+                    </div>
                   </div>
                 </div>
                 <!-- 力度 -->
                 <div class="kb-graph-cfg-group">
                   <div class="kb-graph-cfg-title">力度</div>
-                  <div style="font-size:11.5px;color:var(--kb-text-3);line-height:1.6">控制作用于每个节点的力量：数值越高，图谱越紧凑或越松散。</div>
-                  <div class="kb-graph-cfg-items" style="flex-direction:column;align-items:stretch;gap:10px">
+                  <div style="font-size:11.5px;color:var(--kb-text-3);line-height:1.6;margin-bottom:4px">控制作用于每个节点的力量。调整后点击「重新布局」生效。</div>
+                  <div class="kb-graph-cfg-items" style="flex-direction:column;align-items:stretch;gap:12px">
                     <label class="kb-label kb-graph-slider-label">图谱向心力
                       <Slider type="multiple" min={0} max={0.1} step={0.005} value={[graphParams.forceCentripetal]} onValueChange={(v: number[]) => { graphParams.forceCentripetal = v[0]; saveGraphParams(); }} />
                     </label>
                     <label class="kb-label kb-graph-slider-label">节点间排斥力
-                      <Slider type="multiple" min={500} max={6000} step={100} value={[graphParams.forceRepulsion]} onValueChange={(v: number[]) => { graphParams.forceRepulsion = v[0]; saveGraphParams(); }} />
+                      <Slider type="multiple" min={500} max={5000} step={100} value={[graphParams.forceRepulsion]} onValueChange={(v: number[]) => { graphParams.forceRepulsion = v[0]; saveGraphParams(); }} />
                     </label>
                     <label class="kb-label kb-graph-slider-label">相连节点吸引力
-                      <Slider type="multiple" min={0.005} max={0.12} step={0.005} value={[graphParams.forceAttraction]} onValueChange={(v: number[]) => { graphParams.forceAttraction = v[0]; saveGraphParams(); }} />
+                      <Slider type="multiple" min={0.005} max={0.15} step={0.005} value={[graphParams.forceAttraction]} onValueChange={(v: number[]) => { graphParams.forceAttraction = v[0]; saveGraphParams(); }} />
                     </label>
                     <label class="kb-label kb-graph-slider-label">连线长度
                       <Slider type="multiple" min={0.5} max={2} step={0.05} value={[graphParams.forceEdgeLength]} onValueChange={(v: number[]) => { graphParams.forceEdgeLength = v[0]; saveGraphParams(); }} />
@@ -899,13 +1099,13 @@
                   {/if}
                 </div>
                 {#if sel.status === 'missing'}
-                  <button class="kb-btn kb-btn-sm" style="width:100%;margin-top:10px" onclick={() => { graphCfgOpen = false; startCreateWithTitle(sel.title); }}>
+                  <Button style="width:100%;margin-top:10px" onclick={() => { graphCfgOpen = false; startCreateWithTitle(sel.title); }}>
                     <KbIcon name="plus" size={13} weight="bold" />创建该笔记
-                  </button>
+                  </Button>
                 {:else}
-                  <button class="kb-btn kb-btn-sm" style="width:100%;margin-top:10px" onclick={() => openDetail(sel.pageId)}>
+                  <Button variant="outline" style="width:100%;margin-top:10px" onclick={() => openDetail(sel.pageId)}>
                     <KbIcon name="arrowRight" size={13} weight="bold" />打开页面
-                  </button>
+                  </Button>
                 {/if}
               </div>
             {/if}
@@ -937,11 +1137,9 @@
     font-weight: 600; margin-bottom: 8px; color: var(--kb-text);
   }
   .kb-wiki-title { display: inline-flex; align-items: center; gap: 7px; }
-  .kb-wiki-head-btns { display: flex; gap: 6px; }
-  .kb-wiki-new { background: var(--kb-btn-bg, #145cb9); border-color: var(--kb-btn-bg, #145cb9); color: #fff; }
-  .kb-wiki-new:hover { background: var(--kb-btn-bg-hover, #0f468f); border-color: var(--kb-btn-bg-hover, #0f468f); color: #fff; }
+  .kb-wiki-head-btns { display: flex; gap: 6px; align-items: center; }
+  .kb-wiki-opt { display: flex; align-items: center; gap: 3px; font-size: 12px; color: var(--kb-text-2); cursor: pointer; user-select: none; }
   .kb-wiki-search { display: flex; gap: 6px; margin-bottom: 8px; }
-  .kb-wiki-search .kb-input { flex: 1; }
   .kb-wiki-gen {
     font-size: 12px; color: var(--kb-ok, #7bd95c); background: var(--app-bg-color);
     border: 1px solid color-mix(in srgb, var(--app-success, #52c41a) 44%, var(--app-bg-color)); border-radius: var(--kb-radius-sm, 6px); padding: 6px 8px; margin-bottom: 8px;
@@ -988,11 +1186,6 @@
   }
   .kb-wiki-item-title { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
   .kb-wiki-item-name { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .kb-wiki-item-status {
-    flex-shrink: 0; font-size: 11.5px; padding: 1px 6px; border-radius: 10px;
-    background: var(--app-bg-color); color: var(--kb-accent-bright); border: 1px solid color-mix(in srgb, var(--app-accent, #1a73e8) 48%, var(--app-bg-color));
-  }
-  .kb-wiki-item-status.draft { background: var(--app-bg-color); color: var(--kb-warn, #f0c05a); border-color: color-mix(in srgb, var(--app-warning, #faad14) 46%, var(--app-bg-color)); }
   .kb-wiki-item-summary {
     font-size: 12px; color: var(--kb-text-3);
     margin-top: 4px;     overflow: hidden; text-overflow: ellipsis; display: -webkit-box;
@@ -1036,7 +1229,12 @@
   .kb-wiki-chip:hover { background: var(--kb-hover, #0a0f1e); }
   .kb-wiki-chip-missing { border-style: dashed; color: var(--app-color-secondary, #999); border-color: var(--kb-border-strong, #444); }
   .kb-wiki-chip-missing:hover { color: var(--kb-accent-bright, #6ea8ff); border-color: var(--kb-accent, #1a73e8); }
-  .kb-wiki-backlinks { display: flex; flex-direction: column; gap: 6px; }
+  .kb-wiki-backlinks {
+    display: flex; flex-direction: column; gap: 6px;
+    max-height: 240px; /* 反向链接/提及过多时限高滚动 */
+    overflow-y: auto;
+    padding-right: 4px;
+  }
   .kb-wiki-backlink {
     display: flex; flex-direction: column; gap: 3px; width: 100%; text-align: left;
     background: var(--app-bg-color); border: 1px solid var(--kb-border); border-radius: 8px;
@@ -1068,6 +1266,9 @@
   .wiki-md-body {
     font-size: 13px; line-height: 1.75; color: var(--kb-text);
     word-break: break-word;
+    max-height: 520px; /* 限制正文高度，超出时显示滚动条 */
+    overflow-y: auto;
+    padding-right: 4px;
   }
   .wiki-md-body :global(h1), .wiki-md-body :global(h2), .wiki-md-body :global(h3),
   .wiki-md-body :global(h4), .wiki-md-body :global(h5), .wiki-md-body :global(h6) {
@@ -1145,13 +1346,46 @@
   .kb-check {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
-    font-size: 12px;
+    gap: 8px;
+    font-size: 12.5px;
     color: var(--kb-text-2);
     cursor: pointer;
-    padding-bottom: 8px;
+    padding: 6px 0;
+    line-height: 1.4;
   }
-  .kb-graph-slider-label { display: flex; flex-direction: column; gap: 8px; }
+  .kb-check:hover { color: var(--kb-text); }
+  .kb-graph-slider-label { 
+    display: flex; 
+    flex-direction: column; 
+    gap: 8px;
+    font-size: 12.5px;
+    color: var(--kb-text-2);
+  }
   .kb-graph-slider-label :global([data-slot="slider"]) { flex: none; }
-  .kb-btn-sm.kb-graph-cfg-on { background: var(--kb-hover-strong); border-color: var(--kb-accent); color: var(--kb-accent-bright); }
+  .kb-graph-cfg-group {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .kb-graph-cfg-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--kb-text);
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--kb-border-subtle);
+  }
+  .kb-graph-cfg-items {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  /* ── 全屏模式 ── */
+  :global(.kb-wiki-graph-view:fullscreen) {
+    background: var(--app-bg-color);
+    padding: 16px;
+  }
+  :global(.kb-wiki-graph-view:fullscreen .kb-wiki-graph-head) {
+    padding: 8px 0;
+  }
 </style>

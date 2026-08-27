@@ -1,11 +1,12 @@
 // 大模型管理 — 前端类型定义（与后端 src/tauri/src/llm/types.rs 保持一致）
 
-export type ProviderType = "openai" | "azure" | "ollama" | "custom";
+export type ProviderType = "openai" | "azure" | "ollama" | "xiaomi" | "custom";
 
 export const PROVIDER_TYPE_LABELS: Record<ProviderType, string> = {
   openai: "OpenAI 兼容",
   azure: "Azure OpenAI",
   ollama: "Ollama 本地",
+  xiaomi: "小米 MiMo",
   custom: "自定义兼容",
 };
 
@@ -308,6 +309,36 @@ export interface ModelMeta {
   reasoning_efforts?: string[];
   /** 上下文窗口（token；上下文仪表容量显示） */
   context_window?: number | null;
+
+  // ─── 模态 (Modalities) ───
+  /** 输入模态：支持的输入类型，可多选 */
+  input_modalities?: string[];
+  /** 输出模态：支持的输出类型，可多选 */
+  output_modalities?: string[];
+
+  // ─── 模型能力 (Capabilities) ───
+  /** 深度思考：是否支持深度推理 */
+  reasoning?: boolean;
+  /** 工具调用：是否支持 function calling / tool use */
+  tool_use?: boolean;
+  /** 流式输出：是否支持 streaming */
+  streaming?: boolean;
+  /** 联网搜索：是否支持 web search */
+  web_search?: boolean;
+  /** 结构化输出：是否支持 JSON mode / structured output */
+  structured_output?: boolean;
+  /** Prompt 缓存：是否支持 prompt caching */
+  prompt_cache?: boolean;
+  /** 多模态分析：是否支持图片/音视频理解（用于知识库文件上传多模态分析） */
+  multimodal?: boolean;
+
+  // ─── 性能 (Performance) ───
+  /** 最大输出长度（tokens） */
+  max_output_tokens?: number | null;
+  /** 每分钟请求数限制 (RPM) */
+  requests_per_minute?: number | null;
+  /** 每分钟 Token 数限制 (TPM) */
+  tokens_per_minute?: number | null;
 }
 
 /** 流式响应的单帧 */

@@ -7,14 +7,16 @@
     nodes: DirNode[];
     expanded: Record<number, boolean>;
     onToggle: (id: number) => void;
-    onAdd: (parentId: number | null) => void;
+    onAdd?: (parentId: number | null) => void;
     onSelect?: (id: number) => void;
     onRename?: (id: number) => void;
     onDelete?: (id: number) => void;
     selectedId?: number | null;
+    /** 只读模式：隐藏添加/重命名/删除按钮（用于 Wiki 目录筛选） */
+    readOnly?: boolean;
   }
 
-  let { nodes, expanded, onToggle, onAdd, onSelect, onRename, onDelete, selectedId = null }: Props = $props();
+  let { nodes, expanded, onToggle, onAdd, onSelect, onRename, onDelete, selectedId = null, readOnly = false }: Props = $props();
 
   function isOpen(id: number) {
     return expanded[id] === true;
@@ -39,12 +41,14 @@
           onclick={() => onSelect?.(node.id)}
           onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onSelect?.(node.id); } }}
         >{node.name}</span>
-        <button class="dir-act" title="重命名" onclick={() => onRename?.(node.id)}><KbIcon name="edit" size={13} /></button>
-        <button class="dir-act" title="删除（含子目录与文档）" onclick={() => onDelete?.(node.id)}><KbIcon name="trash" size={13} /></button>
-        <button class="dir-add" title="在此目录下新建子目录" onclick={() => onAdd(node.id)}><KbIcon name="plus" size={13} weight="bold" /></button>
+        {#if !readOnly}
+          <button class="dir-act" title="重命名" onclick={() => onRename?.(node.id)}><KbIcon name="edit" size={13} /></button>
+          <button class="dir-act" title="删除（含子目录与文档）" onclick={() => onDelete?.(node.id)}><KbIcon name="trash" size={13} /></button>
+          <button class="dir-add" title="在此目录下新建子目录" onclick={() => onAdd?.(node.id)}><KbIcon name="plus" size={13} weight="bold" /></button>
+        {/if}
       </div>
       {#if node.children.length > 0 && isOpen(node.id)}
-        <DirTree nodes={node.children} {expanded} {onToggle} {onAdd} {onSelect} {onRename} {onDelete} {selectedId} />
+        <DirTree nodes={node.children} {expanded} {onToggle} {onAdd} {onSelect} {onRename} {onDelete} {selectedId} {readOnly} />
       {/if}
     </li>
   {/each}

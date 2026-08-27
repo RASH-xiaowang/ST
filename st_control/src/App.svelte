@@ -10,6 +10,8 @@
     refreshServerStatus,
   } from './lib/communication';
   import { WeChatPanel, WeChatBootstrap } from '@wechat';
+  import PersonalWechatPanel from './lib/wechat/components/PersonalWechatPanel.svelte';
+  import EnterpriseWechatPanel from './lib/wechat/components/EnterpriseWechatPanel.svelte';
   import LlmPanel from './lib/llm/LlmPanel.svelte';
   import { startLlmSync } from './lib/llm/store.svelte';
   import DataDashboard from './lib/DataDashboard.svelte';
@@ -79,7 +81,7 @@ import PlatformOverview from './lib/components/PlatformOverview.svelte';
   onDestroy(() => { if (pollTimer) clearInterval(pollTimer); });
 
   // ---------- 面板切换 ----------
-  let activeTab = $state<'monitor' | 'harness' | 'agents' | 'automation' | 'db_manager' | 'wechat' | 'llm' | 'kb' | 'ocr'>('monitor');
+  let activeTab = $state<'monitor' | 'harness' | 'agents' | 'automation' | 'db_manager' | 'wechat' | 'llm' | 'kb' | 'ocr' | 'personal_wechat' | 'enterprise_wechat'>('monitor');
   // 首页双视图：落地页（默认）↔ 系统监控（数据看板并入首页）
   let homeView = $state<'overview' | 'sys'>('overview');
   // 概览卡/搜索跳转统一入口：'ai_chat'（原独立板块）已并入 Harness 会话；
@@ -382,6 +384,26 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <svg class="nav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none"><rect x="1.5" y="1.5" width="13" height="13" rx="1.5" stroke="currentColor" stroke-width="1.3"/><circle cx="5.5" cy="5.5" r="1.5" fill="currentColor"/><path d="M2 11l3-3 2.5 2.5L10 8l4 4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/></svg>
           <span class="nav-text">图文识别</span>
         </button>
+
+        <div class="nav-section-label">外部通信功能</div>
+        <button class="nav-item" class:active={activeTab === 'personal_wechat'} onclick={() => activeTab = 'personal_wechat'} role="tab" aria-selected={activeTab === 'personal_wechat'} title="个人微信通信">
+          <svg class="nav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none">
+            <path d="M5.5 3C3 3 1 4.5 1 6.5c0 1.2.7 2.3 1.8 3L2 12l2.7-1.3c.5.2 1 .3 1.6.3M8 3c2.5 0 4.5 1.5 4.5 3.5S10.5 10 8 10" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+            <circle cx="3.5" cy="6.5" r=".5" fill="currentColor"/>
+            <circle cx="5.5" cy="6.5" r=".5" fill="currentColor"/>
+            <circle cx="7.5" cy="6.5" r=".5" fill="currentColor"/>
+            <path d="M8 10c2.5 0 4.5-1.5 4.5-3.5 0-.5-.1-1-.3-1.5.9.5 1.8 1.3 1.8 2.5 0 1.2-.7 2.3-1.8 3L13 12l-2.1-1" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <span class="nav-text">个人微信通信</span>
+        </button>
+        <button class="nav-item" class:active={activeTab === 'enterprise_wechat'} onclick={() => activeTab = 'enterprise_wechat'} role="tab" aria-selected={activeTab === 'enterprise_wechat'} title="企业微信通信">
+          <svg class="nav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none">
+            <rect x="2" y="3" width="12" height="10" rx="2" stroke="currentColor" stroke-width="1.3"/>
+            <path d="M5 7h6M5 10h4" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+            <path d="M6 3V1.5M10 3V1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+          </svg>
+          <span class="nav-text">企业微信通信</span>
+        </button>
       </nav>
 
       <!-- 底部设置/状态 -->
@@ -402,13 +424,6 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
             <line x1="4.5" y1="11" x2="8.5" y2="11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
           </svg>
           <span class="footer-action-text">API 文档</span>
-        </button>
-        <button class="footer-action" onclick={() => settingsOpen = true} title="设置">
-          <svg class="nav-icon" viewBox="0 0 16 16" width="16" height="16" fill="none">
-            <circle cx="8" cy="8" r="2.5" stroke="currentColor" stroke-width="1.3"/>
-            <path d="M8 1v2M8 13v2M1 8h2M13 8h2M2.5 2.5l1.5 1.5M12 12l1.5 1.5M2.5 13.5l1.5-1.5M12 4l1.5-1.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
-          </svg>
-          <span class="footer-action-text">设置</span>
         </button>
       </div>
 
@@ -496,6 +511,12 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
       </PanelSection>
       <PanelSection active={activeTab === 'ocr'}>
         <OcrPanel />
+      </PanelSection>
+      <PanelSection active={activeTab === 'personal_wechat'}>
+        <PersonalWechatPanel />
+      </PanelSection>
+      <PanelSection active={activeTab === 'enterprise_wechat'}>
+        <EnterpriseWechatPanel />
       </PanelSection>
 
     </main>
@@ -1195,230 +1216,6 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
     box-shadow: none;
   }
   .card-grow { flex: 1; min-height: 0; display: grid; place-items: center; }
-
-  /* ---------- 平台首页（监控） ---------- */
-  .monitor-head {
-    display: flex;
-    align-items: flex-end;
-    justify-content: space-between;
-    gap: 12px;
-    padding: 2px 2px 0;
-  }
-  .monitor-title { font-size: 16px; font-weight: 700; color: var(--foreground); }
-  .monitor-sub { font-size: 12.5px; color: var(--muted-foreground); margin-top: 2px; }
-  .monitor-status {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 12.5px;
-    color: var(--muted-foreground);
-    padding: 5px 11px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: var(--card);
-  }
-  .monitor-status-sep {
-    width: 1px;
-    height: 12px;
-    background: var(--border);
-  }
-  .monitor-status-meta {
-    font-family: var(--font-mono);
-    font-size: 11.5px;
-    color: var(--muted-foreground);
-  }
-
-  .monitor-stats {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 12px;
-  }
-  .meter-card {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    padding: 14px 16px;
-  }
-  .meter-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-  }
-  .meter-label {
-    font-size: 11.5px;
-    font-weight: 600;
-    letter-spacing: 0.14em;
-    text-transform: uppercase;
-    color: var(--muted-foreground);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .meter-led {
-    flex: none;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: color-mix(in oklab, var(--foreground) 16%, transparent);
-    border: 1px solid var(--border);
-    transition: background 0.2s ease, box-shadow 0.2s ease;
-  }
-  .meter-led-on {
-    background: var(--brand);
-    border-color: color-mix(in oklab, var(--brand) 60%, white);
-    box-shadow: 0 0 8px color-mix(in oklab, var(--brand) 55%, transparent);
-  }
-  .meter-value {
-    font-family: var(--font-mono);
-    font-size: 26px;
-    font-weight: 700;
-    line-height: 1.05;
-    color: var(--foreground);
-    font-variant-numeric: tabular-nums;
-    letter-spacing: -0.02em;
-  }
-  .monitor-card-shell {
-    position: relative;
-    overflow: hidden;
-    border-radius: var(--radius-lg);
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-  }
-  /* 快捷操作：机架式模块入口 */
-  .monitor-quick {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-  }
-  .quick-label {
-    font-size: 11.5px;
-    font-weight: 600;
-    letter-spacing: 0.16em;
-    color: var(--muted-foreground);
-  }
-  .quick-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
-  }
-  .quick-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 7px;
-    padding: 7px 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--card);
-    color: var(--foreground);
-    font-size: 12.5px;
-    cursor: pointer;
-    transition: border-color 0.15s ease, background 0.15s ease, transform 0.05s ease;
-  }
-  .quick-btn:hover {
-    border-color: color-mix(in oklab, var(--brand) 45%, var(--border));
-    background: color-mix(in oklab, var(--brand) 7%, var(--card));
-  }
-  .quick-btn:active {
-    transform: translateY(1px);
-  }
-  .quick-btn svg {
-    color: var(--brand-strong);
-  }
-
-  .monitor-cols {
-    flex: 1;
-    min-height: 0;
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    gap: 12px;
-  }
-  .monitor-card {
-    display: flex;
-    flex-direction: column;
-    min-height: 0;
-    padding: 0;
-    overflow: hidden;
-  }
-  .monitor-card-hd {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 12px 16px;
-    border-bottom: 1px solid var(--border);
-  }
-  .monitor-card-title { font-size: 13.5px; font-weight: 600; color: var(--foreground); }
-  .monitor-card-count { font-size: 12px; color: var(--muted-foreground); margin-left: auto; font-variant-numeric: tabular-nums; }
-  .monitor-card-bd {
-    flex: 1;
-    min-height: 0;
-    overflow: auto;
-    padding: 6px 10px;
-  }
-  .monitor-empty {
-    display: grid;
-    place-items: center;
-    height: 100%;
-    min-height: 120px;
-    font-size: 12.5px;
-    color: var(--muted-foreground);
-  }
-  .monitor-agent {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 9px 10px;
-    border-radius: 8px;
-  }
-  .monitor-agent:hover { background: var(--muted); }
-  .monitor-agent-dot {
-    flex: none;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--app-success, #52c41a);
-  }
-  .monitor-agent-main { flex: 1; min-width: 0; }
-  .monitor-agent-name {
-    display: block;
-    font-size: 13px;
-    font-weight: 500;
-    color: var(--foreground);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .monitor-agent-meta {
-    display: block;
-    font-size: 11.5px;
-    color: var(--muted-foreground);
-    margin-top: 1px;
-  }
-  .monitor-agent-time { flex: none; font-size: 11.5px; color: var(--muted-foreground); }
-  .monitor-event {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    padding: 7px 10px;
-    border-radius: 8px;
-    font-size: 12px;
-  }
-  .monitor-event:hover { background: var(--muted); }
-  .monitor-event-time {
-    flex: none;
-    color: var(--muted-foreground);
-    font-variant-numeric: tabular-nums;
-  }
-  .monitor-event-name { flex: none; font-weight: 500; color: var(--foreground); }
-  .monitor-event-detail {
-    flex: 1;
-    min-width: 0;
-    color: var(--muted-foreground);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
 
   /* ---------- 表单 ---------- */
   /* ---------- 描述列表 ---------- */

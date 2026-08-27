@@ -2,7 +2,7 @@
  * 知识库 — Wiki 目录树纯算法工具
  * 自 WikiPanel.svelte 下沉：子孙目录集合 / 有序树列表 / 按目录过滤。
  * ============================================================ */
-import type { WikiDir, WikiDirTreeItem, WikiPageItem } from './kbTypes';
+import type { WikiDir, WikiDirTreeItem, WikiPageItem, DirNode } from './kbTypes';
 
 /** 每个目录的子孙目录 id 集合（含自身），用于「按目录筛选」与计数口径一致 */
 export function buildDirSubtree(dirs: WikiDir[]): Map<number, Set<number>> {
@@ -43,6 +43,28 @@ export function buildDirTree(dirs: WikiDir[]): WikiDirTreeItem[] {
   };
   walk(null, 0);
   return out;
+}
+
+/** WikiDir[] → DirNode[] 转换（供 DirTree 组件复用） */
+export function wikiDirsToDirNodes(dirs: WikiDir[]): DirNode[] {
+  const byParent = new Map<number | null, WikiDir[]>();
+  for (const d of dirs) {
+    const k = d.parentId ?? null;
+    const arr = byParent.get(k) ?? [];
+    arr.push(d);
+    byParent.set(k, arr);
+  }
+  const build = (parent: number | null): DirNode[] => {
+    return (byParent.get(parent) ?? []).map((d) => ({
+      id: d.id,
+      kb_id: 0,
+      parent_id: d.parentId,
+      name: d.count > 0 ? `${d.name}（${d.count}）` : d.name,
+      depth: 0,
+      children: build(d.id),
+    }));
+  };
+  return build(null);
 }
 
 /** 按目录过滤页面：dirFilter 为 null 时不过滤；否则保留 dirId 属于该目录子树（含自身）的页面 */

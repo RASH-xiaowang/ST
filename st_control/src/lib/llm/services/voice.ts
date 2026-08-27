@@ -125,7 +125,17 @@ export function buildSpeechAttempts(
   ];
   for (const p of providers) {
     if (!p.enabled) continue;
-    const hit = p.models?.find((m) => p.model_meta?.[m]?.model_type === '语音');
+    // 优先：手动标记为「语音」类型的模型
+    const marked = p.models?.find((m) => p.model_meta?.[m]?.model_type === '语音');
+    if (marked) {
+      attempts.push({ provider_id: p.id, model: marked });
+      continue;
+    }
+    // 兜底：模型名含 tts / speech / voice / audio 关键词 → 自动识别为语音模型
+    const hit = p.models?.find((m) => {
+      const l = m.toLowerCase();
+      return l.includes('tts') || l.includes('speech') || l.includes('voice') || l.includes('audio') || l.includes('mimo');
+    });
     if (hit) attempts.push({ provider_id: p.id, model: hit });
   }
   return attempts;
@@ -194,14 +204,31 @@ export async function blobToWav16kMono(blob: Blob): Promise<Uint8Array | null> {
 /** 把 Markdown 文本清理成适合朗读的纯文本 */
 export function plainTextForSpeech(text: string): string {
   return text
-    // 推理模型的 <think>…</think> 思考块：不朗读
+    // 推理模型的思考块：不朗读
+        // 表情符号：不朗读
+    .replace(/[\u{1F600}-\u{1F64F}\u{1F300}-\u{1F5FF}\u{1F680}-\u{1F6FF}\u{1F900}-\u{1F9FF}\u{2600}-\u{26FF}\u{2700}-\u{27BF}\u{FE00}-\u{FE0F}\u{1F000}-\u{1F02F}\u{1F0A0}-\u{1F0FF}\u{1F100}-\u{1F64F}\u{1F910}-\u{1F96B}\u{1F980}-\u{1F9E0}]/gu, "")
     .replace(/<\s*think\s*>[\s\S]*?<\s*\/\s*think\s*>/gi, " ")
-    // 【思考】…【/思考】式思考块（部分国产模型），同样不朗读
     .replace(/【思考】[\s\S]*?【\/思考】/g, " ")
-    .replace(/```[\s\S]*?```/g, " 代码块 ")
-    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ")
+    // 代码块：简短提示
+    .replace(/```[^\n]*\n[\s\S]*?```/g, "，代码如下，")
+    .replace(/```[\s\S]*?```/g, "，代码块，")
+    // 图片：跳过
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, "")
+    // 链接：只保留文字
     .replace(/\[([^\]]*)\]\([^)]*\)/g, "$1")
-    .replace(/[#>*_~`|]/g, " ")
+    // 行内代码：去掉反引号
+    .replace(/`([^`]+)`/g, "$1")
+    // 标记符号：保留情感标点
+    .replace(/[#*_~|]/g, " ")
+    // 引用和列表：转为停顿
+    .replace(/^>\s*/gm, "，")
+    .replace(/^[-*+]\s+/gm, "，")
+    .replace(/^\d+\.\s+/gm, "，")
+    // 多余空行：转为句号停顿
+    .replace(/\n\s*\n/g, "。")
+    // 单个换行：转为逗号停顿
+    .replace(/\n/g, "，")
+    // 多余空格
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -250,4 +277,52 @@ export class StreamSpeechFeeder {
   reset() {
     this.pending = "";
   }
+}
+
+/** 朗读分段：按句子切分，附带句后停顿与逐句语速（模拟真人节奏） */
+export interface SpeechSegment {
+  text: string;
+  pauseMs: number;
+  speed: number;
+}
+
+/**
+ * 把文本切成朗读分段：
+ * - 按句号/问号/感叹号/分号切分，保留标点（TTS 会读出停顿）
+ * - 问句：语速稍慢 + 句后长停顿（留给听者反应）
+ * - 感叹句：语速稍快 + 句后较长停顿（情绪回响）
+ * - 句号：中等停顿；长句额外放缓
+ */
+export function splitForSpeech(text: string, baseSpeed: number): SpeechSegment[] {
+  const cleaned = plainTextForSpeech(text);
+  if (!cleaned) return [];
+  const sentences = cleaned
+    .split(/(?<=[。！？!?；;])/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return sentences.map((s) => {
+    const last = s.slice(-1);
+    let pauseMs = 220;   // 默认短停顿（逗号级）
+    let speed = baseSpeed;
+    if (/[。；;]/.test(last)) {
+      pauseMs = 350;     // 句号/分号：中等停顿
+      speed = baseSpeed * 1.0;
+    } else if (/[！!]/.test(last)) {
+      pauseMs = 480;     // 感叹号：较长停顿 + 稍快
+      speed = baseSpeed * 1.15;
+    } else if (/[？?]/.test(last)) {
+      pauseMs = 550;     // 问号：最长停顿 + 稍慢
+      speed = baseSpeed * 0.92;
+    }
+    // 长句：额外放缓，避免赶读
+    if (s.length > 50) speed *= 0.97;
+    // 短句（<10字）：略快，保持节奏
+    if (s.length < 10) speed *= 1.06;
+    return { text: s, pauseMs, speed };
+  });
+}
+
+/** 暂停辅助（毫秒） */
+export function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
 }

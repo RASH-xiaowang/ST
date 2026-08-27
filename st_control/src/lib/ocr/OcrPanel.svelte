@@ -432,6 +432,7 @@
           </div>
 
           <div class="ocr-table-wrap">
+          {#if items.length > 0}
             <Table>
               <TableHeader>
                 <TableRow>
@@ -467,15 +468,14 @@
                       </div>
                     </TableCell>
                   </TableRow>
-                {:else}
-                  <TableRow>
-                    <TableCell colspan={9} class="h-24 text-center text-muted-foreground">
-                      {loading ? '加载中…' : '暂无资源，等待 API 推送'}
-                    </TableCell>
-                  </TableRow>
                 {/each}
               </TableBody>
             </Table>
+          {:else}
+            <div class="flex h-40 items-center justify-center text-sm text-muted-foreground">
+              {loading ? '加载中…' : '暂无资源，等待 API 推送'}
+            </div>
+          {/if}
           </div>
 
           <div class="flex items-center justify-end gap-3 text-xs text-muted-foreground">

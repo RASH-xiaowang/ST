@@ -81,16 +81,43 @@ export function communityColor(community: number): string {
 
 /**
  * 把 Wiki 图谱数据构建为力导向图。
- * 仅保留可见节点（visibleIds 为调用方权威过滤结果，空集 = 无节点），
+ * 保留可见节点（visibleIds 为调用方权威过滤结果，空集 = 无节点），
  * 边两端都必须可见；showImplicit=false 时丢弃共享实体边。
+ * 新增：以知识库名为主节点（pageId=0），所有页面节点都连接到主节点，
+ * 形成以库名为中心的约束布局，防止节点随意发散。
  */
 export function buildWikiGraph(
   graph: WikiGraph | null,
   visibleIds: Set<number>,
   params: WikiGraphBuildParams,
+  kbName?: string,
 ): BuiltWikiGraph {
   if (!graph || graph.nodes.length === 0) return { nodes: [], edges: [], communityCount: 0 };
   const nodes: WNode[] = [];
+
+  // 添加知识库主节点（pageId=0，固定在中心）
+  const centerNode: WNode = {
+    id: '0',
+    pageId: 0,
+    label: kbName || '知识库',
+    docTitle: null,
+    dirName: null,
+    status: 'center',
+    degree: graph.nodes.length,
+    inDegree: 0,
+    outDegree: graph.nodes.length,
+    weight: graph.nodes.length,
+    radius: 18 * params.nodeScale,
+    community: -2, // 特殊社区编号：中心节点
+    x: 0,
+    y: 0,
+    vx: 0,
+    vy: 0,
+    fx: 0, // 固定在中心
+    fy: 0,
+  };
+  nodes.push(centerNode);
+
   for (const nd of graph.nodes) {
     if (!visibleIds.has(nd.pageId)) continue;
     const degree = nd.inDegree + nd.outDegree;
@@ -117,6 +144,20 @@ export function buildWikiGraph(
   }
   const index = new Set(nodes.map((n) => n.id));
   const edges: WEdge[] = [];
+
+  // 添加所有页面节点到中心节点的边（向心力约束）
+  for (const nd of nodes) {
+    if (nd.pageId === 0) continue; // 跳过中心节点自身
+    edges.push({
+      source: '0',
+      target: nd.id,
+      linkType: 'center',
+      weight: 1,
+      dist: 180 * params.forceEdgeLength, // 中心到页面的距离
+    });
+  }
+
+  // 添加原有的页面间边
   for (const e of graph.edges) {
     if (!params.showImplicit && e.linkType === 'entity') continue;
     const s = String(e.from);

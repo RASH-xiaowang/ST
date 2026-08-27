@@ -6,62 +6,52 @@
   import { downloadBlob } from '../download';
   import { formatDate } from '../format';
 
-  // 指标定义（与首页指标卡一致）
-  const METRICS: { key: string; label: string; unit: string }[] = [
-    { key: 'messages', label: '消息量', unit: '' },
-    { key: 'sessions', label: '会话量', unit: '' },
-    { key: 'handoff', label: '转人工率', unit: '%' },
-    { key: 'recommend', label: '问题推荐', unit: '' },
-    { key: 'recall', label: '整体召回率', unit: '%' },
-    { key: 'faq', label: '常用问答', unit: '' },
-    { key: 'task', label: '任务技能', unit: '' },
-    { key: 'llm', label: 'LLM问答', unit: '' },
+  // 指标定义（配色经过精心搭配，确保在深浅背景下都清晰可辨）
+  const METRICS: { key: string; label: string; unit: string; color: string; gradient: string }[] = [
+    { key: 'messages', label: '消息量', unit: '', color: '#6366f1', gradient: 'rgba(99,102,241,0.15)' },
+    { key: 'sessions', label: '会话量', unit: '', color: '#06b6d4', gradient: 'rgba(6,182,212,0.15)' },
+    { key: 'recall', label: '召回率', unit: '%', color: '#f59e0b', gradient: 'rgba(245,158,11,0.15)' },
+    { key: 'faq', label: '常用问答', unit: '', color: '#8b5cf6', gradient: 'rgba(139,92,246,0.15)' },
+    { key: 'llm', label: 'LLM问答', unit: '', color: '#10b981', gradient: 'rgba(16,185,129,0.15)' },
+    { key: 'recommend', label: '问题推荐', unit: '', color: '#f43f5e', gradient: 'rgba(244,63,94,0.15)' },
   ];
-  const DEFAULT_UNITS: Record<string, string> = {
-    messages: '', sessions: '', handoff: '%', recommend: '',
-    recall: '%', faq: '', task: '', llm: '',
-  };
 
-  let metric = $state('messages');
   let settings = $state<AnalyticsSetting[]>([]);
-  // 时间范围：0 = 本周（最近 7 天），1 = 上周，2 = 上上周
   let rangeOffset = $state(0);
   let hoverIdx = $state<number | null>(null);
+  let chartReady = $state(false);
 
-  // 可见指标（由指标配置决定；未配置时显示全部）
   const visibleMetrics = $derived.by(() => {
     const vis = settings.filter((s) => s.visible);
     if (vis.length === 0) return METRICS;
-    return vis.map((s) => ({ key: s.key, label: s.label, unit: DEFAULT_UNITS[s.key] ?? '' }));
+    return vis.map((s) => {
+      const def = METRICS.find((m) => m.key === s.key);
+      return { key: s.key, label: s.label, unit: def?.unit ?? '', color: def?.color ?? '#999', gradient: def?.gradient ?? 'rgba(153,153,153,0.15)' };
+    });
   });
 
-  // 数据序列来自 kb_get_analytics（完整埋点）
   let seriesMap = $state<Record<string, number[]>>(Object.fromEntries(
     METRICS.map((m) => [m.key, Array(7).fill(0)]),
   ));
+
   async function loadAnalytics() {
     try {
-    const res = await kbApi.getAnalytics();
+      const res = await kbApi.getAnalytics();
       for (const item of res?.metrics ?? []) {
-        const arr = (item.series ?? []).map((s) => Number(s.value) || 0);
+        const arr = (item.series ?? []).map((s: { value: number }) => Number(s.value) || 0);
         if (arr.length === 7) seriesMap[item.key] = arr;
       }
-    } catch { /* 未配置统计时保持占位 */ }
+      setTimeout(() => chartReady = true, 100);
+    } catch { chartReady = true; }
   }
+
   async function loadSettings() {
-    try {
-    settings = await kbApi.getAnalyticsSettings();
-      if (settings.length > 0 && !settings.some((s) => s.key === metric && s.visible)) {
-        metric = settings.find((s) => s.visible)?.key ?? metric;
-      }
-    } catch {
-      settings = [];
-    }
+    try { settings = await kbApi.getAnalyticsSettings(); } catch { settings = []; }
   }
 
   const fmtShort = (d: Date): string => `${d.getMonth() + 1}/${d.getDate()}`;
+  const fmtWeekday = (d: Date): string => ['日', '一', '二', '三', '四', '五', '六'][d.getDay()];
 
-  // 时间段：以今天为基准，向前取 7 天（含今天）
   const range = $derived.by(() => {
     const end = new Date();
     end.setDate(end.getDate() - rangeOffset * 7);
@@ -70,34 +60,37 @@
     return { start, end };
   });
 
-  const points = $derived.by(() => {
+  const allPoints = $derived.by(() => {
     const { start } = range;
-    const values = seriesMap[metric] ?? Array(7).fill(0);
-    return values.map((v, i) => {
-      const d = new Date(start);
-      d.setDate(d.getDate() + i);
-      return { date: formatDate(d, { dateOnly: true }), short: fmtShort(d), value: v };
+    return visibleMetrics.map((m) => {
+      const values = seriesMap[m.key] ?? Array(7).fill(0);
+      return {
+        ...m,
+        points: values.map((v, i) => {
+          const d = new Date(start);
+          d.setDate(d.getDate() + i);
+          return { date: formatDate(d, { dateOnly: true }), short: fmtShort(d), weekday: fmtWeekday(d), value: v };
+        }),
+      };
     });
   });
 
-  const curLabel = $derived(visibleMetrics.find((m) => m.key === metric)?.label ?? '');
-  const maxY = $derived(Math.max(1, ...points.map((p) => p.value)));
+  const xLabels = $derived(allPoints[0]?.points.map((p) => p) ?? []);
+  const maxY = $derived(Math.max(1, ...allPoints.flatMap((m) => m.points.map((p) => p.value))));
 
-  // 图表几何：全部用百分比坐标（0-100），SVG 与 HTML 坐标轴标签共用，
-  // 文字不随 SVG 拉伸缩放，始终以固定 CSS 字号渲染
-  const pctL = 6, pctR = 3, pctT = 4, pctB = 9;
-  const plotW = 100 - pctL - pctR;
-  const plotH = 100 - pctT - pctB;
-  const xAt = (i: number) => pctL + (points.length <= 1 ? 0 : (i * plotW) / (points.length - 1));
-  const yAt = (v: number) => pctT + plotH * (1 - v / maxY);
-  // 整数友好的 Y 轴刻度：消息量等整数指标不再出现 0.25/0.75 之类小数刻度
+  // 图表几何（留出更多边距给装饰元素）
+  const ML = 8, MR = 4, MT = 4, MB = 10;
+  const PW = 100 - ML - MR;
+  const PH = 100 - MT - MB;
+  const xAt = (i: number) => ML + (xLabels.length <= 1 ? 0 : (i * PW) / (xLabels.length - 1));
+  const yAt = (v: number) => MT + PH * (1 - v / maxY);
+
   function niceStep(raw: number): number {
     const pow = Math.pow(10, Math.floor(Math.log10(Math.max(raw, 1e-9))));
-    for (const m of [1, 2, 5, 10]) {
-      if (raw <= m * pow) return m * pow;
-    }
+    for (const m of [1, 2, 5, 10]) { if (raw <= m * pow) return m * pow; }
     return 10 * pow;
   }
+
   const gridLevels = $derived.by(() => {
     const step = niceStep(maxY / 4);
     const levels: number[] = [];
@@ -105,185 +98,518 @@
     if (levels.length < 2) levels.push(maxY);
     return levels.map((v) => ({ ratio: maxY > 0 ? v / maxY : 0, v }));
   });
-  const linePath = $derived(points.map((p, i) => `${i === 0 ? 'M' : 'L'}${xAt(i).toFixed(2)},${yAt(p.value).toFixed(2)}`).join(' '));
-  const areaPath = $derived(`${linePath}L${xAt(points.length - 1).toFixed(2)},${(pctT + plotH).toFixed(2)}L${pctL},${(pctT + plotH).toFixed(2)}Z`);
-  const hover = $derived(hoverIdx === null ? points[points.length - 1] : (points[hoverIdx] ?? points[points.length - 1]));
-  const hoverX = $derived(hoverIdx === null ? xAt(points.length - 1) : xAt(hoverIdx));
-  const hoverY = $derived(yAt(hover?.value ?? 0));
-  const curUnit = $derived(visibleMetrics.find((m) => m.key === metric)?.unit ?? '');
 
-  // 悬停定位：屏幕像素 → 最近数据点
+  // Catmull-Rom 平滑曲线
+  function smoothPath(pts: { x: number; y: number }[]): string {
+    if (pts.length < 2) return '';
+    if (pts.length === 2) return `M${pts[0].x},${pts[0].y}L${pts[1].x},${pts[1].y}`;
+    let d = `M${pts[0].x.toFixed(2)},${pts[0].y.toFixed(2)}`;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const p0 = pts[Math.max(0, i - 1)];
+      const p1 = pts[i];
+      const p2 = pts[i + 1];
+      const p3 = pts[Math.min(pts.length - 1, i + 2)];
+      const t = 0.3;
+      d += `C${(p1.x + (p2.x - p0.x) * t).toFixed(2)},${(p1.y + (p2.y - p0.y) * t).toFixed(2)},${(p2.x - (p3.x - p1.x) * t).toFixed(2)},${(p2.y - (p3.y - p1.y) * t).toFixed(2)},${p2.x.toFixed(2)},${p2.y.toFixed(2)}`;
+    }
+    return d;
+  }
+
+  // 曲线 + 面积路径
+  const chartPaths = $derived(allPoints.map((m) => {
+    const pts = m.points.map((p, i) => ({ x: xAt(i), y: yAt(p.value) }));
+    const line = smoothPath(pts);
+    const area = `${line}L${xAt(pts.length - 1).toFixed(2)},${(MT + PH).toFixed(2)}L${ML},${(MT + PH).toFixed(2)}Z`;
+    return { key: m.key, color: m.color, gradient: m.gradient, line, area };
+  }));
+
+  const hoverX = $derived(hoverIdx !== null ? xAt(hoverIdx) : xAt(xLabels.length - 1));
+
   function onChartMove(ev: PointerEvent) {
     const svg = (ev.currentTarget as SVGSVGElement);
     const rect = svg.getBoundingClientRect();
     if (rect.width <= 0) return;
     const px = ((ev.clientX - rect.left) / rect.width) * 100;
     let best = 0, bestDist = Infinity;
-    for (let i = 0; i < points.length; i++) {
+    for (let i = 0; i < xLabels.length; i++) {
       const d = Math.abs(xAt(i) - px);
       if (d < bestDist) { bestDist = d; best = i; }
     }
     hoverIdx = best;
   }
 
-  // 导出 CSV（UTF-8 BOM，Excel 可直接打开）
   function exportData() {
-    const unit = METRICS.find((m) => m.key === metric)?.unit ?? '';
-    const rows = [
-      ['日期', `${curLabel}${unit}`],
-      ...points.map((p) => [p.date, p.value]),
-    ];
-    const csv = rows.map((r) => r.join(',')).join('\r\n');
+    const headers = ['日期', ...visibleMetrics.map((m) => `${m.label}${m.unit}`)];
+    const rows = xLabels.map((x, i) => [x.date, ...visibleMetrics.map((m) => seriesMap[m.key]?.[i] ?? 0)]);
+    const csv = [headers, ...rows].map((r) => r.join(',')).join('\r\n');
     downloadBlob(
       new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8' }),
-      `${curLabel}_趋势_${range.start.getFullYear()}${String(range.start.getMonth() + 1).padStart(2, '0')}${String(range.start.getDate()).padStart(2, '0')}-${formatDate(range.end, { dateOnly: true })}.csv`,
+      `趋势_${formatDate(range.start, { dateOnly: true })}-${formatDate(range.end, { dateOnly: true })}.csv`,
     );
   }
+
+  // 汇总统计
+  const summary = $derived(visibleMetrics.map((m) => {
+    const vals = seriesMap[m.key] ?? [];
+    const total = vals.reduce((a, b) => a + b, 0);
+    const max = Math.max(0, ...vals);
+    const trend = vals.length >= 2 && vals[vals.length - 2] > 0
+      ? ((vals[vals.length - 1] - vals[vals.length - 2]) / vals[vals.length - 2] * 100).toFixed(1)
+      : null;
+    return { ...m, total, max, trend };
+  }));
 
   onMount(() => { loadAnalytics(); loadSettings(); });
 </script>
 
-<div class="kb-card kb-trend">
-  <div class="kb-card-hd" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
-    <span><KbIcon name="chart" size={15} color="var(--kb-accent-bright)" />数据指标趋势图</span>
-    <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-      <button class="kb-btn-sm" onclick={exportData} title="导出当前指标与时间段的 CSV 数据">
-        <KbIcon name="download" size={13} />导出数据
+<div class="kb-trend-card">
+  <!-- 头部：标题 + 时间选择 + 导出 -->
+  <div class="kt-header">
+    <div class="kt-header-left">
+      <div class="kt-header-icon"><KbIcon name="chart" size={18} /></div>
+      <div>
+        <h3 class="kt-title">数据指标趋势</h3>
+        <p class="kt-subtitle">{formatDate(range.start, { dateOnly: true })} — {formatDate(range.end, { dateOnly: true })}</p>
+      </div>
+    </div>
+    <div class="kt-header-right">
+      <div class="kt-range-picker">
+        <button class="kt-range-btn" class:active={rangeOffset === 0} onclick={() => rangeOffset = 0}>本周</button>
+        <button class="kt-range-btn" class:active={rangeOffset === 1} onclick={() => rangeOffset = 1}>上周</button>
+        <button class="kt-range-btn" class:active={rangeOffset === 2} onclick={() => rangeOffset = 2}>上上周</button>
+      </div>
+      <button class="kt-export-btn" onclick={exportData} title="导出 CSV">
+        <KbIcon name="download" size={14} />
       </button>
     </div>
   </div>
-  <div class="kb-card-bd" style="display:flex;flex-direction:column;gap:12px">
-    <!-- 指标选项卡 -->
-    <div class="kb-trend-tabs">
+
+  <!-- 指标概览卡片行 -->
+  <div class="kt-summary-row">
+    {#each summary as m}
+      <div class="kt-summary-card" style="--accent:{m.color}">
+        <div class="kt-summary-dot" style="background:{m.color}"></div>
+        <div class="kt-summary-info">
+          <span class="kt-summary-label">{m.label}</span>
+          <span class="kt-summary-value">{m.max}{m.unit}</span>
+        </div>
+        {#if m.trend !== null}
+          <span class="kt-summary-trend" class:up={Number(m.trend) > 0} class:down={Number(m.trend) < 0}>
+            {Number(m.trend) > 0 ? '↑' : Number(m.trend) < 0 ? '↓' : '—'}{Math.abs(Number(m.trend))}%
+          </span>
+        {/if}
+      </div>
+    {/each}
+  </div>
+
+  <!-- 图表区域 -->
+  <div class="kt-chart-wrap">
+    <!-- 图例 -->
+    <div class="kt-legend">
       {#each visibleMetrics as m}
-        <button class="kb-trend-tab" class:active={metric === m.key} onclick={() => metric = m.key}>{m.label}</button>
+        <span class="kt-legend-item">
+          <span class="kt-legend-line" style="background:{m.color}"></span>
+          {m.label}
+        </span>
       {/each}
     </div>
-    <!-- 时间范围 -->
-    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-      <div class="kb-seg">
-        <button class="kb-seg-item" class:active={rangeOffset === 0} onclick={() => rangeOffset = 0}>本周</button>
-        <button class="kb-seg-item" class:active={rangeOffset === 1} onclick={() => rangeOffset = 1}>上周</button>
-        <button class="kb-seg-item" class:active={rangeOffset === 2} onclick={() => rangeOffset = 2}>上上周</button>
-      </div>
-      <span class="kb-trend-range">{formatDate(range.start, { dateOnly: true })} 至 {formatDate(range.end, { dateOnly: true })}</span>
-      <div style="flex:1"></div>
-      <span class="kb-trend-hint">移动鼠标查看每日数据</span>
-    </div>
-    <!-- 折线图 -->
-    <div style="position:relative;height:260px">
-      <svg viewBox="0 0 100 100" style="position:absolute;inset:0;width:100%;height:100%;display:block" preserveAspectRatio="none"
+
+    <!-- 图表 -->
+    <div class="kt-chart" class:ready={chartReady}>
+      <svg viewBox="0 0 100 100" class="kt-svg"
+        preserveAspectRatio="none"
         role="img" aria-label="趋势图"
         onpointermove={onChartMove} onpointerleave={() => hoverIdx = null}>
-        <!-- 网格 -->
+
+        <defs>
+          {#each chartPaths as cp}
+            <linearGradient id="grad-{cp.key}" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color={cp.color} stop-opacity="0.25" />
+              <stop offset="100%" stop-color={cp.color} stop-opacity="0.02" />
+            </linearGradient>
+          {/each}
+        </defs>
+
+        <!-- 网格线 -->
         {#each gridLevels as g}
-          <line x1={pctL} x2={100 - pctR} y1={yAt(g.v)} y2={yAt(g.v)} stroke="var(--kb-border-subtle)" stroke-width="1" vector-effect="non-scaling-stroke" />
+          <line x1={ML} x2={100 - MR} y1={yAt(g.v)} y2={yAt(g.v)}
+            stroke="var(--kb-border-subtle)" stroke-width="0.3" vector-effect="non-scaling-stroke" />
         {/each}
-        <!-- 面积 + 折线 -->
-        <path d={areaPath} fill="color-mix(in srgb, var(--app-accent) 12%, transparent)" stroke="none" vector-effect="non-scaling-stroke" />
-        <path d={linePath} fill="none" stroke="var(--kb-accent-bright)" stroke-width="2" vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round" />
-        <!-- 绿色参考线 + 数据点 -->
-        <line x1={hoverX} x2={hoverX} y1={pctT} y2={pctT + plotH} stroke="var(--kb-ok)" stroke-width="1.5" vector-effect="non-scaling-stroke" stroke-dasharray="4 3" />
+
+        <!-- 面积填充 -->
+        {#each chartPaths as cp}
+          <path d={cp.area} fill="url(#grad-{cp.key})" stroke="none" opacity="0.6" />
+        {/each}
+
+        <!-- 曲线 -->
+        {#each chartPaths as cp}
+          <path d={cp.line} fill="none" stroke={cp.color} stroke-width="1.8"
+            vector-effect="non-scaling-stroke" stroke-linejoin="round" stroke-linecap="round"
+            class:kt-line-animate={chartReady} />
+        {/each}
+
+        <!-- 悬停十字线 -->
+        {#if hoverIdx !== null}
+          <line x1={hoverX} x2={hoverX} y1={MT} y2={MT + PH}
+            stroke="var(--kb-text-3)" stroke-width="0.5" vector-effect="non-scaling-stroke"
+            stroke-dasharray="2 2" opacity="0.6" />
+        {/if}
       </svg>
-      <!-- 数据点（HTML，固定像素大小，不随 SVG 拉伸） -->
-      <span class="kb-trend-dot" style="left:{hoverX}%;top:{hoverY}%"></span>
-      <!-- Y 轴刻度（HTML，固定字号不随图表拉伸） -->
+
+      <!-- 数据点（HTML 固定像素） -->
+      {#if hoverIdx !== null}
+        {#each allPoints as m}
+          {@const val = m.points[hoverIdx]?.value ?? 0}
+          <span class="kt-dot" style="left:{hoverX}%;top:{yAt(val)}%;--dot-color:{m.color}"></span>
+        {/each}
+      {/if}
+
+      <!-- Y 轴刻度 -->
       {#each gridLevels as g}
-        <span class="kb-trend-axis-y" style="top:{yAt(g.v)}%">{Number.isInteger(g.v) ? g.v.toLocaleString() : (+g.v.toFixed(2)).toLocaleString()}</span>
+        <span class="kt-axis-y" style="top:{yAt(g.v)}%">
+          {Number.isInteger(g.v) ? g.v.toLocaleString() : g.v.toFixed(1)}
+        </span>
       {/each}
-      <!-- X 轴日期（HTML） -->
-      {#each points as p, i}
-        <span class="kb-trend-axis-x" style="left:{xAt(i)}%">{p.short}</span>
+
+      <!-- X 轴日期 -->
+      {#each xLabels as x, i}
+        <span class="kt-axis-x" style="left:{xAt(i)}%">
+          <span class="kt-axis-date">{x.short}</span>
+          <span class="kt-axis-weekday">周{x.weekday}</span>
+        </span>
       {/each}
-      <!-- 提示框 -->
-      <div class="kb-trend-tip" style="left:{Math.min(96, Math.max(5, hoverX))}%;top:{Math.max(0, hoverY - 16)}%">
-        <div class="kb-trend-tip-date">{hover.date}</div>
-        <div class="kb-trend-tip-val">{curLabel}：{hover.value}{curUnit}</div>
-      </div>
+
+      <!-- 悬停提示框 -->
+      {#if hoverIdx !== null}
+        {@const pt = xLabels[hoverIdx]}
+        <div class="kt-tooltip" style="left:{Math.min(92, Math.max(8, hoverX))}%;top:6%">
+          <div class="kt-tooltip-header">
+            <span class="kt-tooltip-date">{pt?.date}</span>
+            <span class="kt-tooltip-weekday">周{pt?.weekday}</span>
+          </div>
+          <div class="kt-tooltip-body">
+            {#each allPoints as m}
+              <div class="kt-tooltip-row">
+                <span class="kt-tooltip-dot" style="background:{m.color}"></span>
+                <span class="kt-tooltip-label">{m.label}</span>
+                <span class="kt-tooltip-val">{m.points[hoverIdx]?.value ?? 0}{m.unit}</span>
+              </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
     </div>
   </div>
 </div>
 
 <style>
-  .kb-trend-tabs {
-    display: flex;
-    gap: 4px;
-    flex-wrap: wrap;
+  .kb-trend-card {
+    background: var(--app-bg-color);
+    border: 1px solid var(--kb-border);
+    border-radius: var(--kb-radius, 10px);
+    box-shadow: var(--kb-shadow-sm);
+    overflow: hidden;
   }
-  .kb-trend-tab {
-    height: 28px;
-    padding: 0 12px;
-    border: 1px solid transparent;
+
+  /* ── 头部 ── */
+  .kt-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--kb-border-subtle);
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .kt-header-left {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .kt-header-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--kb-accent) 16%, var(--kb-surface));
+    color: var(--kb-accent-bright);
+    display: grid;
+    place-items: center;
+  }
+  .kt-title {
+    font-size: 15px;
+    font-weight: 700;
+    margin: 0;
+    color: var(--kb-text);
+  }
+  .kt-subtitle {
+    font-size: 12px;
+    color: var(--kb-text-3);
+    margin: 2px 0 0;
+  }
+  .kt-header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .kt-range-picker {
+    display: flex;
+    background: var(--kb-surface);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 2px;
+  }
+  .kt-range-btn {
+    padding: 5px 14px;
+    border: none;
     border-radius: 6px;
     background: transparent;
-    color: var(--kb-text-2);
     font-size: 12.5px;
-    font-family: inherit;
+    color: var(--kb-text-3);
     cursor: pointer;
-    transition: background .12s, color .12s, border-color .12s;
+    transition: all 0.15s;
   }
-  .kb-trend-tab:hover { background: var(--kb-hover); color: var(--kb-text); }
-  .kb-trend-tab.active {
-    background: var(--kb-hover-strong);
-    border-color: var(--kb-border-strong);
-    color: var(--kb-accent-bright);
+  .kt-range-btn:hover { color: var(--kb-text); }
+  .kt-range-btn.active {
+    background: var(--app-bg-color);
+    color: var(--kb-text);
     font-weight: 600;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
   }
-  .kb-trend-range {
-    font-size: 12.5px;
+  .kt-export-btn {
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--kb-border);
+    border-radius: 8px;
+    background: var(--app-bg-color);
+    color: var(--kb-text-3);
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .kt-export-btn:hover { background: var(--kb-surface); color: var(--kb-text); }
+
+  /* ── 指标概览卡片行 ── */
+  .kt-summary-row {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 1px;
+    background: var(--kb-border);
+    border-bottom: 1px solid var(--kb-border-subtle);
+  }
+  .kt-summary-card {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 14px;
+    background: var(--app-bg-color);
+    transition: background 0.12s;
+  }
+  .kt-summary-card:hover { background: var(--kb-surface); }
+  .kt-summary-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    box-shadow: 0 0 6px color-mix(in srgb, currentColor 30%, transparent);
+  }
+  .kt-summary-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .kt-summary-label {
+    font-size: 11px;
+    color: var(--kb-text-3);
+    white-space: nowrap;
+  }
+  .kt-summary-value {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--kb-text);
+    font-variant-numeric: tabular-nums;
+  }
+  .kt-summary-trend {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .kt-summary-trend.up {
+    background: color-mix(in srgb, #16a34a 12%, transparent);
+    color: #16a34a;
+  }
+  .kt-summary-trend.down {
+    background: color-mix(in srgb, #dc2626 12%, transparent);
+    color: #dc2626;
+  }
+
+  /* ── 图表区域 ── */
+  .kt-chart-wrap {
+    padding: 16px 20px 20px;
+  }
+  .kt-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  .kt-legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
     color: var(--kb-text-2);
-    font-variant-numeric: tabular-nums;
   }
-  .kb-trend-hint { font-size: 11.5px; color: var(--kb-text-3); }
-  .kb-trend-axis-y {
+  .kt-legend-line {
+    width: 16px;
+    height: 3px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+
+  /* 图表容器 */
+  .kt-chart {
+    position: relative;
+    height: 300px;
+    border-radius: 8px;
+    background: var(--kb-surface);
+    padding: 8px 0 0 0;
+  }
+  .kt-svg {
     position: absolute;
-    left: 0;
-    width: 6%;
-    transform: translateY(-50%);
-    text-align: right;
-    padding-right: 8px;
-    color: var(--kb-text-3);
-    font-size: 11.5px;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-    pointer-events: none;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
   }
-  .kb-trend-axis-x {
-    position: absolute;
-    bottom: 2px;
-    transform: translateX(-50%);
-    color: var(--kb-text-3);
-    font-size: 11.5px;
-    font-variant-numeric: tabular-nums;
-    white-space: nowrap;
-    pointer-events: none;
+
+  /* 曲线入场动画 */
+  .kt-line-animate {
+    stroke-dasharray: 1000;
+    stroke-dashoffset: 1000;
+    animation: kt-draw 1.2s ease-out forwards;
   }
-  .kb-trend-dot {
+  @keyframes kt-draw {
+    to { stroke-dashoffset: 0; }
+  }
+
+  /* 数据点 */
+  .kt-dot {
     position: absolute;
     width: 10px;
     height: 10px;
     border-radius: 50%;
     transform: translate(-50%, -50%);
-    background: var(--kb-accent-bright);
-    border: 2px solid var(--kb-ok);
-    box-shadow: 0 0 0 2px color-mix(in srgb, var(--app-bg-color) 72%, transparent);
+    background: var(--dot-color);
+    border: 2px solid var(--app-bg-color);
+    box-shadow: 0 0 0 2px var(--dot-color), 0 2px 8px color-mix(in srgb, var(--dot-color) 30%, transparent);
     pointer-events: none;
     z-index: 2;
+    animation: kt-dot-in 0.15s ease-out;
   }
-  .kb-trend-tip {
+  @keyframes kt-dot-in {
+    from { transform: translate(-50%, -50%) scale(0); }
+    to { transform: translate(-50%, -50%) scale(1); }
+  }
+
+  /* 坐标轴 */
+  .kt-axis-y {
+    position: absolute;
+    left: 0;
+    width: 8%;
+    transform: translateY(-50%);
+    text-align: right;
+    padding-right: 10px;
+    color: var(--kb-text-3);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  .kt-axis-x {
+    position: absolute;
+    bottom: -4px;
+    transform: translateX(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    pointer-events: none;
+  }
+  .kt-axis-date {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--kb-text);
+    font-variant-numeric: tabular-nums;
+  }
+  .kt-axis-weekday {
+    font-size: 10px;
+    color: var(--kb-text-3);
+    margin-top: 1px;
+  }
+
+  /* 提示框 */
+  .kt-tooltip {
     position: absolute;
     transform: translateX(-50%);
     pointer-events: none;
     z-index: 3;
-    background: var(--kb-surface-2);
-    border: 1px solid var(--kb-border-strong);
-    /* impeccable-disable-next-line side-tab -- 趋势提示条状态色刻线 */
-    border-left: 3px solid var(--kb-ok);
-    border-radius: 6px;
-    box-shadow: var(--kb-shadow);
-    padding: 5px 9px;
+    background: var(--app-bg-color);
+    border: 1px solid var(--kb-border);
+    border-radius: 10px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.12);
+    padding: 0;
     white-space: nowrap;
+    overflow: hidden;
+    min-width: 160px;
+    animation: kt-tip-in 0.15s ease-out;
   }
-  .kb-trend-tip-date { font-size: 11.5px; color: var(--kb-text-3); }
-  .kb-trend-tip-val { font-size: 12px; font-weight: 600; color: var(--kb-text); margin-top: 1px; }
+  @keyframes kt-tip-in {
+    from { opacity: 0; transform: translateX(-50%) translateY(4px); }
+    to { opacity: 1; transform: translateX(-50%) translateY(0); }
+  }
+  .kt-tooltip-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: var(--kb-surface);
+    border-bottom: 1px solid var(--kb-border-subtle);
+  }
+  .kt-tooltip-date {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--kb-text);
+  }
+  .kt-tooltip-weekday {
+    font-size: 11px;
+    color: var(--kb-text-3);
+  }
+  .kt-tooltip-body {
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .kt-tooltip-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+  }
+  .kt-tooltip-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .kt-tooltip-label { color: var(--kb-text-2); flex: 1; }
+  .kt-tooltip-val { font-weight: 600; color: var(--kb-text); font-variant-numeric: tabular-nums; }
+
+  @media (max-width: 768px) {
+    .kt-summary-row { grid-template-columns: repeat(3, 1fr); }
+    .kt-chart { height: 220px; }
+  }
 </style>

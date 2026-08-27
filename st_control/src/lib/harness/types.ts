@@ -150,6 +150,10 @@ export interface HarnessSettings {
   reasoning_effort?: string | null;
   /** 联网搜索提供商（DSH web 提供商缝）：bing / deepseek */
   web_search_provider?: string | null;
+  /** 朗读音色（TTS voice）：alloy/echo/nova 等；空 = 跟随默认 */
+  voice_name?: string | null;
+  /** 朗读语速（0.5 ~ 2.0；默认 1.2 偏快） */
+  voice_speed?: number | null;
 }
 
 /** 预设附加 prompt 分区 */

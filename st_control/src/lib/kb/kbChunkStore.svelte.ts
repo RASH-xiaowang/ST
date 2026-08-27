@@ -6,21 +6,25 @@ export const kbChunkCfg = $state<{
   strategy: 'recursive' | 'title' | 'parent_child';
   size: number;
   overlap: number;
+  /** 向量检索大库保护阈值：超过此分片数时自动走 FTS 候选池预筛（默认 500） */
+  vectorScanCap: number;
 }>({
   strategy: 'recursive',
   size: 800,
   overlap: 128,
+  vectorScanCap: 500,
 });
 
 // 从后端加载已保存的分块设置（首次进入知识库时调用）
 export async function loadKbChunkCfg() {
   try {
-    const s = await invoke<{ strategy: string; size: number; overlap: number }>('kb_get_chunk_settings');
+    const s = await invoke<{ strategy: string; size: number; overlap: number; vectorScanCap?: number }>('kb_get_chunk_settings');
     if (s?.strategy === 'recursive' || s?.strategy === 'title' || s?.strategy === 'parent_child') {
       kbChunkCfg.strategy = s.strategy;
     }
     if (typeof s?.size === 'number' && s.size > 0) kbChunkCfg.size = s.size;
     if (typeof s?.overlap === 'number' && s.overlap >= 0) kbChunkCfg.overlap = s.overlap;
+    if (typeof s?.vectorScanCap === 'number' && s.vectorScanCap >= 50) kbChunkCfg.vectorScanCap = s.vectorScanCap;
   } catch {
     /* 未初始化数据库时忽略 */
   }
@@ -35,6 +39,7 @@ export function saveKbChunkCfg() {
       strategy: kbChunkCfg.strategy,
       size: kbChunkCfg.size,
       overlap: kbChunkCfg.overlap,
+      vectorScanCap: kbChunkCfg.vectorScanCap,
     }).catch(() => {
       /* 保存失败时保持内存值，下次修改重试 */
     });

@@ -1,9 +1,10 @@
 <script lang="ts">
   import { Channel } from '@tauri-apps/api/core';
   import { kbApi, type KbRagInput } from './services/ipc';
+  import { kbConfirm } from './KbConfirm.svelte';
   import { onMount, untrack } from 'svelte';
   import type { RetrievedChunk, ModelInfo, KbSummary, QaSessionItem, QaMessageItem, SearchLogItem, RecommendItem } from './kbTypes';
-  import { highlightSegments, parseCitations } from './chatUtils';
+  import { highlightSegments, parseCitations, extractChineseTerms } from './chatUtils';
   import { MODE_LABEL } from './fileUtils';
   import { formatIsoTime } from '../format';
   import KbIcon from './KbIcon.svelte';
@@ -11,7 +12,8 @@
   import KbSelect, { type KbSelectItem } from './KbSelect.svelte';
   import { track } from './analytics.svelte';
   import { Checkbox } from '../components/ui/checkbox';
-  import { RippleButton } from 'fancy-ui-svelte';
+  import { Button } from '../components/ui/button';
+  import { Empty, EmptyTitle, EmptyDescription } from '../components/ui/empty';
 
   interface Props {
     selectedKb: number | null;
@@ -65,25 +67,25 @@
   );
   // 检索/问答的固定选项
   const SEARCH_MODE_ITEMS: KbSelectItem[] = [
-    { value: 'hybrid', label: '混合' },
-    { value: 'vector', label: '仅向量' },
-    { value: 'bm25', label: '仅全文' },
+    { value: 'hybrid', label: '混合', meta: 'BM25 + 向量语义融合，推荐' },
+    { value: 'vector', label: '仅向量', meta: '纯语义相似度匹配' },
+    { value: 'bm25', label: '仅全文', meta: '关键词精确匹配，速度快' },
   ];
   const SEARCH_TOPK_ITEMS: KbSelectItem[] = [
-    { value: 5, label: '5' },
-    { value: 10, label: '10' },
-    { value: 20, label: '20' },
+    { value: 5, label: '5', meta: '快速检索，结果精简' },
+    { value: 10, label: '10', meta: '平衡精度与速度' },
+    { value: 20, label: '20', meta: '全面检索，结果更多' },
   ];
   const RAG_MODE_ITEMS: KbSelectItem[] = [
-    { value: 'hybrid', label: '混合' },
-    { value: 'vector', label: '向量' },
-    { value: 'bm25', label: '全文' },
+    { value: 'hybrid', label: '混合', meta: 'BM25 + 向量语义融合，推荐' },
+    { value: 'vector', label: '向量', meta: '纯语义相似度匹配' },
+    { value: 'bm25', label: '全文', meta: '关键词精确匹配，速度快' },
   ];
   const RAG_TOPK_ITEMS: KbSelectItem[] = [
-    { value: 3, label: '3' },
-    { value: 5, label: '5' },
-    { value: 8, label: '8' },
-    { value: 10, label: '10' },
+    { value: 3, label: '3', meta: '最精简，适合简单问题' },
+    { value: 5, label: '5', meta: '平衡精度与速度' },
+    { value: 8, label: '8', meta: '较全面的上下文' },
+    { value: 10, label: '10', meta: '最全面，适合复杂问题' },
   ];
   function onProviderChange(v: string | number) {
     const p = String(v);
@@ -142,21 +144,31 @@
   let ragMode = $state<'hybrid' | 'vector' | 'bm25'>('hybrid');
   let ragTopK = $state<number>(5);
   let ragLoading = $state(false);
+  // RAG 流式生成控制：停止标记 / 活动 Channel 引用 / 超时看门狗
+  let ragStopping = $state(false);
+  let ragChannel: Channel<string> | null = null; // 保留引用用于停止时释放（赋值语义）
+  void ragChannel; // 抑制未读取警告（实际通过赋值使用）
+  let activeRagId: number | null = null; // 当前活跃 RAG 流式 ID（用于精准取消）
+  let ragTimeout: ReturnType<typeof setTimeout> | null = null;
+  const RAG_TIMEOUT_MS = 120000; // 生成超时兜底：超过 2 分钟自动停止
   let streamText = $state<string | null>(null);
   let msgEl = $state<HTMLDivElement | null>(null);
   // 消息 / 流式更新时自动滚动到底部
+  function scrollToBottom() {
+    if (!msgEl) return;
+    requestAnimationFrame(() => { if (msgEl) msgEl.scrollTop = msgEl.scrollHeight; });
+  }
   $effect(() => {
     void qaMessages;
     void streamText;
-    if (!msgEl) return;
-    msgEl.scrollTop = msgEl.scrollHeight;
+    scrollToBottom();
   });
   let qaSessions = $state<QaSessionItem[]>([]);
   let curQaSession = $state<number | null>(null);
   let qaMessages = $state<QaMessageItem[]>([]);
   let qaLoading = $state(false);
 
-  // ─── 热门问题推荐 + 转人工 + 引用详情 ───
+  // ─── 引用详情 ───
   let recommendations = $state<RecommendItem[]>([]);
   let recLoading = $state(false);
   let citeOpen = $state<{ title: string; section: string | null; content: string; docId: number; chunkId: number | null; kbId: number | null } | null>(null);
@@ -187,11 +199,6 @@
     } else {
       query = q;
     }
-  }
-
-  function doHandoff() {
-    track('handoff_click', { kbId: effKbId, sessionId: curQaSession });
-    notify('已记录转人工请求（计入转人工率指标）', 'warn');
   }
 
   async function openCitation(c: { doc_id?: number; chunk_id?: number; kb_id?: number; doc_title?: string; section?: string | null }) {
@@ -286,7 +293,7 @@
     } catch (e: unknown) { notify('创建会话失败：' + e, 'error'); }
   }
   async function deleteQaSession(id: number) {
-    if (!confirm('删除该问答会话？')) return;
+    if (!await kbConfirm({ message: '删除该问答会话？', danger: true, confirmText: '删除' })) return;
     try {
     await kbApi.deleteSession(id);
       if (curQaSession === id) { curQaSession = null; qaMessages = []; }
@@ -304,11 +311,27 @@
   // ─── 检索执行 ───
   async function doSearch() {
     if (!query.trim()) return;
+    const searchQuery = query.trim();
+    query = ''; // 立即清空输入框
     searching = true;
     try {
       searchResults = await kbApi.search({
-        input: { userId: 1, kbId: effKbId, query, topK: searchTopK, mode: searchMode, providerId: chatProvider || null, model: chatModel || null },
+        input: { userId: 1, kbId: effKbId, query: searchQuery, topK: searchTopK, mode: searchMode, providerId: chatProvider || null, model: chatModel || null },
       });
+      // 回退策略：混合检索中文整句 0 命中时，用提取的关键词重试
+      if (searchResults.length === 0 && searchMode === 'hybrid' && /[\u4e00-\u9fa5]/.test(searchQuery)) {
+        const terms = extractChineseTerms(searchQuery);
+        if (terms.length > 0) {
+          const fallbackQuery = terms.slice(0, 5).join(' ');  // 取前 5 个关键词
+          const fallbackResults = await kbApi.search({
+            input: { userId: 1, kbId: effKbId, query: fallbackQuery, topK: searchTopK, mode: searchMode, providerId: chatProvider || null, model: chatModel || null },
+          });
+          if (fallbackResults.length > 0) {
+            searchResults = fallbackResults;
+            notify(`已用关键词「${fallbackQuery}」匹配到 ${fallbackResults.length} 条结果`, 'success');
+          }
+        }
+      }
       track('search', { kbId: effKbId, detail: JSON.stringify({ mode: searchMode, topK: searchTopK, hitCount: searchResults.length }) });
       loadSearchLogs();
     } catch (e: unknown) { notify('检索失败：' + e, 'error'); }
@@ -318,18 +341,34 @@
   // ─── RAG 执行 ───
   async function doRag() {
     if (!ragQuery.trim()) return;
-    ragLoading = true; streamText = '';
+    const userQuery = ragQuery.trim();
+    ragQuery = ''; // 立即清空输入框
+    ragLoading = true; streamText = ''; ragStopping = false;
+
+    // 立即在 UI 中显示用户消息（乐观更新）
+    const userMsg: QaMessageItem = {
+      id: Date.now(),
+      role: 'user',
+      content: userQuery,
+      citations: '',
+      createdAt: new Date().toISOString(),
+    };
+    qaMessages = [...qaMessages, userMsg];
+    scrollToBottom();
+
     // 首次提问自动创建会话：保证回答落库、历史对话有记录
     if (curQaSession === null) {
       try {
-        const title = ragQuery.trim().slice(0, 24) || '问答';
-    const id = await kbApi.createSession(effKbId, title);
+        const title = userQuery.slice(0, 24) || '问答';
+        const id = await kbApi.createSession(effKbId, title);
         curQaSession = id;
         await loadQaSessions();
         onSessionsChanged?.();
       } catch (e: unknown) {
         notify('创建会话失败：' + e, 'error');
         ragLoading = false;
+        // 移除乐观添加的用户消息
+        qaMessages = qaMessages.filter((m) => m.id !== userMsg.id);
         return;
       }
     }
@@ -342,7 +381,7 @@
     const input: KbRagInput = {
       userId: 1,
       kbId: effKbId,
-      query: ragQuery,
+      query: userQuery,
       providerId: chatProvider || null,
       model: chatModel || null,
       topK: ragTopK,
@@ -352,8 +391,17 @@
     if (overrides.length > 0) input.chunks = overrides;
     // 流式问答：Channel 接收 delta/done/error 帧，逐字渲染
     const channel = new Channel<string>();
+    ragChannel = channel;
     let acc = '';
     let streamErr = '';
+    // 超时兜底：生成超过阈值仍未结束则自动停止并提示
+    if (ragTimeout) clearTimeout(ragTimeout);
+    ragTimeout = setTimeout(() => {
+      if (ragLoading) {
+        notify('生成超时，已自动停止', 'warn');
+        stopRag();
+      }
+    }, RAG_TIMEOUT_MS);
     channel.onmessage = (msg: string) => {
       try {
         const f = JSON.parse(msg);
@@ -371,7 +419,11 @@
       }
     };
     try {
-      await kbApi.ragStreamWithChannel(input, channel);
+      const result = await kbApi.ragStreamWithChannel(input, channel);
+      // 捕获 ragId 用于精准取消（后端返回 { streamed, model, provider, ragId }）
+      if (result && typeof result === 'object' && 'ragId' in result) {
+        activeRagId = (result as { ragId?: number }).ragId ?? null;
+      }
       if (streamErr) {
         notify('RAG 失败：' + streamErr, 'error');
       } else if (curQaSession !== null) {
@@ -382,9 +434,26 @@
     } catch (e: unknown) {
       notify('RAG 失败：' + e, 'error');
     } finally {
+      if (ragTimeout) { clearTimeout(ragTimeout); ragTimeout = null; }
+      ragChannel = null;
+      activeRagId = null;
       ragLoading = false;
       streamText = null;
+      if (ragStopping) {
+        ragStopping = false;
+        notify('已停止生成', 'warn');
+      }
     }
+  }
+
+  // ─── 停止 RAG 流式生成 ───
+  function stopRag() {
+    if (!ragLoading) return;
+    ragStopping = true;
+    // 精准取消：传入当前活跃 RAG ID，避免误取消其他并发请求
+    kbApi.ragCancel(activeRagId ?? undefined).catch(() => { /* 忽略取消命令失败 */ });
+    ragChannel = null; // 释放 Channel 引用
+    activeRagId = null;
   }
 
   // ─── 高亮分段（前端本地计算） ───
@@ -407,6 +476,7 @@
   function sendFromLanding() {
     const t = landingText.trim();
     if (!t) return;
+    landingText = '';
     started = true;
     if (mode === 'qa') {
       ragQuery = t;
@@ -427,14 +497,15 @@
   onMount(() => { loadSearchLogs(); });
 </script>
 
-<div class="kb-card" style="height:100%;display:flex;flex-direction:column;min-height:0">
+<div class="h-full flex flex-col min-h-0">
   {#if !started}
     <!-- 开始新的对话 -->
     <div class="kb-chat-landing">
-      <div class="kb-chat-title">
-        <h3 class="text-[22px] font-bold text-[var(--kb-text)]">开始新的对话</h3>
-      </div>
-      <div class="kb-chat-sub">向你的知识库提问，获取回答与分析</div>
+      <Empty class="border-0 p-4">
+        <KbIcon name="sparkle" size={32} color="var(--kb-accent-bright)" />
+        <EmptyTitle class="text-xl">开始新的对话</EmptyTitle>
+        <EmptyDescription>向你的知识库提问，获取回答与分析</EmptyDescription>
+      </Empty>
       <div class="kb-chat-composer">
         <div class="kb-chat-inputrow">
           <textarea class="kb-chat-input" rows="3" placeholder="请输入您想要咨询的问题或需要帮助的内容..."
@@ -490,11 +561,13 @@
     <div style="flex:1"></div>
     <KbSelect icon="book" style="min-width:170px;max-width:220px" items={kbItems} value={kbSel}
       onchange={(v) => (kbSel = v as number | 'all')} />
-    <KbSelect style="min-width:130px" items={providerItems} value={chatProvider} placeholder="提供方…"
+    <KbSelect style="min-width:130px;max-width:180px" items={providerItems} value={chatProvider} placeholder="提供方…"
       onchange={onProviderChange} />
-    <KbSelect style="min-width:170px" items={modelItems} value={chatModel} placeholder="模型…"
+    <KbSelect style="min-width:170px;max-width:220px" items={modelItems} value={chatModel} placeholder="模型…"
       disabled={chatProvider === ''} onchange={onModelChange} />
-    <button class="kb-btn-sm" onclick={restart} title="回到开始页"><KbIcon name="home" size={13} />重新开始</button>
+    <Button variant="outline" size="sm" onclick={restart} title="回到开始页">
+      <KbIcon name="home" size={13} />重新开始
+    </Button>
   </div>
 
   {#if mode === 'search'}
@@ -506,7 +579,9 @@
         <input class="kb-chat-searchfield" placeholder="输入关键词检索知识库（混合检索 = 向量 + BM25）" bind:value={query}
           onkeydown={(e) => e.key === 'Enter' && doSearch()} />
       </div>
-      <button class="kb-btn" onclick={doSearch} disabled={searching || !query.trim()}>{searching ? '检索中…' : '检索'}</button>
+      <Button onclick={doSearch} disabled={searching || !query.trim()}>
+        {searching ? '检索中…' : '检索'}
+      </Button>
     </div>
     <div class="kb-chat-searchtools">
       <label class="kb-chat-tool-label">模式
@@ -518,9 +593,9 @@
           onchange={(v) => (searchTopK = Number(v))} />
       </label>
       <div style="flex:1"></div>
-      <button class="kb-btn-sm" onclick={() => { showHistory = !showHistory; if (showHistory) loadSearchLogs(); }}>
+      <Button variant="ghost" size="sm" onclick={() => { showHistory = !showHistory; if (showHistory) loadSearchLogs(); }}>
         <KbIcon name="activity" size={13} />{showHistory ? '隐藏历史' : '检索历史'}
-      </button>
+      </Button>
     </div>
 
     {#if showHistory}
@@ -568,7 +643,7 @@
   <div class="kb-chat-qa">
     <!-- 会话列表 -->
     <aside class="kb-chat-sessions">
-      <button class="kb-btn kb-chat-new-session" onclick={newQaSession}><KbIcon name="plus" size={14} weight="bold" />新建会话</button>
+      <Button class="kb-chat-new-session" onclick={newQaSession}><KbIcon name="plus" size={14} weight="bold" />新建会话</Button>
       {#each qaSessions as s}
         <div
           class="kb-chat-session"
@@ -634,8 +709,6 @@
           {:else}
             <span class="kb-badge kb-badge-ok">回答将写入当前会话</span>
           {/if}
-          <div style="flex:1"></div>
-          <button class="kb-btn-sm" onclick={doHandoff} title="转人工（计入转人工率指标）"><KbIcon name="send" size={13} />转人工</button>
         </div>
         {#if draftChunks.length > 0}
           <div style="border:1px solid var(--kb-border);border-radius:10px;margin-bottom:8px;max-height:260px;overflow:auto">
@@ -671,13 +744,17 @@
         <div class="kb-chat-composer2-row">
           <textarea class="kb-textarea kb-chat-qa-input" rows="2" placeholder="向知识库提问（基于检索上下文生成回答）" bind:value={ragQuery}
             onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doRag(); } }}></textarea>
-          <button class="kb-btn-md" onclick={runDraftSearch} disabled={draftBusy || !ragQuery.trim()} title="先检索片段，可勾选/排序/编辑后再生成">
+          <Button variant="outline" onclick={runDraftSearch} disabled={draftBusy || !ragQuery.trim()} title="先检索片段，可勾选/排序/编辑后再生成">
             <KbIcon name="search" size={14} />{draftBusy ? '检索中…' : '检索片段'}
-          </button>
-          <RippleButton onclick={doRag} disabled={ragLoading || !ragQuery.trim()} rippleColor="#b8f5a8"
-            class="h-9 rounded-[6px] border-0 bg-[var(--kb-btn-bg)] px-4 text-[13px] font-medium text-white hover:brightness-110">
+          </Button>
+          {#if ragLoading}
+            <Button variant="destructive" onclick={stopRag} title="停止生成">
+              <KbIcon name="stop" size={14} />停止
+            </Button>
+          {/if}
+          <Button onclick={doRag} disabled={ragLoading || !ragQuery.trim()}>
             {ragLoading ? '生成中…' : '发送'}
-          </RippleButton>
+          </Button>
         </div>
       </div>
     </section>
@@ -697,8 +774,8 @@
         <div style="border:1px solid var(--kb-border);border-radius:8px;padding:10px;margin-top:10px;font-size:12.5px;line-height:1.7;color:var(--kb-text-2);white-space:pre-wrap;word-break:break-word;max-height:42vh;overflow:auto">{citeOpen.content || '（该分片内容暂不可用，可在文档中查看）'}</div>
       </div>
       <div class="kb-modal-ft">
-        <button class="kb-btn-md" onclick={() => citeOpen = null}>关闭</button>
-        <button class="kb-btn" onclick={() => { const c = citeOpen; if (!c) return; const d = c.docId; const k = c.kbId; citeOpen = null; onOpenDoc?.(d, k); }}>打开文档</button>
+        <Button variant="outline" onclick={() => citeOpen = null}>关闭</Button>
+        <Button onclick={() => { const c = citeOpen; if (!c) return; const d = c.docId; const k = c.kbId; citeOpen = null; onOpenDoc?.(d, k); }}>打开文档</Button>
       </div>
     </div>
   </KbModal>
@@ -739,18 +816,9 @@
     gap: 12px;
     padding: 28px 24px;
   }
-  .kb-chat-title {
-    font-size: 22px;
-    font-weight: 700;
-    color: var(--kb-text);
-    letter-spacing: .01em;
-  }
-  .kb-chat-sub {
-    font-size: 13px;
-    color: var(--kb-text-3);
-  }
   .kb-chat-composer {
     width: min(760px, 100%);
+    min-width: 0;
     margin-top: 18px;
     display: flex;
     flex-direction: column;
@@ -759,6 +827,7 @@
     border-radius: 16px;
     padding: 14px 14px 10px;
     box-shadow: var(--kb-shadow-sm);
+    overflow: hidden;
   }
   .kb-chat-inputrow {
     display: flex;
@@ -818,17 +887,37 @@
     display: flex;
     flex-direction: column;
     gap: 5px;
+    min-width: 0;
   }
   .kb-chat-field-label {
     font-size: 11.5px;
     letter-spacing: .05em;
     color: var(--kb-text-3);
+    white-space: nowrap;
   }
   .kb-chat-mode-seg { box-sizing: border-box; height: 32px; }
   .kb-chat-mode-seg .kb-seg-item { height: 26px; padding: 0 12px; }
   .kb-chat-model-pair {
     display: flex;
     gap: 8px;
+    min-width: 0;
+    max-width: 100%;
+  }
+  /* 模型选择器：固定最大宽度，防止长名称撑破布局 */
+  .kb-chat-model-pair :global(.kb-dselect) {
+    max-width: 180px;
+    min-width: 0;
+    flex: 1;
+  }
+  .kb-chat-model-pair :global(.kb-select-trigger) {
+    overflow: hidden;
+    min-width: 0;
+  }
+  .kb-chat-model-pair :global(.kb-select-label) {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 140px;
   }
   .kb-chat-disclaimer {
     font-size: 11.5px;
@@ -1041,7 +1130,6 @@
     gap: 4px;
     background: var(--app-bg-color);
   }
-  .kb-chat-new-session { margin-bottom: 6px; }
   .kb-chat-session {
     display: grid;
     grid-template-columns: 1fr auto;

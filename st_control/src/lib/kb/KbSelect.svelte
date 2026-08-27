@@ -21,7 +21,7 @@
   let open = $state(false);
   let triggerEl = $state<HTMLButtonElement | null>(null);
   let menuEl = $state<HTMLDivElement | null>(null);
-  let pos = $state({ top: 0, left: 0, width: 0 });
+  let pos = $state({ top: 0, left: 0, width: 0, openUp: false });
   let hi = $state(0);
 
   const curLabel = $derived(items.find((i) => i.value === value)?.label ?? placeholder);
@@ -30,7 +30,15 @@
     if (disabled || open) return;
     const r = triggerEl?.getBoundingClientRect();
     if (!r) return;
-    pos = { top: r.bottom + 6, left: r.left, width: Math.max(r.width, 180) };
+    const menuHeight = Math.min(items.length * 40, 264); // 预估菜单高度
+    const spaceBelow = window.innerHeight - r.bottom;
+    const openUp = spaceBelow < menuHeight + 20; // 下方空间不足时向上弹出
+    pos = {
+      top: openUp ? r.top - menuHeight - 6 : r.bottom + 6,
+      left: r.left,
+      width: Math.max(r.width, 180),
+      openUp,
+    };
     hi = Math.max(0, items.findIndex((i) => i.value === value));
     open = true;
   }
@@ -106,15 +114,17 @@
   </button>
 
   {#if open}
-    <div class="kb-select-menu" bind:this={menuEl} role="listbox" aria-label={placeholder}
+    <div class="kb-select-menu" class:open-up={pos.openUp} bind:this={menuEl} role="listbox" aria-label={placeholder}
       style="top:{pos.top}px;left:{pos.left}px;min-width:{pos.width}px">
       {#each items as it, i (it.value)}
         <button class="kb-select-option" class:active={it.value === value} class:hover={hi === i} data-idx={i} type="button"
           role="option" aria-selected={it.value === value}
           onmouseenter={() => (hi = i)}
           onclick={() => pick(it.value)}>
-          <span class="kb-select-option-label">{it.label}</span>
-          {#if it.meta}<span class="kb-select-option-meta">{it.meta}</span>{/if}
+          <div class="kb-select-option-content">
+            <span class="kb-select-option-label">{it.label}</span>
+            {#if it.meta}<span class="kb-select-option-meta">{it.meta}</span>{/if}
+          </div>
           {#if it.value === value}<KbIcon name="check" size={13} />{/if}
         </button>
       {/each}
@@ -189,12 +199,20 @@
     from { opacity: 0; transform: translateY(-4px) scale(.98); }
     to { opacity: 1; transform: translateY(0) scale(1); }
   }
+  @keyframes kb-pop-up {
+    from { opacity: 0; transform: translateY(4px) scale(.98); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
+  .kb-select-menu.open-up {
+    transform-origin: bottom center;
+    animation: kb-pop-up .14s ease-out;
+  }
   .kb-select-option {
     display: flex;
     align-items: center;
     gap: 8px;
     width: 100%;
-    padding: 7px 10px;
+    padding: 8px 10px;
     border: none;
     border-radius: 7px;
     background: transparent;
@@ -214,12 +232,17 @@
     font-weight: 600;
     background: color-mix(in srgb, var(--kb-accent) 8%, transparent);
   }
-  .kb-select-option-label {
+  .kb-select-option-content {
     flex: 1;
     min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .kb-select-option-label {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .kb-select-option-meta { font-size: 11.5px; color: var(--kb-text-3); }
+  .kb-select-option-meta { font-size: 11px; color: var(--kb-text-3); line-height: 1.3; }
 </style>

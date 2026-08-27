@@ -8,10 +8,12 @@ import type { WikiGraphNode } from './kbTypes';
 /** 连线类型 → 颜色 */
 export const EDGE_COLORS: Record<string, string> = {
   related: '#5b8ff9',
+  backlink: '#a0d9ff',  // 反向链接（由正向 [[引用]] 自动生成，颜色较浅以区分）
   reference: '#5ad8a6',
   child_of: '#f6bd16',
   generated: '#b37feb',
   entity: '#4fd1c5',   // 隐含关系：共享实体
+  center: '#6366f1',   // 中心节点连接线（紫色，半透明）
 };
 
 export const EDGE_COLOR_FALLBACK = '#7d8899';

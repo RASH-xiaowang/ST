@@ -7,7 +7,9 @@
     ArrowLeft, ArrowRight, ArrowUp, ArrowDown, Stack, CompassRose, ShieldCheck, ListBullets, Scroll,
     FileArrowUp, Swap, SlidersHorizontal, CircleNotch, Lightbulb, FileDashed, FileXls, Tray,
     Cube, ChartBar, FilePdf, FileDoc, FileCsv, FileMd, ChatCircle, PushPin, Minus, ArrowsOut,
-    Eye, Tag, DotsThree, Book, Lightning, House,
+    Eye, Tag, DotsThree, Book, Lightning, House, Stop,
+    Users, UserPlus, Key, ShieldSlash, SignIn, SignOut, List,
+    Keyboard, Play, Image, Table, Presentation, DotsThreeCircleVertical,
   } from 'phosphor-svelte';
 
   const ICONS: Record<string, typeof FileText> = {
@@ -34,6 +36,7 @@
     caretDown: CaretDown,
     check: CheckCircle,
     warn: WarningCircle,
+    warning: WarningCircle,
     info: Info,
     send: PaperPlaneTilt,
     link: LinkSimple,
@@ -46,6 +49,7 @@
     stack: Stack,
     compass: CompassRose,
     shield: ShieldCheck,
+    shieldOff: ShieldSlash,
     list: ListBullets,
     scroll: Scroll,
     fileUp: FileArrowUp,
@@ -72,6 +76,19 @@
     book: Book,
     bolt: Lightning,
     home: House,
+    stop: Stop,
+    users: Users,
+    userPlus: UserPlus,
+    key: Key,
+    login: SignIn,
+    logout: SignOut,
+    menu: List,
+    more: DotsThreeCircleVertical,
+    keyboard: Keyboard,
+    play: Play,
+    image: Image,
+    table: Table,
+    presentation: Presentation,
   };
 
   interface Props {

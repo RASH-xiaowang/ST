@@ -114,16 +114,99 @@
   // 类型与标签均为前端约定的可选项；后端不做强校验，原样持久化字符串。
   const MODEL_TYPES = ["对话", "生图", "视频", "语音", "嵌入", "重排序"];
   const MODEL_TAGS = ["视觉", "MoE", "推理", "Tools", "FIM", "Math", "Coder"];
+  // ─── 模态选项 ───
+  const INPUT_MODALITIES = ["文本", "图像", "音频", "视频", "文件"];
+  const OUTPUT_MODALITIES = ["文本", "图像", "音频", "视频", "代码"];
 
   let editingMetaFor = $state<string | null>(null);
   let draftType = $state("");
   let draftTags = $state<string[]>([]);
+  // ─── 新增配置项状态 ───
+  let draftInputModalities = $state<string[]>([]);
+  let draftOutputModalities = $state<string[]>([]);
+  let draftReasoning = $state(false);
+  let draftToolUse = $state(false);
+  let draftStreaming = $state(false);
+  let draftWebSearch = $state(false);
+  let draftStructuredOutput = $state(false);
+  let draftPromptCache = $state(false);
+  let draftMultimodal = $state(false);
+  let draftMaxOutputTokens = $state<number | null>(null);
+  let draftRequestsPerMinute = $state<number | null>(null);
+  let draftTokensPerMinute = $state<number | null>(null);
+  let draftContextWindow = $state<number | null>(null);
+  let contextWindowUnit = $state("1000");  // 默认 K
+  let maxOutputUnit = $state("1000");      // 默认 K
+  let tokensPerMinuteUnit = $state("1000"); // 默认 K
 
   function openMeta(m: string) {
     const cur = selected?.model_meta?.[m];
     editingMetaFor = m;
     draftType = cur?.model_type ?? "";
     draftTags = [...(cur?.tags ?? [])];
+    draftInputModalities = [...(cur?.input_modalities ?? [])];
+    draftOutputModalities = [...(cur?.output_modalities ?? [])];
+    draftReasoning = cur?.reasoning ?? false;
+    draftToolUse = cur?.tool_use ?? false;
+    draftStreaming = cur?.streaming ?? false;
+    draftWebSearch = cur?.web_search ?? false;
+    draftStructuredOutput = cur?.structured_output ?? false;
+    draftPromptCache = cur?.prompt_cache ?? false;
+    draftMultimodal = cur?.multimodal ?? false;
+    draftMaxOutputTokens = cur?.max_output_tokens ?? null;
+    draftRequestsPerMinute = cur?.requests_per_minute ?? null;
+    // 解析TPM，自动选择合适的单位
+    const tpmVal = cur?.tokens_per_minute ?? null;
+    if (tpmVal !== null) {
+      if (tpmVal >= 1000000 && tpmVal % 1000000 === 0) {
+        draftTokensPerMinute = tpmVal / 1000000;
+        tokensPerMinuteUnit = "1000000";
+      } else if (tpmVal >= 1000 && tpmVal % 1000 === 0) {
+        draftTokensPerMinute = tpmVal / 1000;
+        tokensPerMinuteUnit = "1000";
+      } else {
+        draftTokensPerMinute = tpmVal;
+        tokensPerMinuteUnit = "1";
+      }
+    } else {
+      draftTokensPerMinute = null;
+      tokensPerMinuteUnit = "1000";
+    }
+    // 解析上下文长度，自动选择合适的单位
+    const ctxVal = cur?.context_window ?? null;
+    if (ctxVal !== null) {
+      if (ctxVal >= 1000000 && ctxVal % 1000000 === 0) {
+        draftContextWindow = ctxVal / 1000000;
+        contextWindowUnit = "1000000";
+      } else if (ctxVal >= 1000 && ctxVal % 1000 === 0) {
+        draftContextWindow = ctxVal / 1000;
+        contextWindowUnit = "1000";
+      } else {
+        draftContextWindow = ctxVal;
+        contextWindowUnit = "1";
+      }
+    } else {
+      draftContextWindow = null;
+      contextWindowUnit = "1000";
+    }
+    
+    // 解析最大输出长度，自动选择合适的单位
+    const maxVal = cur?.max_output_tokens ?? null;
+    if (maxVal !== null) {
+      if (maxVal >= 1000000 && maxVal % 1000000 === 0) {
+        draftMaxOutputTokens = maxVal / 1000000;
+        maxOutputUnit = "1000000";
+      } else if (maxVal >= 1000 && maxVal % 1000 === 0) {
+        draftMaxOutputTokens = maxVal / 1000;
+        maxOutputUnit = "1000";
+      } else {
+        draftMaxOutputTokens = maxVal;
+        maxOutputUnit = "1";
+      }
+    } else {
+      draftMaxOutputTokens = null;
+      maxOutputUnit = "1000";
+    }
   }
   function cancelMeta() {
     editingMetaFor = null;
@@ -134,11 +217,42 @@
   function toggleDraftTag(t: string) {
     draftTags = draftTags.includes(t) ? draftTags.filter((x) => x !== t) : [...draftTags, t];
   }
+  
+  function toggleDraftInputModality(m: string) {
+    draftInputModalities = draftInputModalities.includes(m) 
+      ? draftInputModalities.filter((x) => x !== m) 
+      : [...draftInputModalities, m];
+  }
+  
+  function toggleDraftOutputModality(m: string) {
+    draftOutputModalities = draftOutputModalities.includes(m) 
+      ? draftOutputModalities.filter((x) => x !== m) 
+      : [...draftOutputModalities, m];
+  }
 
   async function saveMeta(m: string) {
     if (!selectedId) return;
     try {
-      await llmApi.setModelMeta(selectedId, m, draftType || null, [...draftTags]);
+      await llmApi.setModelMeta(
+        selectedId, 
+        m, 
+        draftType || null, 
+        [...draftTags],
+        [...draftInputModalities],
+        [...draftOutputModalities],
+        draftReasoning,
+        draftToolUse,
+        draftStreaming,
+        draftWebSearch,
+        draftStructuredOutput,
+        draftPromptCache,
+        draftMultimodal,
+        draftMaxOutputTokens !== null ? draftMaxOutputTokens * Number(maxOutputUnit) : null,
+        draftRequestsPerMinute,
+        tokensPerMinuteUnit,
+        draftTokensPerMinute,
+        draftContextWindow !== null ? draftContextWindow * Number(contextWindowUnit) : null,
+      );
       editingMetaFor = null;
       success = "能力已保存";
       error = "";
@@ -252,7 +366,11 @@
               </span>
               <span class="llm-model-metas">
                 {#if meta?.model_type}<span class="llm-meta-chip llm-meta-type">{meta.model_type}</span>{/if}
+                {#if meta?.multimodal}<span class="llm-meta-chip llm-meta-multimodal">多模态</span>{/if}
                 {#each (meta?.tags ?? []) as t (t)}<span class="llm-meta-chip">{t}</span>{/each}
+                {#if meta?.context_window}<span class="llm-meta-chip">上下文 {meta.context_window >= 1000000 ? (meta.context_window / 1000000) + 'M' : meta.context_window >= 1000 ? (meta.context_window / 1000) + 'K' : meta.context_window}</span>{/if}
+                {#if meta?.max_output_tokens}<span class="llm-meta-chip">输出 {meta.max_output_tokens >= 1000000 ? (meta.max_output_tokens / 1000000) + 'M' : meta.max_output_tokens >= 1000 ? (meta.max_output_tokens / 1000) + 'K' : meta.max_output_tokens}</span>{/if}
+                {#if meta?.tokens_per_minute}<span class="llm-meta-chip">TPM {meta.tokens_per_minute >= 1000000 ? (meta.tokens_per_minute / 1000000) + 'M' : meta.tokens_per_minute >= 1000 ? (meta.tokens_per_minute / 1000) + 'K' : meta.tokens_per_minute}</span>{/if}
               </span>
             </div>
             <div class="llm-model-actions">
@@ -291,14 +409,76 @@
             <button type="button" class="llm-meta-chip-btn" class:on={draftTags.includes(t)} onclick={() => toggleDraftTag(t)}>{t}</button>
           {/each}
         </div>
+        <!-- ─── 模态 (Modalities) ─── -->
+        <div class="llm-meta-section-label">输入模态（可多选）</div>
+        <div class="llm-meta-chips">
+          {#each INPUT_MODALITIES as m}
+            <button type="button" class="llm-meta-chip-btn" class:on={draftInputModalities.includes(m)} onclick={() => toggleDraftInputModality(m)}>{m}</button>
+          {/each}
+        </div>
+        <div class="llm-meta-section-label">输出模态（可多选）</div>
+        <div class="llm-meta-chips">
+          {#each OUTPUT_MODALITIES as m}
+            <button type="button" class="llm-meta-chip-btn" class:on={draftOutputModalities.includes(m)} onclick={() => toggleDraftOutputModality(m)}>{m}</button>
+          {/each}
+        </div>
+        <!-- ─── 模型能力 (Capabilities) ─── -->
+        <div class="llm-meta-section-label">模型能力</div>
+        <div class="llm-meta-checkboxes">
+          <label class="llm-meta-checkbox"><input type="checkbox" bind:checked={draftReasoning} /> 深度思考</label>
+          <label class="llm-meta-checkbox"><input type="checkbox" bind:checked={draftToolUse} /> 工具调用</label>
+          <label class="llm-meta-checkbox"><input type="checkbox" bind:checked={draftStreaming} /> 流式输出</label>
+          <label class="llm-meta-checkbox"><input type="checkbox" bind:checked={draftWebSearch} /> 联网搜索</label>
+          <label class="llm-meta-checkbox"><input type="checkbox" bind:checked={draftStructuredOutput} /> 结构化输出</label>
+          <label class="llm-meta-checkbox"><input type="checkbox" bind:checked={draftPromptCache} /> Prompt 缓存</label>
+          <label class="llm-meta-checkbox"><input type="checkbox" bind:checked={draftMultimodal} /> 多模态分析</label>
+        </div>
+        <!-- ─── 性能 (Performance) ─── -->
+        <div class="llm-meta-section-label">性能参数</div>
+        <div class="llm-meta-inputs">
+          <label class="llm-meta-input">
+            <span>上下文长度</span>
+            <div class="llm-meta-input-with-unit">
+              <input type="number" bind:value={draftContextWindow} placeholder="如 128" />
+              <select bind:value={contextWindowUnit}>
+                <option value="1">tokens</option>
+                <option value="1000">K</option>
+                <option value="1000000">M</option>
+              </select>
+            </div>
+          </label>
+          <label class="llm-meta-input">
+            <span>最大输出长度</span>
+            <div class="llm-meta-input-with-unit">
+              <input type="number" bind:value={draftMaxOutputTokens} placeholder="如 4" />
+              <select bind:value={maxOutputUnit}>
+                <option value="1">tokens</option>
+                <option value="1000">K</option>
+                <option value="1000000">M</option>
+              </select>
+            </div>
+          </label>
+          <label class="llm-meta-input"><span>RPM (每分钟请求数)</span><input type="number" bind:value={draftRequestsPerMinute} placeholder="如 60" /></label>
+          <label class="llm-meta-input">
+            <span>TPM (每分钟 Token 数)</span>
+            <div class="llm-meta-input-with-unit">
+              <input type="number" bind:value={draftTokensPerMinute} placeholder="如 100" />
+              <select bind:value={tokensPerMinuteUnit}>
+                <option value="1">tokens</option>
+                <option value="1000">K</option>
+                <option value="1000000">M</option>
+              </select>
+            </div>
+          </label>
+        </div>
         <div class="llm-meta-pop-actions">
           <button class="llm-btn llm-btn-sm" onclick={cancelMeta}>取消</button>
           <button class="llm-btn llm-btn-sm llm-btn-primary" onclick={() => { if (editingMetaFor) saveMeta(editingMetaFor); }}>保存</button>
         </div>
       </div>
     </div>
-  {/if}
-</div>
+    {/if}
+  </div>
 
 <style>
   .llm-models { display: flex; flex-direction: column; gap: 12px; min-height: 100%; }
@@ -351,6 +531,11 @@
     border-color: color-mix(in srgb, var(--app-color-accent) 35%, var(--app-color-border));
     background: color-mix(in srgb, var(--app-color-accent) 8%, transparent);
   }
+  .llm-meta-chip.llm-meta-multimodal {
+    color: #8b5cf6;
+    border-color: color-mix(in srgb, #8b5cf6 35%, var(--app-color-border));
+    background: color-mix(in srgb, #8b5cf6 8%, transparent);
+  }
   .llm-meta-mask {
     position: fixed; inset: 0; z-index: 1000;
     background: rgba(0,0,0,0.45);
@@ -376,5 +561,30 @@
     background: var(--app-color-accent); color: #fff; border-color: var(--app-color-accent);
   }
   .llm-meta-pop-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 10px; }
+  .llm-meta-checkboxes { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+  .llm-meta-checkbox { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--app-color-text); cursor: pointer; }
+  .llm-meta-checkbox input { width: 15px; height: 15px; accent-color: var(--app-color-accent); cursor: pointer; }
+  .llm-meta-inputs { display: flex; flex-direction: column; gap: 8px; }
+  .llm-meta-input { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--app-color-muted); }
+  .llm-meta-input input { background: var(--app-color-surface); color: var(--app-color-text); border: 1px solid var(--app-color-border); border-radius: 6px; padding: 5px 8px; font-size: 12px; }
+  .llm-meta-input-with-unit { display: flex; gap: 4px; align-items: center; }
+  .llm-meta-input-with-unit input { flex: 1; min-width: 0; }
+  .llm-meta-input-with-unit select { 
+    width: 70px; 
+    background: var(--app-color-surface-alt); 
+    color: var(--app-color-text); 
+    border: 1px solid var(--app-color-border); 
+    border-radius: 6px; 
+    padding: 5px 4px; 
+    font-size: 12px; 
+    cursor: pointer;
+    appearance: auto;
+  }
+  .llm-meta-input-with-unit select:hover {
+    border-color: var(--app-color-accent);
+  }
+  .llm-meta-input-with-unit select:focus {
+    outline: none;
+    border-color: var(--app-color-accent);
+  }
 </style>
-

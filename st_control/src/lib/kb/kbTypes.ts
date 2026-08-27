@@ -2,7 +2,7 @@
 export interface KbSummary { id: number; name: string; description: string | null; owner_id: number | null; pinned: boolean; isSystem: boolean; docCount: number; created_at: string; }
 export interface CurrentUser { id: number; username: string; displayName: string | null; isAdmin: boolean; }
 export interface DirNode { id: number; kb_id: number; parent_id: number | null; name: string; depth: number; children: DirNode[]; }
-export interface DocItem { id: number; title: string; fileType: string | null; status: string; processStatus: string | null; createdAt: string; updatedAt?: string; fileSize?: number | null; source?: string | null; tags: string[]; }
+export interface DocItem { id: number; title: string; fileType: string | null; status: string; processStatus: string | null; createdAt: string; updatedAt?: string; fileSize?: number | null; source?: string | null; tags: string[]; snippet?: string; }
 export interface RetrievedChunk { chunk_id: number; doc_id: number; kb_id: number; content: string; page_no: number | null; section: string | null; score: number; source: string; doc_title: string; }
 export interface RagContextItem { chunk_id: number; doc_id: number; kb_id: number; content: string; score: number; doc_title: string; section?: string | null; page_no?: number | null; }
 export interface RagAnswer { answer: string; context: RagContextItem[]; model: string; provider: string; }
@@ -158,6 +158,17 @@ export interface WikiDirTreeItem {
   name: string;
   count: number;
   depth: number;
+}
+
+/** Wiki 页面版本记录 */
+export interface WikiVersionItem {
+  id: number;
+  versionNo: number;
+  title: string;
+  summary: string;
+  contentMd: string;
+  note: string | null;
+  createdAt: string;
 }
 
 // ─── 指标统计（埋点）───

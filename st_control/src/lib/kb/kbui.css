@@ -256,6 +256,37 @@
   padding-left: 14px;
   border-left: 1px solid var(--kb-border);
 }
+/* ─── 全局搜索（顶栏） ─── */
+.kb-global-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--kb-hover, rgba(255,255,255,0.04));
+  border: 1px solid var(--kb-border-subtle);
+  border-radius: 8px;
+  padding: 0 10px;
+  height: 32px;
+  min-width: 180px;
+  max-width: 280px;
+  transition: border-color .15s, background .15s;
+}
+.kb-global-search:focus-within {
+  border-color: var(--kb-accent);
+  background: var(--app-bg-color);
+}
+.kb-global-search-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  font-size: 12.5px;
+  color: var(--kb-text);
+  font-family: inherit;
+}
+.kb-global-search-input::placeholder {
+  color: var(--kb-text-3);
+}
 
 /* ─── 布局 ─── */
 .kb-layout { flex: 1; min-height: 0; display: flex; }
@@ -1070,3 +1101,294 @@
 .kb-mb-2 { margin-bottom: 8px; }
 .kb-mb-3 { margin-bottom: 12px; }
 .kb-mb-4 { margin-bottom: 16px; }
+
+/* ============================================================
+   响应式适配
+   ============================================================ */
+
+/* ── 移动端汉堡菜单按钮（仅移动端显示） ── */
+.kb-mobile-menu-btn {
+  display: none;
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 60;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  border: 1px solid var(--kb-border);
+  background: var(--kb-surface);
+  color: var(--kb-text);
+  cursor: pointer;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s;
+}
+.kb-mobile-menu-btn:hover { background: var(--kb-hover); }
+
+/* ── 移动端遮罩 ── */
+.kb-sidebar-overlay {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 49;
+  background: rgba(0,0,0,0.4);
+  backdrop-filter: blur(2px);
+}
+
+/* ── 面包屑导航 ── */
+.kb-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.kb-breadcrumb-link {
+  color: var(--kb-text-3);
+  cursor: pointer;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 14px;
+  font-weight: 600;
+  transition: color 0.15s;
+}
+.kb-breadcrumb-link:hover { color: var(--kb-accent); }
+.kb-breadcrumb-sep { color: var(--kb-text-3); font-weight: 400; }
+.kb-breadcrumb-current { color: var(--kb-text); }
+
+/* ── Tabs 栏（文档/Wiki/成员/FAQ/权限） ── */
+.kb-tabs-bar {
+  display: flex;
+  gap: 2px;
+  background: var(--kb-surface-2);
+  border-radius: 8px;
+  padding: 3px;
+  flex-shrink: 0;
+}
+.kb-tab-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 12.5px;
+  font-weight: 500;
+  color: var(--kb-text-2);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s;
+}
+.kb-tab-item:hover { background: var(--kb-hover); color: var(--kb-text); }
+.kb-tab-item.active {
+  background: var(--app-bg-color);
+  color: var(--kb-text);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+}
+
+/* ── 用户区域 ── */
+.kb-user-area {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin-left: 8px;
+}
+.kb-user-info { min-width: 0; }
+.kb-user-name {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--kb-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.kb-user-sub {
+  font-size: 11px;
+  color: var(--kb-text-3);
+}
+
+/* ── 侧边栏标签（平板端折叠时隐藏） ── */
+.kb-sidebar-label {
+  white-space: nowrap;
+}
+.kb-sidebar-tooltip {
+  display: none; /* 桌面端不显示 tooltip，直接显示文字 */
+}
+
+/* ── 选择知识库提示区 ── */
+.kb-select-kb-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 20px;
+}
+.kb-select-kb-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px;
+}
+
+/* ── 全局搜索框 ── */
+.kb-global-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--kb-surface);
+  border: 1px solid var(--kb-border-subtle);
+  border-radius: 8px;
+  padding: 0 10px;
+  height: 32px;
+  flex-shrink: 0;
+  min-width: 180px;
+  max-width: 280px;
+  transition: border-color 0.15s;
+}
+.kb-global-search:focus-within { border-color: var(--kb-accent); }
+.kb-global-search-input {
+  border: none;
+  background: transparent;
+  outline: none;
+  font-size: 12.5px;
+  color: var(--kb-text);
+  width: 100%;
+}
+.kb-global-search-input::placeholder { color: var(--kb-text-3); }
+
+/* ============================================================
+   响应式断点：平板端 ≤ 1279px
+   ============================================================ */
+@media (max-width: 1279px) {
+  /* 侧边栏折叠为图标栏 */
+  .kb-sidebar {
+    width: 56px !important;
+    min-width: 56px !important;
+  }
+  .kb-brand-text,
+  .kb-sidebar-section:not(.kb-sidebar-section-row),
+  .kb-sidebar-label,
+  .kb-sidebar-kb-name,
+  .kb-sidebar-kb-count,
+  .kb-sidebar-empty,
+  .kb-sidebar-add { display: none !important; }
+  .kb-sidebar-tooltip { display: block; } /* 折叠态显示 tooltip */
+  .kb-brand { justify-content: center; padding: 12px 0 !important; }
+  .kb-sidebar-item { justify-content: center; padding: 10px 0 !important; }
+  .kb-sidebar-section-row { justify-content: center; }
+  .kb-sidebar-bottom .kb-sidebar-item { justify-content: center; }
+
+  /* Tabs 栏可横向滚动 */
+  .kb-tabs-bar { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+  /* 搜索框缩短 */
+  .kb-global-search { min-width: 140px; max-width: 200px; }
+
+  /* 用户信息隐藏 */
+  .kb-user-info { display: none; }
+}
+
+/* ============================================================
+   响应式断点：移动端 ≤ 767px
+   ============================================================ */
+@media (max-width: 767px) {
+  /* 汉堡菜单按钮显示 */
+  .kb-mobile-menu-btn { display: flex; }
+  .kb-sidebar-overlay.open { display: block; }
+
+  /* 侧边栏变为抽屉 */
+  .kb-sidebar {
+    position: fixed !important;
+    left: -260px;
+    top: 0;
+    bottom: 0;
+    z-index: 50;
+    width: 260px !important;
+    min-width: 260px !important;
+    transition: left 0.25s ease;
+    box-shadow: 4px 0 20px rgba(0,0,0,0.15);
+  }
+  .kb-sidebar.open { left: 0; }
+
+  /* 恢复完整侧边栏内容 */
+  .kb-brand-text,
+  .kb-sidebar-section,
+  .kb-sidebar-label,
+  .kb-sidebar-kb-name,
+  .kb-sidebar-kb-count,
+  .kb-sidebar-add { display: initial !important; }
+  .kb-sidebar-tooltip { display: none; } /* 移动端抽屉态隐藏 tooltip */
+  .kb-brand { justify-content: flex-start; padding: 12px 16px !important; }
+  .kb-sidebar-item { justify-content: flex-start; padding: 10px 16px !important; }
+
+  /* 主内容区占满宽度 */
+  .kb-main { margin-left: 0 !important; }
+
+  /* 内容栏适配 */
+  .kb-contentbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 10px 12px !important;
+  }
+  .kb-breadcrumb { order: -1; width: 100%; }
+  .kb-global-search { min-width: 0; max-width: none; flex: 1; order: 0; }
+  .kb-tabs-bar { order: 1; width: 100%; }
+  .kb-user-area { order: 2; }
+
+  /* 选择知识库网格单列 */
+  .kb-select-kb-grid { grid-template-columns: 1fr; }
+}
+
+
+/* ─── 文档上传悬浮面板（迁自 KbDocs scoped 样式：子组件 KbDocUploadPanel 无法吃到
+   scoped 样式，必须在全局样式表中定义才能真正生效） ─── */
+.kb-upload-panel {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 61;
+  width: min(360px, calc(100vw - 36px));
+  display: flex;
+  flex-direction: column;
+  background: var(--app-bg-color);
+  border: 1px solid var(--kb-border-strong);
+  border-radius: 10px;
+  box-shadow: var(--kb-shadow-lg);
+  overflow: hidden;
+  animation: kb-pop .16s ease-out;
+}
+.kb-upload-panel-hd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 10px 8px 12px;
+  border-bottom: 1px solid var(--kb-border);
+  background: var(--app-bg-color);
+  flex: none;
+}
+.kb-upload-panel.kb-upload-collapsed .kb-upload-panel-hd { border-bottom: none; }
+.kb-upload-panel-body {
+  max-height: min(280px, 34vh);
+  overflow: auto;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: var(--app-bg-color);
+}
+.kb-upload-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  padding: 6px 10px;
+  border: 1px solid var(--kb-border);
+  border-radius: 8px;
+  background: var(--app-bg-color);
+  flex: none;
+}

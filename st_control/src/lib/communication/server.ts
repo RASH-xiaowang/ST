@@ -38,10 +38,19 @@ export async function initEventListeners(): Promise<void> {
   await listen<string>('server-event', (event) => {
     try {
       const data = JSON.parse(event.payload);
-      const eventType = data.event || 'unknown';
+      if (!data || typeof data !== 'object') return;
+      const eventType: string = typeof data.event === 'string' ? data.event : 'unknown';
 
       if (eventType === 'agent_connected') {
-        const client = data.client as AgentInfo;
+        const c = data.client;
+        if (!c || typeof c !== 'object' || typeof c.id !== 'string' || typeof c.name !== 'string') return;
+        const client: AgentInfo = {
+          id: String(c.id).slice(0, 64),
+          name: String(c.name).slice(0, 128),
+          connectedAt: typeof c.connectedAt === 'string' ? c.connectedAt : '',
+          lastHeartbeat: typeof c.lastHeartbeat === 'string' ? c.lastHeartbeat : '',
+          remoteAddr: typeof c.remoteAddr === 'string' ? c.remoteAddr : '',
+        };
         agents.update((list) => {
           if (!list.find((a) => a.id === client.id)) {
             return [...list, client];
@@ -50,12 +59,14 @@ export async function initEventListeners(): Promise<void> {
         });
         addEventLog('agent_connected', `Agent 已连接: ${client.name}`);
       } else if (eventType === 'agent_disconnected') {
-        const clientId = data.client_id as string;
+        const clientId = typeof data.client_id === 'string' ? data.client_id : '';
+        if (!clientId) return;
         agents.update((list) => list.filter((a) => a.id !== clientId));
         addEventLog('agent_disconnected', `Agent 已断开: ${clientId.slice(0, 8)}...`);
       } else if (eventType === 'agent_name_updated') {
-        const clientId = data.client_id as string;
-        const newName = data.name as string;
+        const clientId = typeof data.client_id === 'string' ? data.client_id : '';
+        const newName = typeof data.name === 'string' ? data.name : '';
+        if (!clientId || !newName) return;
         agents.update((list) => list.map((a) => a.id === clientId ? { ...a, name: newName } : a));
         addEventLog('agent_name_updated', `Agent 名称更新: ${newName}`);
       } else if (eventType === 'message_received') {

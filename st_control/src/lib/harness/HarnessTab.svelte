@@ -13,6 +13,7 @@
   import { errText } from "../format";
   import { harnessApi } from "./services/ipc";
   import { llmApi } from "../llm/services/ipc";
+  import { getSandbox } from "./services/sandbox";
   import type { LlmConfig, AiRole, AgentPlugin } from "../llm/types";
   import { composeSystemPrompt } from "../llm/roleUtils";
   import type {
@@ -52,8 +53,9 @@
   import MessageBody from "../llm/components/MessageBody.svelte";
   import {
     buildSpeechAttempts,
-    plainTextForSpeech,
     blobToWav16kMono,
+    splitForSpeech,
+    delay,
   } from "../llm/services/voice";
   import { playTtsAudio, stopTtsPlayer, ttsDataUrl, ttsPlayer } from "../llm/services/ttsPlayer.svelte";
   import {
@@ -446,6 +448,9 @@
   // ─── 语音（TTS 朗读 + STT 输入） ───
   let speakingIdx = $state<number | null>(null);
   let voiceStatus = $state("");
+  // ─── 语音配置（音色 / 语速）───
+  let voiceName = $state("");        // TTS 音色（alloy/echo/nova 等；空 = 跟随默认）
+  let voiceSpeed = $state(1.2);      // TTS 语速（0.5 ~ 2.0，默认 1.2 偏快）
   let micStream: MediaStream | null = null;
 
   const activeSession = $derived(sessions.find((s) => s.id === activeId) ?? null);
@@ -1365,6 +1370,11 @@
   // ─── 设置持久化（最近使用的提供方/模型；合并保留 guard/preset 配置） ───
   let currentSettings = $state<HarnessSettings>({ last_provider_id: "", last_model: "" });
 
+  /** 持久化语音配置到 Harness 设置 */
+  function persistVoiceConfig() {
+    harnessApi.saveSettings({ ...currentSettings, voice_name: voiceName, voice_speed: voiceSpeed }).catch(() => {});
+  }
+  
   function persistSelection() {
     if (!providerId) return;
     currentSettings = {
@@ -1381,11 +1391,21 @@
     const p = providers.find((x) => x.id === id);
     modelId = p?.default_model ?? p?.models[0] ?? "";
     persistSelection();
+    // 稍等后端设置保存完成后刷新上下文占用（避免竞态读取旧模型窗口）
+    if (activeId) {
+      const sid = activeId;
+      setTimeout(() => loadContextMeter(sid).catch(() => {}), 150);
+    }
   }
 
   function seatModelChange(model: string) {
     modelId = model;
     persistSelection();
+    // 稍等后端设置保存完成后刷新上下文占用（避免竞态读取旧模型窗口）
+    if (activeId) {
+      const sid = activeId;
+      setTimeout(() => loadContextMeter(sid).catch(() => {}), 150);
+    }
   }
 
   // ─── 设置 / 钩子 / 预设 ───
@@ -1533,7 +1553,10 @@
       voiceStatus = "";
       return;
     }
-    const text = plainTextForSpeech(m.content);
+    // 分段朗读：按句子切分，逐句合成 + 句间自然停顿，更接近真人
+    const baseSpeed = voiceSpeed || 1.2;
+    const segments = splitForSpeech(m.content, baseSpeed);
+    if (segments.length === 0) return;
     const attempts = buildSpeechAttempts(
       { provider_id: providerId, model: modelId },
       providers,
@@ -1542,16 +1565,26 @@
     for (const a of attempts) {
       if (!a.provider_id || !a.model) continue;
       try {
-        const res = await llmApi.generateSpeech({
-          provider_id: a.provider_id,
-          model: a.model,
-          input: text,
-          voice: "",
-          response_format: "mp3",
-          speed: 1,
-        });
         speakingIdx = i;
-        await playTtsAudio(ttsDataUrl(res), i);
+        for (let s = 0; s < segments.length; s++) {
+          const seg = segments[s];
+          // 第一句（s===0）不检查：此时 ttsPlayer.speaking 尚未置 true；
+          // 后续句子若已被 stopTtsPlayer 停止（speaking=false）则中断
+          if (s > 0 && !ttsPlayer.speaking) break;
+          const res = await llmApi.generateSpeech({
+            provider_id: a.provider_id,
+            model: a.model,
+            input: seg.text,
+            voice: voiceName || undefined,
+            response_format: "mp3",
+            speed: seg.speed,
+          });
+          await playTtsAudio(ttsDataUrl(res), i);
+          // 句间停顿（最后一句不再停）
+          if (s < segments.length - 1 && ttsPlayer.speaking && seg.pauseMs > 0) {
+            await delay(seg.pauseMs);
+          }
+        }
         speakingIdx = null;
         return;
       } catch (e) {
@@ -1560,7 +1593,7 @@
     }
     // 全部提供方失败 → Windows SAPI 系统语音兜底（零配置）
     try {
-      const res = await llmApi.synthesizeNativeSpeech(text, -2);
+      const res = await llmApi.synthesizeNativeSpeech(m.content, -2);
       speakingIdx = i;
       await playTtsAudio(ttsDataUrl(res), i, { viaNative: true });
       speakingIdx = null;
@@ -1736,6 +1769,51 @@
     }
   }
 
+  // ── 沙箱执行器（隔离模型生成代码，防止访问全局对象/Tauri IPC）──
+  // 原 new Function 方案允许代码访问 window/document/fetch/Tauri IPC，
+  // 模型通过 prompt injection 可读取 config.json 密钥、调用任意 IPC。
+  // 现在使用 sandbox iframe + postMessage 隔离执行。
+  const sandbox = getSandbox();
+
+  // 沙箱工具调用桥：代码请求调用 Harness 工具时转发给后端
+  sandbox.onToolCall = async (call) => {
+    // 从当前活跃会话获取 session_id（工具调用需要）
+    const sid = activeSession?.id;
+    if (!sid) {
+      sandbox.sendCallResult({ id: call.id, ok: false, error: "无活跃会话，无法调用工具" });
+      return;
+    }
+    try {
+      const r = await harnessApi.executeToolNoLock(
+        sid,
+        call.toolName,
+        JSON.stringify(call.toolArgs ?? {}),
+      );
+      sandbox.sendCallResult({
+        id: call.id,
+        ok: r?.ok !== false,
+        result: r?.ok === false ? { __err: r.result } : r?.result,
+      });
+    } catch (e: unknown) {
+      sandbox.sendCallResult({ id: call.id, ok: false, error: errText(e) || String(e) });
+    }
+  };
+
+  // 沙箱 agent 调用桥：代码请求派生子代理时转发给后端
+  sandbox.onAgentCall = async (call) => {
+    const sid = activeSession?.id;
+    if (!sid) {
+      sandbox.sendCallResult({ id: call.id, ok: false, error: "无活跃会话，无法派生子代理" });
+      return;
+    }
+    try {
+      const result = await harnessApi.workflowAgent(sid, call.prompt);
+      sandbox.sendCallResult({ id: call.id, ok: true, result });
+    } catch (e: unknown) {
+      sandbox.sendCallResult({ id: call.id, ok: false, error: errText(e) || String(e) });
+    }
+  };
+
   /** 前端沙箱执行模型编写的代码（插件工具 / run_code），回传结果给后端 */
   async function execPluginTool(payload: {
     id: string;
@@ -1746,50 +1824,14 @@
   }) {
     let ok = true;
     let result = "";
-    const logs: string[] = [];
     try {
-      // B23：ctx.tools——脚本内可调用其它 Harness 工具（经会话派发，
-      // 遵守审批/沙箱/预设作用域）。用无锁 IPC：外层 run_code/插件派发
-      // 已持有会话锁，嵌套调用再取锁会死锁
-      const tools =
-        payload.session_id
-          ? new Proxy(
-              {},
-              {
-                get: (_t, toolName: string) =>
-                  async (toolArgs?: unknown) => {
-                    const r = await harnessApi.executeToolNoLock(
-                      payload.session_id!,
-                      toolName,
-                      JSON.stringify(toolArgs ?? {}),
-                    );
-                    return r?.ok === false ? { __err: r.result } : r?.result;
-                  },
-              },
-            )
-          : undefined;
-      const ctx = {
-        fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
-        log: (...xs: unknown[]) => {
-          logs.push(xs.map(String).join(" "));
-        },
-        tools,
-      };
       const argsObj = JSON.parse(payload.args || "{}");
-      const fn = new Function(
-        "args",
-        "ctx",
-        `"use strict";\nreturn (async function(args, ctx) {\n${payload.code}\n})(args, ctx);`,
-      );
-      const out = await fn(argsObj, ctx);
-      const logPart = logs.length ? `[日志]\n${logs.join("\n")}\n\n` : "";
-      result =
-        logPart +
-        (typeof out === "string"
-          ? out
-          : out === undefined
-            ? "（工具无返回值）"
-            : JSON.stringify(out));
+      result = await sandbox.execute(payload.code, argsObj, {
+        hasTools: !!payload.session_id,
+        hasAgent: false,
+        hasParallel: false,
+        hasPipeline: false,
+      });
     } catch (e: unknown) {
       ok = false;
       result = errText(e) || String(e);
@@ -1811,48 +1853,14 @@
   }) {
     let ok = true;
     let result = "";
-    const logs: string[] = [];
     try {
-      const agent = async (prompt: string) => {
-        if (!payload.session_id) throw new Error("缺少 session_id，无法派生子代理");
-        return await harnessApi.workflowAgent(payload.session_id, String(prompt));
-      };
-      const parallel = async (thunks: Array<() => Promise<unknown>>) =>
-        await Promise.all(thunks.map((t) => t()));
-      const pipeline = async (
-        items: unknown[],
-        ...stages: Array<(v: unknown) => Promise<unknown>>
-      ) => {
-        let cur = items;
-        for (const stage of stages) {
-          cur = await Promise.all(cur.map((x) => stage(x)));
-        }
-        return cur;
-      };
-      const ctx = {
-        fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
-        log: (...xs: unknown[]) => {
-          logs.push(xs.map(String).join(" "));
-        },
-        agent,
-        parallel,
-        pipeline,
-      };
       const argsObj = JSON.parse(payload.args || "{}");
-      const fn = new Function(
-        "args",
-        "ctx",
-        `"use strict";\nreturn (async function(args, ctx) {\n${payload.code}\n})(args, ctx);`,
-      );
-      const out = await fn(argsObj, ctx);
-      const logPart = logs.length ? `[日志]\n${logs.join("\n")}\n\n` : "";
-      result =
-        logPart +
-        (typeof out === "string"
-          ? out
-          : out === undefined
-            ? "（工具无返回值）"
-            : JSON.stringify(out));
+      result = await sandbox.execute(payload.code, argsObj, {
+        hasTools: false,
+        hasAgent: !!payload.session_id,
+        hasParallel: true,
+        hasPipeline: true,
+      });
     } catch (e: unknown) {
       ok = false;
       result = errText(e) || String(e);
@@ -2237,7 +2245,12 @@
         busy_enter: s.busy_enter ?? null,
         reasoning_effort: s.reasoning_effort ?? null,
         web_search_provider: s.web_search_provider ?? null,
+        voice_name: s.voice_name ?? null,
+        voice_speed: s.voice_speed ?? null,
       };
+      // 恢复语音配置（音色 / 语速）
+      voiceName = s.voice_name ?? "";
+      voiceSpeed = s.voice_speed ?? 1.2;
       settingsForm = { ...currentSettings };
       busyEnter = (s.busy_enter ?? "queue") === "steer" ? "steer" : "queue";
       effortId = s.reasoning_effort ?? "";
@@ -2736,6 +2749,8 @@
       unlistenHook?.();
       unlistenToolExec?.();
       unlistenWfExec?.();
+      // 释放沙箱 iframe（隔离模型代码执行环境）
+      sandbox.destroy();
       // 组件卸载：释放录音与播报资源
       releaseVoiceRecorder();
       stopTtsPlayer();
@@ -3363,6 +3378,34 @@
                   const v = (e.currentTarget as HTMLInputElement).value;
                   settingsForm.context_budget_tokens = v === "" ? null : Number(v);
                 }}
+              />
+            </div>
+            <div class="hns-field">
+              <span class="hns-field-label">朗读音色（TTS voice）</span>
+              <select
+                aria-label="朗读音色"
+                value={voiceName}
+                onchange={(e) => { voiceName = (e.currentTarget as HTMLSelectElement).value; persistVoiceConfig(); }}
+              >
+                <option value="">跟随默认</option>
+                <option value="alloy">alloy（中性）</option>
+                <option value="echo">echo（沉稳）</option>
+                <option value="fable">fable（柔和）</option>
+                <option value="onyx">onyx（深沉）</option>
+                <option value="nova">nova（明亮）</option>
+                <option value="shimmer">shimmer（轻盈）</option>
+              </select>
+            </div>
+            <div class="hns-field">
+              <span class="hns-field-label">朗读语速：{voiceSpeed.toFixed(1)}x</span>
+              <input
+                type="range"
+                min="0.5"
+                max="2"
+                step="0.1"
+                aria-label="朗读语速"
+                value={voiceSpeed}
+                oninput={(e) => { voiceSpeed = Number((e.currentTarget as HTMLInputElement).value); persistVoiceConfig(); }}
               />
             </div>
             <div class="hns-field-actions">
