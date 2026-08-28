@@ -124,6 +124,8 @@ pub(crate) const MAX_ZIP_ENTRY_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 pub(crate) const MAX_ZIP_ENTRIES: usize = 4096;
 /// 解压后总大小上限（防御海量条目合计超大）
 pub(crate) const MAX_ZIP_TOTAL_BYTES: usize = 256 * 1024 * 1024; // 256 MB
+/// 文本类文件解析大小上限（防御超大文件全量转 String 导致内存溢出）
+pub(crate) const MAX_TEXT_PARSE_BYTES: usize = 64 * 1024 * 1024; // 64 MB
 
 /// 读取 zip 条目为文本，带解压大小上限；超限视为压缩炸弹拒绝。
 pub(crate) fn read_zip_entry_text<R: std::io::Read>(
@@ -208,6 +210,13 @@ pub fn parse_document(file_type: &str, data: &[u8]) -> Result<ParsedDoc, String>
         | "java" | "c" | "cpp" | "h" | "hpp" | "rb" | "sh" | "sql" | "xml" | "yaml" | "yml"
         | "toml" | "ini" | "cfg" | "env" | "dockerfile" | "makefile" | "html" | "css" | "scss"
         | "less" => {
+            if data.len() > MAX_TEXT_PARSE_BYTES {
+                return Err(format!(
+                    "文本类文件过大（{}MB，上限 {}MB），请拆分后上传",
+                    data.len() / 1024 / 1024,
+                    MAX_TEXT_PARSE_BYTES / 1024 / 1024
+                ));
+            }
             let text = String::from_utf8_lossy(data).to_string();
             Ok(split_into_sections(&text))
         }
@@ -405,6 +414,5 @@ pub fn save_chunks(
     Ok(ids)
 }
 
-#[cfg(test)]
 #[cfg(test)]
 mod tests;

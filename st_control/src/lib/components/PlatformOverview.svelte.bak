@@ -1,0 +1,1211 @@
+<script lang="ts">
+  // ============================================================
+  // 首页 — 产品官网式落地页（Landing · 动效版）
+  // 定位：像一款产品的官方网站首页那样介绍「ST 控制台」是什么、
+  // 解决什么问题、有哪些能力，并保留真实运行状态（不虚构指标）。
+  // 版式借鉴 LifeArchiveProject/WeChatDataAnalysis 官网的编辑部
+  // 叙事；动效（流星 / 跑马灯 / 边框光束 / 火花标题 / 卡片光斑 /
+  // 渐变按钮 / 揭示入场）来自 fancy-ui-svelte，颜色全走主题 token。
+  // ============================================================
+  import { serverStatus, agents, eventLog } from '../communication/server';
+  import LiveNumber from './fancy/LiveNumber.svelte';
+  import {
+    Marquee,
+    Meteors,
+    SparklesText,
+    BorderBeam,
+    BoxReveal,
+    CardSpotlight,
+    GradientButton,
+    TextGenerateEffect,
+  } from 'fancy-ui-svelte';
+  import MessagesSquareIcon from '@lucide/svelte/icons/messages-square';
+  import BotIcon from '@lucide/svelte/icons/bot';
+  import BrainCircuitIcon from '@lucide/svelte/icons/brain-circuit';
+  import WorkflowIcon from '@lucide/svelte/icons/workflow';
+  import MessageCircleIcon from '@lucide/svelte/icons/message-circle';
+  import LibraryIcon from '@lucide/svelte/icons/library';
+  import GaugeIcon from '@lucide/svelte/icons/gauge';
+  import DatabaseIcon from '@lucide/svelte/icons/database';
+  import ScanTextIcon from '@lucide/svelte/icons/scan-text';
+  import ArrowRightIcon from '@lucide/svelte/icons/arrow-right';
+  import ArrowDownIcon from '@lucide/svelte/icons/arrow-down';
+  import ShieldCheckIcon from '@lucide/svelte/icons/shield-check';
+  import LayersIcon from '@lucide/svelte/icons/layers';
+  import ActivityIcon from '@lucide/svelte/icons/activity';
+  import PlugZapIcon from '@lucide/svelte/icons/plug-zap';
+
+  let { statusText, statusCls, onNavigate }: {
+    statusText: string;
+    statusCls: string;
+    /** 跳转到指定功能面板（tab） */
+    onNavigate: (tab: string) => void;
+  } = $props();
+
+  const srvStatus = $derived($serverStatus);
+  const agentList = $derived($agents);
+  const eventList = $derived($eventLog);
+
+  /** 平滑滚动到功能全景章节（在 .po-root 滚动容器内） */
+  function scrollToFeatures() {
+    document.getElementById('po-features')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  // ── 宣言（产品价值主张，基于真实架构提炼，不虚构指标） ──
+  const MANIFESTO: { no: string; title: string; desc: string; icon: typeof BotIcon }[] = [
+    {
+      no: '01',
+      title: '本地优先',
+      desc: '微信密钥与聊天数据全程留在这台电脑：本地解密、本地入库、本地分析，0 字节出网。',
+      icon: ShieldCheckIcon,
+    },
+    {
+      no: '02',
+      title: '一体化',
+      desc: '从数据到智能到执行——微信档案、大模型、知识库、自动化与消息通道，一个界面全部掌控。',
+      icon: LayersIcon,
+    },
+    {
+      no: '03',
+      title: '真实可见',
+      desc: '状态实时刷新、指标来自真实运行数据；每一块面板都是插在工作台上的仪表，扫一眼即知。',
+      icon: ActivityIcon,
+    },
+  ];
+
+  // ── 功能全景（官网式编号章节；12 模块已合并为 9：AI 角色/AI 文案并入大模型，
+  //    消息通道并入自动化，数据看板并入首页系统监控） ──
+  const FEATURES: {
+    tab: string;
+    name: string;
+    slogan: string;
+    points: string[];
+    icon: typeof BotIcon;
+  }[] = [
+    {
+      tab: 'wechat', name: '微信数据', slogan: '本地解密，完整掌控你的微信',
+      points: [
+        '朋友圈洞察：活跃作者排行 + 月度热力',
+        '撤回消息记录：谁撤回了什么，可查可导出',
+        '存储空间分析：会话/发送者排行 + 大文件清单',
+        '通讯录全库搜索、群成员按群分组、资料卡直达',
+        '消息构成画像 / 每日消息日历 / 全局消息搜索',
+        '社交关系图谱：群友圈子 / 群聊网络双模式',
+      ],
+      icon: MessageCircleIcon,
+    },
+    {
+      tab: 'kb', name: '知识库', slogan: '个人 RAG 问答中枢',
+      points: ['多格式文档导入与解析', '向量 + BM25 混合检索问答', 'Wiki 知识图谱与自动提炼'],
+      icon: LibraryIcon,
+    },
+    {
+      tab: 'llm', name: '大模型', slogan: '多提供商统一接入 · 含 AI 角色与文案',
+      points: ['OpenAI / Azure / Ollama / 自定义', '用量与成本管控', '语音合成 / 转写 / 图像视频生成', 'AI 角色：提示词与能力标签管理', 'AI 文案：场景模板一键生成'],
+      icon: BrainCircuitIcon,
+    },
+    {
+      tab: 'harness', name: 'AI 对话', slogan: '智能体 + 角色对话，一个界面',
+      points: ['流式输出与语音播报', '录音输入与打断监听', 'AI 角色注入与图表生成', '工具调用与治理审批'],
+      icon: MessagesSquareIcon,
+    },
+    {
+      tab: 'agents', name: '智能体', slogan: '远程客户端协同',
+      points: ['st_agent 安全连接', '任务下发与状态实时监控'],
+      icon: BotIcon,
+    },
+    {
+      tab: 'automation', name: '自动化', slogan: '消息驱动的规则引擎 · 含消息通道',
+      points: ['实时消息监控规则', 'AI 字段提取与自动回复', '微信 iLink / QQ 官方机器人通道', '回复机器人：待回复队列自动发送'],
+      icon: WorkflowIcon,
+    },
+    {
+      tab: 'data_dashboard', name: '系统监控', slogan: '首页实时性能监控',
+      points: ['CPU / 内存 / 磁盘 / GPU / 网络', '实时曲线与帧率'],
+      icon: GaugeIcon,
+    },
+    {
+      tab: 'db_manager', name: '数据库', slogan: 'SQLite 可视化工作台',
+      points: ['多库浏览与 SQL 执行', '表详情 / 完整性 / 统计', '备份恢复与 CSV 导出'],
+      icon: DatabaseIcon,
+    },
+    {
+      tab: 'ocr', name: '图文识别', slogan: '批量 OCR 工作流',
+      points: ['文本 / 表格 / 二维码识别', '批量任务与统计', '结果导出'],
+      icon: ScanTextIcon,
+    },
+  ];
+
+  // ── 跑马灯条目 ──
+  const MARQUEE_NAMES = $derived(FEATURES.map((f) => f.name));
+  const MARQUEE_SLOGANS = $derived(FEATURES.map((f) => `${f.name} · ${f.slogan}`));
+
+  // ── 三步工作流（映射真实使用路径） ──
+  const FLOW: { step: string; title: string; desc: string; tags: string[] }[] = [
+    {
+      step: 'STEP 01',
+      title: '连接你的数据',
+      desc: '微信扫码绑定，本地解密全量留存；QQ 官方机器人填入 AppID + Secret 即通，网关自动收集会话目标。',
+      tags: ['微信 iLink', 'QQ 官方机器人', '本地解密'],
+    },
+    {
+      step: 'STEP 02',
+      title: '注入智能',
+      desc: '接入 DeepSeek / OpenAI / Ollama 等模型，导入文档搭建个人知识库，用 AI 角色编排专属助手。',
+      tags: ['多模型', 'RAG 问答', 'AI 角色'],
+    },
+    {
+      step: 'STEP 03',
+      title: '交给自动化',
+      desc: '消息规则 + AI 字段提取 + 自动回复：微信与 QQ 双向消息实时入流水线，智能体远程执行任务。',
+      tags: ['规则引擎', '自动回复', '智能体'],
+    },
+  ];
+</script>
+
+<div class="po-root">
+  <!-- ═══════════ HERO：品牌金句 + 实时状态 ═══════════ -->
+  <header class="po-hero">
+    <div class="po-hero-main">
+      <div class="po-hero-fx" aria-hidden="true">
+        <div class="po-aurora po-aurora-a"></div>
+        <div class="po-aurora po-aurora-b"></div>
+        <Meteors count={22} class="bg-[var(--brand)]" />
+        <BorderBeam colorFrom="#22d3ee" colorTo="#0ea5e9" size={380} duration={8} borderWidth={1.5} anchor={90} />
+      </div>
+      <div class="po-hero-inner">
+        <div class="po-brand-row">
+          <span class="po-logo">ST</span>
+          <span class="po-name">ST 控制台</span>
+          <span class="po-edition">v1.0 · 本地优先</span>
+        </div>
+        <p class="po-eyebrow">PERSONAL CONSOLE — 微信 × 大模型 × 自动化</p>
+        <h1 class="po-headline">
+          <TextGenerateEffect
+            words="你的数据、你的 AI、你的自动化，"
+            filter={true}
+            duration={0.6}
+            delay={0.1}
+            stagger={220}
+            class="po-tge"
+          /><br />
+          <SparklesText
+            text="一块工作台，全部接管。"
+            sparklesCount={10}
+            colors={{ first: '#22d3ee', second: '#7dd3fc' }}
+            class="po-spark"
+          />
+        </h1>
+        <BoxReveal color="var(--brand)" duration={0.55} delay={0.15} class="po-lead-wrap">
+          <p class="po-lead">
+            ST 控制台是一体化个人控制台：微信聊天记录本地解密、留存与洞察，多提供商大模型
+            （含 AI 角色与文案）、知识库 RAG 问答，消息驱动的自动化规则引擎与微信 / QQ
+            双通道消息机器人——9 大模块一个界面。密钥与数据全程不出本机。
+          </p>
+        </BoxReveal>
+        <div class="po-cta">
+          <GradientButton
+            colors={['#22d3ee', '#38bdf8', '#0ea5e9', '#22d3ee']}
+            duration={3200}
+            borderRadius={10}
+            borderWidth={2.5}
+            blur={6}
+            bgColor="var(--card)"
+            class="po-grad-btn shadow-[0_0_26px_-8px_#22d3ee]"
+            onclick={() => onNavigate('wechat')}
+          >
+            进入工作台
+            <ArrowRightIcon size={15} class="po-grad-icon" />
+          </GradientButton>
+          <button type="button" class="po-cta-ghost" onclick={scrollToFeatures}>
+            查看功能全景
+            <ArrowDownIcon size={14} />
+          </button>
+        </div>
+        <div class="po-hero-meta">
+          <span>9 大能力模块</span><i></i>
+          <span>微信 / QQ 双通道</span><i></i>
+          <span>0 字节出网</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="po-live card">
+      <BorderBeam colorFrom="#22d3ee" colorTo="#7dd3fc" size={220} duration={14} borderWidth={1.5} anchor={90} />
+      <div class="po-live-hd">
+        <span class="po-live-label">LIVE STATUS — 实时状态</span>
+        <span class="status-dot {statusCls}"></span>
+      </div>
+      <div class="po-live-text">{statusText}<span class="po-live-port">端口 {srvStatus.port || '--'}</span></div>
+      <div class="po-meters">
+        <div class="po-meter">
+          <span class="po-meter-label">Agent 在线</span>
+          <span class="po-meter-value"><LiveNumber value={srvStatus.agentCount} duration={700} /></span>
+        </div>
+        <div class="po-meter">
+          <span class="po-meter-label">消息总量</span>
+          <span class="po-meter-value"><LiveNumber value={srvStatus.messageCount} duration={700} /></span>
+        </div>
+        <div class="po-meter">
+          <span class="po-meter-label">已连接节点</span>
+          <span class="po-meter-value"><LiveNumber value={agentList.length} duration={700} /></span>
+        </div>
+      </div>
+      {#if agentList.length === 0}
+        <p class="po-live-hint">⚡ 暂无 Agent 接入 —— 安装 st_agent 客户端即可远程下发任务</p>
+      {/if}
+    </div>
+  </header>
+
+  <!-- ═══════════ 跑马灯：模块滚动带 ═══════════ -->
+  <div class="po-marquee-band" aria-hidden="true">
+    <Marquee repeat={3} pauseOnHover={true}>
+      {#each MARQUEE_NAMES as name (name)}
+        <span class="po-mq-item">
+          {name}<i class="po-mq-dot">✦</i>
+        </span>
+      {/each}
+    </Marquee>
+    <Marquee repeat={3} reverse pauseOnHover={true}>
+      {#each MARQUEE_SLOGANS as s (s)}
+        <span class="po-mq-item po-mq-slogan">
+          {s}<i class="po-mq-dot">✦</i>
+        </span>
+      {/each}
+    </Marquee>
+  </div>
+
+  <!-- ═══════════ 宣言：为什么是它 ═══════════ -->
+  <section class="po-manifesto">
+    {#each MANIFESTO as m (m.no)}
+      <div class="po-mani card">
+        <span class="po-mani-no">{m.no}</span>
+        <span class="po-mani-icon"><m.icon size={16} /></span>
+        <div class="po-mani-title">{m.title}</div>
+        <p class="po-mani-desc">{m.desc}</p>
+      </div>
+    {/each}
+  </section>
+
+  <!-- ═══════════ 功能全景：编号章节 ═══════════ -->
+  <section class="po-section" id="po-features">
+    <div class="po-section-hd">
+      <div>
+        <p class="po-section-eyebrow">FEATURES — 功能全景</p>
+        <BoxReveal color="var(--brand)" duration={0.5} delay={0.1}>
+          <h2 class="po-section-title">从数据到智能到执行，一步不缺</h2>
+        </BoxReveal>
+      </div>
+      <span class="po-section-sub">{FEATURES.length} 大能力模块 · 全部本地运行 · 点击卡片直达</span>
+    </div>
+    <div class="po-grid">
+      {#each FEATURES as f, i (f.tab)}
+        <CardSpotlight
+          class="po-spot"
+          gradientColor="var(--brand)"
+          gradientOpacity={0.22}
+          gradientSize={280}
+        >
+          <button
+            type="button"
+            class="po-card card"
+            onclick={() => onNavigate(f.tab)}
+            title="进入{f.name}"
+          >
+            <span class="po-card-index">{String(i + 1).padStart(2, '0')}</span>
+            <div class="po-card-top">
+              <span class="po-card-icon"><f.icon size={16} /></span>
+              <span class="po-card-name">{f.name}</span>
+            </div>
+            <div class="po-card-slogan">{f.slogan}</div>
+            <ul class="po-card-points">
+              {#each f.points as pt (pt)}
+                <li>{pt}</li>
+              {/each}
+            </ul>
+            <span class="po-card-go">进入 <ArrowRightIcon size={13} /></span>
+          </button>
+        </CardSpotlight>
+      {/each}
+    </div>
+  </section>
+
+  <!-- ═══════════ 工作流：三步 ═══════════ -->
+  <section class="po-flow">
+    <div class="po-section-hd">
+      <div>
+        <p class="po-section-eyebrow">HOW IT WORKS — 三步上手</p>
+        <BoxReveal color="var(--brand)" duration={0.5} delay={0.1}>
+          <h2 class="po-section-title">接上数据，注入智能，交给它自动运行</h2>
+        </BoxReveal>
+      </div>
+    </div>
+    <div class="po-flow-grid">
+      {#each FLOW as s, i (s.step)}
+        <div class="po-step card">
+          <div class="po-step-top">
+            <span class="po-step-no">{s.step}</span>
+            {#if i < FLOW.length - 1}
+              <span class="po-step-line"></span>
+            {/if}
+          </div>
+          <h3 class="po-step-title">{s.title}</h3>
+          <p class="po-step-desc">{s.desc}</p>
+          <div class="po-step-tags">
+            {#each s.tags as t (t)}
+              <span class="po-tag">{t}</span>
+            {/each}
+          </div>
+        </div>
+      {/each}
+    </div>
+  </section>
+
+  <!-- ═══════════ 运行状态：真实数据底座 ═══════════ -->
+  <section class="po-status-cols">
+    <div class="po-col card">
+      <div class="po-col-hd">
+        <span class="po-col-title">Agent 连接</span>
+        <span class="po-col-count">{agentList.length} 个</span>
+      </div>
+      <div class="po-col-bd">
+        {#if agentList.length === 0}
+          <div class="po-empty">暂无 Agent 连接</div>
+        {:else}
+          {#each agentList as a}
+            <div class="po-agent">
+              <span class="po-agent-dot"></span>
+              <div class="po-agent-main">
+                <span class="po-agent-name">{a.name || a.id}</span>
+                <span class="po-agent-meta">{a.remoteAddr}</span>
+              </div>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    </div>
+    <div class="po-col card">
+      <div class="po-col-hd">
+        <span class="po-col-title">最近事件</span>
+        <span class="po-col-count">{eventList.length} 条</span>
+      </div>
+      <div class="po-col-bd">
+        {#if eventList.length === 0}
+          <div class="po-empty">暂无事件记录</div>
+        {:else}
+          {#each eventList.slice(0, 12) as ev}
+            <div class="po-event">
+              <span class="po-event-time">{ev.time}</span>
+              <span class="po-event-name">{ev.event}</span>
+              <span class="po-event-detail">{ev.detail}</span>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    </div>
+  </section>
+
+  <!-- ═══════════ 收尾：隐私主张 + CTA ═══════════ -->
+  <footer class="po-footer">
+    <div class="po-footer-main">
+      <PlugZapIcon size={16} class="po-footer-icon" />
+      <p class="po-footer-slogan">
+        把数据与智能，<span class="po-footer-accent">握回自己手里</span>
+      </p>
+      <p class="po-footer-note">密钥与数据全程不出本机 · 0 字节出网 · 仅限个人合法使用 · 数据请谨慎保管</p>
+    </div>
+    <GradientButton
+      colors={['#22d3ee', '#38bdf8', '#0ea5e9', '#22d3ee']}
+      duration={3200}
+      borderRadius={10}
+      borderWidth={2.5}
+      blur={6}
+      bgColor="var(--card)"
+      class="po-grad-btn shadow-[0_0_26px_-8px_#22d3ee]"
+      onclick={() => onNavigate('wechat')}
+    >
+      开始使用
+      <ArrowRightIcon size={15} class="po-grad-icon" />
+    </GradientButton>
+  </footer>
+</div>
+
+<style>
+  .po-root {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    height: 100%;
+    overflow-y: auto;
+    padding: 2px;
+    scroll-behavior: smooth;
+  }
+  /* 子区块保持自然高度：flex 列默认 flex-shrink:1 会在面板高度不足时
+     把各区块等比压扁（跑马灯被压到只剩 padding、内容被裁切）——
+     改为不收缩，由根容器滚动呈现 */
+  .po-root > * {
+    flex: none;
+  }
+
+  /* ── Hero ── */
+  .po-hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 300px;
+    gap: 20px;
+    align-items: stretch;
+  }
+  .po-hero-main {
+    padding: 26px 26px 22px;
+    border-radius: 16px;
+    background: linear-gradient(140deg, color-mix(in oklab, var(--brand) 10%, var(--card)), var(--card) 62%);
+    border: 1px solid var(--border);
+    position: relative;
+    overflow: hidden;
+  }
+  .po-hero-fx {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+  /* 极光光斑：两团模糊渐变光缓慢漂移 */
+  .po-aurora {
+    position: absolute;
+    width: 420px;
+    height: 420px;
+    border-radius: 50%;
+    filter: blur(70px);
+    opacity: 0.72;
+    background: radial-gradient(circle, color-mix(in oklab, var(--brand) 48%, transparent), transparent 70%);
+    animation: poAurora 16s ease-in-out infinite alternate;
+  }
+  .po-aurora-a { top: -140px; left: 18%; }
+  .po-aurora-b {
+    top: 40px;
+    right: -120px;
+    width: 340px;
+    height: 340px;
+    background: radial-gradient(circle, color-mix(in oklab, var(--brand) 26%, transparent), transparent 70%);
+    animation-duration: 21s;
+    animation-delay: -6s;
+  }
+  @keyframes poAurora {
+    0% { transform: translate(0, 0) scale(1); }
+    50% { transform: translate(60px, 34px) scale(1.12); }
+    100% { transform: translate(-40px, 22px) scale(0.96); }
+  }
+  .po-hero-inner {
+    position: relative;
+    z-index: 1;
+  }
+  .po-brand-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .po-logo {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border-radius: 9px;
+    background: var(--brand);
+    color: color-mix(in oklab, var(--brand) 18%, #000);
+    font-weight: 800;
+    font-size: 14px;
+    letter-spacing: 0.5px;
+    box-shadow: 0 0 18px color-mix(in oklab, var(--brand) 55%, transparent);
+  }
+  .po-name {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--foreground);
+  }
+  .po-edition {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--brand);
+    border: 1px solid color-mix(in oklab, var(--brand) 45%, transparent);
+    border-radius: 999px;
+    padding: 1px 9px;
+  }
+  .po-eyebrow {
+    margin: 18px 0 10px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.22em;
+    color: var(--muted-foreground);
+    text-transform: uppercase;
+  }
+  .po-headline {
+    margin: 0;
+    font-size: clamp(24px, 2.6vw, 34px);
+    line-height: 1.24;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    color: var(--foreground);
+  }
+  /* TextGenerateEffect：内联继承标题字号/字重 */
+  :global(.po-tge) {
+    display: inline;
+    font-size: inherit;
+    font-weight: inherit;
+    line-height: inherit;
+    letter-spacing: inherit;
+  }
+  :global(.po-tge > div) {
+    display: inline;
+  }
+  /* 流星增亮：品牌色头部光点 + 渐变拖尾；半透明避免干扰正文 */
+  :global(.po-hero-fx .meteor) {
+    background: var(--brand);
+    width: 2px;
+    height: 2px;
+    opacity: 0.6;
+    box-shadow: 0 0 7px 1px color-mix(in oklab, var(--brand) 85%, transparent);
+  }
+  :global(.po-hero-fx .meteor::before) {
+    background: linear-gradient(90deg, var(--brand), transparent);
+    opacity: 0.7;
+  }
+  /* SparklesText 覆盖：内联继承标题字号/字重，并施加渐变流光文字 */
+  :global(.sparkles-text.po-spark) {
+    display: inline;
+    font-size: inherit;
+    font-weight: inherit;
+    line-height: inherit;
+    letter-spacing: inherit;
+  }
+  :global(.sparkles-text.po-spark > span) {
+    background: linear-gradient(92deg, var(--brand), color-mix(in oklab, var(--brand) 40%, var(--foreground)), var(--brand));
+    background-size: 220% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: poGradientShift 6s linear infinite;
+  }
+  @keyframes poGradientShift {
+    0% { background-position: 0% 50%; }
+    100% { background-position: 220% 50%; }
+  }
+  .po-lead-wrap {
+    margin-top: 14px;
+  }
+  .po-lead {
+    margin: 0;
+    max-width: 680px;
+    font-size: 13px;
+    line-height: 1.85;
+    color: var(--muted-foreground);
+  }
+  .po-cta {
+    margin-top: 18px;
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .po-grad-btn {
+    padding: 0 20px;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--foreground);
+    border: none;
+    gap: 7px;
+  }
+  .po-grad-icon {
+    flex: none;
+  }
+  .po-cta-ghost {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 9px 16px;
+    border-radius: 9px;
+    border: 1px solid var(--border);
+    background: var(--card);
+    color: var(--foreground);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: border-color 0.15s, transform 0.15s, box-shadow 0.15s;
+  }
+  .po-cta-ghost:hover {
+    border-color: color-mix(in oklab, var(--brand) 55%, var(--border));
+    transform: translateY(-1px);
+    box-shadow: 0 0 16px color-mix(in oklab, var(--brand) 30%, transparent);
+  }
+  .po-hero-meta {
+    margin-top: 16px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 11.5px;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+  .po-hero-meta i {
+    width: 3px;
+    height: 3px;
+    border-radius: 50%;
+    background: var(--brand);
+    box-shadow: 0 0 6px var(--brand);
+    flex: none;
+  }
+
+  /* 实时状态卡 */
+  .po-live {
+    padding: 18px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 14px;
+    position: relative;
+    overflow: hidden;
+  }
+  .po-live-hd {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    position: relative;
+    z-index: 1;
+  }
+  .po-live-text,
+  .po-meters,
+  .po-live-hint {
+    position: relative;
+    z-index: 1;
+  }
+  .po-live-hint {
+    margin: -4px 0 0;
+    font-size: 11px;
+    line-height: 1.6;
+    color: var(--muted-foreground);
+  }
+  .po-live-label {
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    color: var(--muted-foreground);
+  }
+  .status-dot {
+    margin-left: auto;
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: #8a93a5;
+    flex: none;
+  }
+  .status-dot.tag-ok { background: #22c55e; box-shadow: 0 0 8px #22c55e; }
+  .status-dot.tag-warn { background: #f5b301; box-shadow: 0 0 8px #f5b301; }
+  .status-dot.tag-danger { background: #ff5f56; box-shadow: 0 0 8px #ff5f56; }
+  .po-live-text {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-size: 17px;
+    font-weight: 800;
+    color: var(--foreground);
+  }
+  .po-live-port {
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+  .po-meters {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+  .po-meter {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 10px 11px;
+    border-radius: 10px;
+    background: var(--muted);
+    transition: box-shadow 0.2s, transform 0.2s;
+  }
+  .po-meter:hover {
+    box-shadow: 0 0 14px color-mix(in oklab, var(--brand) 35%, transparent);
+    transform: translateY(-1px);
+  }
+  .po-meter-label {
+    font-size: 10.5px;
+    color: var(--muted-foreground);
+  }
+  .po-meter-value {
+    font-size: 19px;
+    font-weight: 800;
+    color: var(--foreground);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── 跑马灯 ── */
+  .po-marquee-band {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 2px;
+    border-radius: 13px;
+    border: 1px solid var(--border);
+    background: linear-gradient(120deg, color-mix(in oklab, var(--brand) 7%, var(--card)), var(--card) 55%);
+    overflow: hidden;
+    /* 两端渐隐，滚动带更精致 */
+    mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+    -webkit-mask-image: linear-gradient(90deg, transparent, #000 8%, #000 92%, transparent);
+  }
+  .po-mq-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 14px;
+    flex: none;
+    margin-right: 14px;
+    font-size: 13.5px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    color: var(--foreground);
+  }
+  .po-mq-slogan {
+    font-weight: 600;
+    font-size: 12px;
+    color: var(--muted-foreground);
+  }
+  .po-mq-dot {
+    font-style: normal;
+    font-size: 10px;
+    color: var(--brand);
+    text-shadow: 0 0 8px color-mix(in oklab, var(--brand) 80%, transparent);
+  }
+
+  /* ── 宣言 ── */
+  .po-manifesto {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+  .po-mani {
+    padding: 16px 16px 14px;
+    border-radius: 14px;
+    position: relative;
+    overflow: hidden;
+    transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
+  }
+  .po-mani:hover {
+    transform: translateY(-3px);
+    border-color: color-mix(in oklab, var(--brand) 50%, var(--border));
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.09), 0 0 18px color-mix(in oklab, var(--brand) 18%, transparent);
+  }
+  .po-mani-no {
+    position: absolute;
+    right: 12px;
+    top: 8px;
+    font-size: 34px;
+    font-weight: 800;
+    line-height: 1;
+    color: color-mix(in oklab, var(--brand) 22%, transparent);
+    pointer-events: none;
+  }
+  .po-mani-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    border-radius: 8px;
+    color: var(--brand);
+    background: color-mix(in oklab, var(--brand) 13%, transparent);
+  }
+  .po-mani-title {
+    margin-top: 10px;
+    font-size: 14.5px;
+    font-weight: 800;
+    color: var(--foreground);
+  }
+  .po-mani-desc {
+    margin: 6px 0 0;
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--muted-foreground);
+  }
+
+  /* ── 章节通用 ── */
+  .po-section-hd {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+    flex-wrap: wrap;
+  }
+  .po-section-eyebrow {
+    margin: 0 0 5px;
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.2em;
+    color: var(--muted-foreground);
+    text-transform: uppercase;
+  }
+  .po-section-title {
+    margin: 0;
+    font-size: 19px;
+    font-weight: 800;
+    letter-spacing: 0.2px;
+    color: var(--foreground);
+  }
+  .po-section-sub {
+    font-size: 12px;
+    color: var(--muted-foreground);
+  }
+
+  /* ── 功能全景 ── */
+  .po-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    /* 所有行等高：卡片内容多少不影响高度，整格齐整 */
+    grid-auto-rows: 1fr;
+  }
+  /* CardSpotlight 外壳由子组件渲染，作用域规则打不中——
+     用 :global 中和其硬编码背景，并让内容容器与卡片按钮撑满单元格 */
+  :global(.po-spot) {
+    background: transparent;
+    border: none;
+    border-radius: 13px;
+  }
+  :global(.po-spot .relative) {
+    width: 100%;
+    height: 100%;
+    display: flex;
+  }
+  .po-spot :global(.relative) {
+    width: 100%;
+  }
+  .po-card {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 15px 15px 13px;
+    text-align: left;
+    border-radius: 13px;
+    cursor: pointer;
+    position: relative;
+    overflow: hidden;
+    /* 显式指定前景色：CardSpotlight 外壳带 dark:text-white，
+       浅色主题下（OS 深色 + 应用浅色）会变成白字白卡 */
+    color: var(--foreground);
+    transition: border-color 0.15s, transform 0.15s, box-shadow 0.15s;
+  }
+  /* 悬停扫光 */
+  .po-card::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    background: linear-gradient(115deg, transparent 32%, color-mix(in oklab, var(--brand) 16%, transparent) 50%, transparent 68%);
+    transform: translateX(-110%);
+    transition: transform 0.6s ease;
+  }
+  .po-card:hover::after {
+    transform: translateX(110%);
+  }
+  .po-card:hover {
+    border-color: color-mix(in oklab, var(--brand) 55%, var(--border));
+    transform: translateY(-3px);
+    box-shadow: 0 8px 22px rgb(0 0 0 / 0.09);
+  }
+  .po-card:focus-visible {
+    outline: 2px solid var(--brand);
+    outline-offset: 1px;
+  }
+  .po-card-index {
+    position: absolute;
+    right: 10px;
+    top: 6px;
+    font-size: 30px;
+    font-weight: 800;
+    line-height: 1;
+    color: color-mix(in oklab, var(--brand) 18%, transparent);
+    pointer-events: none;
+    transition: color 0.2s, text-shadow 0.2s;
+  }
+  .po-card:hover .po-card-index {
+    color: color-mix(in oklab, var(--brand) 45%, transparent);
+    text-shadow: 0 0 14px color-mix(in oklab, var(--brand) 55%, transparent);
+  }
+  .po-card-top {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .po-card-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    color: var(--brand);
+    background: color-mix(in oklab, var(--brand) 12%, transparent);
+    flex: none;
+    transition: box-shadow 0.2s, transform 0.2s;
+  }
+  .po-card:hover .po-card-icon {
+    box-shadow: 0 0 14px color-mix(in oklab, var(--brand) 60%, transparent);
+    transform: scale(1.06);
+  }
+  .po-card-name {
+    font-size: 13.5px;
+    font-weight: 800;
+    color: var(--foreground);
+  }
+  .po-card-slogan {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--foreground);
+  }
+  .po-card-points {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+  .po-card-points li {
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--muted-foreground);
+  }
+  .po-card-go {
+    margin-top: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11.5px;
+    font-weight: 700;
+    color: var(--brand);
+    opacity: 0;
+    transform: translateX(-4px);
+    transition: opacity 0.15s, transform 0.15s;
+  }
+  .po-card:hover .po-card-go {
+    opacity: 1;
+    transform: translateX(0);
+  }
+
+  /* ── 工作流 ── */
+  .po-flow-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+  .po-step {
+    padding: 16px;
+    border-radius: 14px;
+    transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
+  }
+  .po-step:hover {
+    transform: translateY(-3px);
+    border-color: color-mix(in oklab, var(--brand) 50%, var(--border));
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.09), 0 0 18px color-mix(in oklab, var(--brand) 18%, transparent);
+  }
+  .po-step-top {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .po-step-no {
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.18em;
+    color: var(--brand);
+    text-shadow: 0 0 10px color-mix(in oklab, var(--brand) 60%, transparent);
+  }
+  .po-step-line {
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, color-mix(in oklab, var(--brand) 45%, transparent), transparent);
+  }
+  .po-step-title {
+    margin: 10px 0 0;
+    font-size: 15px;
+    font-weight: 800;
+    color: var(--foreground);
+  }
+  .po-step-desc {
+    margin: 7px 0 0;
+    font-size: 12px;
+    line-height: 1.7;
+    color: var(--muted-foreground);
+  }
+  .po-step-tags {
+    margin-top: 11px;
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .po-tag {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--brand);
+    border: 1px solid color-mix(in oklab, var(--brand) 35%, transparent);
+    border-radius: 999px;
+    padding: 1px 9px;
+  }
+
+  /* ── 运行状态 ── */
+  .po-status-cols {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+  }
+  .po-col {
+    padding: 14px 16px;
+    border-radius: 13px;
+    min-height: 120px;
+  }
+  .po-col-hd {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .po-col-title {
+    font-size: 13px;
+    font-weight: 800;
+    color: var(--foreground);
+  }
+  .po-col-count {
+    margin-left: auto;
+    font-size: 11.5px;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+  .po-col-bd {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .po-empty {
+    font-size: 12px;
+    color: var(--muted-foreground);
+    padding: 12px 4px;
+  }
+  .po-agent {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 7px 8px;
+    border-radius: 8px;
+  }
+  .po-agent:hover { background: var(--muted); }
+  .po-agent-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #22c55e;
+    box-shadow: 0 0 7px #22c55e;
+    flex: none;
+  }
+  .po-agent-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .po-agent-name {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .po-agent-meta {
+    font-size: 11px;
+    color: var(--muted-foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .po-event {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 5px 8px;
+    border-radius: 6px;
+    font-size: 11.5px;
+  }
+  .po-event:hover { background: var(--muted); }
+  .po-event-time {
+    flex: none;
+    color: var(--muted-foreground);
+    font-variant-numeric: tabular-nums;
+  }
+  .po-event-name {
+    flex: none;
+    font-weight: 600;
+    color: var(--foreground);
+  }
+  .po-event-detail {
+    color: var(--muted-foreground);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* ── 收尾 ── */
+  .po-footer {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding: 20px 22px;
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    background: linear-gradient(140deg, color-mix(in oklab, var(--brand) 8%, var(--card)), var(--card) 60%);
+    position: relative;
+    overflow: hidden;
+  }
+  .po-footer-main {
+    min-width: 0;
+  }
+  .po-footer-icon {
+    color: var(--brand);
+    filter: drop-shadow(0 0 6px color-mix(in oklab, var(--brand) 70%, transparent));
+  }
+  .po-footer-slogan {
+    margin: 6px 0 4px;
+    font-size: 17px;
+    font-weight: 800;
+    color: var(--foreground);
+  }
+  .po-footer-accent {
+    background: linear-gradient(92deg, var(--brand), color-mix(in oklab, var(--brand) 55%, var(--foreground)));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  .po-footer-note {
+    margin: 0;
+    font-size: 11.5px;
+    color: var(--muted-foreground);
+  }
+
+  /* ── 窄屏 ── */
+  @media (max-width: 1180px) {
+    .po-hero { grid-template-columns: 1fr; }
+    .po-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  }
+  @media (max-width: 880px) {
+    .po-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .po-manifesto, .po-flow-grid { grid-template-columns: 1fr; }
+    .po-status-cols { grid-template-columns: 1fr; }
+  }
+</style>
+

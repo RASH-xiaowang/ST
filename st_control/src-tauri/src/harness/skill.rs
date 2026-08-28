@@ -89,28 +89,46 @@ fn parse_frontmatter(content: &str) -> (String, String, String, bool) {
     (rest.to_string(), name, description, !disable_model)
 }
 
-/// 从目录加载全部技能（目录约定：<id>/SKILL.md，支持 frontmatter）
+/// 从目录加载全部技能（DSH 2026-07-05 skill-system：目录约定 <id>/SKILL.md
+/// 与扁平 <name>.md 两种形态，均支持 frontmatter）
 fn load_skills() -> Vec<SkillInfo> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(skills_dir()) else {
         return out;
     };
     for entry in entries.flatten() {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        // 扁平技能：<name>.md（kebab-case 校验），目录技能：<id>/SKILL.md
+        if is_dir {
+            let Ok(content) = std::fs::read_to_string(skill_path(&file_name)) else {
+                continue;
+            };
+            let (body, name, description, model_invocable) = parse_frontmatter(&content);
+            out.push(SkillInfo {
+                id: file_name,
+                name,
+                description,
+                content: body,
+                model_invocable,
+            });
+        } else if file_name.ends_with(".md") && file_name != "SKILL.md" {
+            let id = file_name.trim_end_matches(".md").to_string();
+            if !is_valid_skill_id(&id) {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let (body, name, description, model_invocable) = parse_frontmatter(&content);
+            out.push(SkillInfo {
+                id,
+                name,
+                description,
+                content: body,
+                model_invocable,
+            });
         }
-        let id = entry.file_name().to_string_lossy().to_string();
-        let Ok(content) = std::fs::read_to_string(skill_path(&id)) else {
-            continue;
-        };
-        let (body, name, description, model_invocable) = parse_frontmatter(&content);
-        out.push(SkillInfo {
-            id,
-            name,
-            description,
-            content: body,
-            model_invocable,
-        });
     }
     out.sort_by(|a, b| a.id.cmp(&b.id));
     out
@@ -324,6 +342,30 @@ mod tests {
         assert!(!skill_list_result().unwrap().contains(&id));
         assert!(skill_load_result(&id).is_err());
         delete_skill(&id).unwrap();
+    }
+
+    #[test]
+    fn flat_skill_md_files_are_discovered() {
+        // DSH 2026-07-05 skill-system：扁平 <name>.md 与目录 <id>/SKILL.md 都算技能
+        let id = format!("flat-skill-{}", uuid::Uuid::new_v4().simple());
+        let dir = skills_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join(format!("{id}.md"));
+        std::fs::write(
+            &file,
+            format!("---\nname: 扁平技能\ndescription: 扁平形态\n---\n\n# 扁平技能\n\n扁平正文。"),
+        )
+        .unwrap();
+        let skills = load_skills();
+        let hit = skills.iter().find(|s| s.id == id);
+        assert!(
+            hit.is_some(),
+            "扁平 .md 技能应被发现: {:?}",
+            skills.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(hit.unwrap().name, "扁平技能");
+        assert!(hit.unwrap().content.contains("扁平正文"));
+        let _ = std::fs::remove_file(&file);
     }
 
     #[test]

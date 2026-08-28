@@ -10,6 +10,46 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 裁剪尾部未闭合的工具轮（DSH toolPairingBalanced 语义）：摘要请求重放
+/// 被压缩消息前，去掉末尾无对应 tool 结果的 assistant tool_calls 及其后
+/// 的孤儿 tool 结果，保证消息序对 OpenAI 兼容/DeepSeek 适配器合法。
+fn trim_unclosed_tool_round(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut out = messages.to_vec();
+    // 定位最后一条 assistant tool_calls；若其调用 id 未被其后 tool 结果
+    // 全部闭合，则视为崩溃/中断残留：从投影剥离该调用及其后的孤儿结果，
+    // 保证重放消息序对 OpenAI 兼容/DeepSeek 适配器合法（DSH 工具配对平衡）
+    let mut last_calls: Option<usize> = None;
+    for (i, m) in out.iter().enumerate() {
+        let is_calls = m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+            && m.get("tool_calls").is_some();
+        if is_calls {
+            last_calls = Some(i);
+        }
+    }
+    if let Some(k) = last_calls {
+        let ids: std::collections::HashSet<String> = out[k]
+            .get("tool_calls")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c.get("id").and_then(|i| i.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let after = &out[k + 1..];
+        let all_resolved = !ids.is_empty()
+            && ids.iter().all(|id| {
+                after
+                    .iter()
+                    .any(|m| m.get("tool_call_id").and_then(|i| i.as_str()) == Some(id.as_str()))
+            });
+        if !all_resolved {
+            out.truncate(k);
+        }
+    }
+    out
+}
+
 /// 压缩结果（供落日志与诊断）
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CompactionSummary {
@@ -223,16 +263,17 @@ pub async fn maybe_compact(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let summary_prompt = format!(
-        "请把以下对话历史压缩为一段简洁摘要（保留关键事实/结论/用户目标，不超过 300 字）：\n{}",
-        transcript
-    );
     // spill：压缩前把完整转录写盘（上下文溢写，可审计可恢复）
     let _spill_path = spill_transcript(session_id, &transcript);
-    let summary_messages = vec![serde_json::json!({
+    // DSH 2026-07-21 compaction-summary-prefix-cache-reuse：摘要调用重放
+    // 被压缩区域的真实消息（非扁平转录）+ 尾部指令，作为上一个请求的
+    // 前缀扩展以复用提供方 KV 缓存；尾部 user 消息保证消息序合法。
+    let mut summary_messages = trim_unclosed_tool_round(&to_compress);
+    summary_messages.push(serde_json::json!({
         "role": "user",
-        "content": summary_prompt,
-    })];
+        "content": "请把以上对话压缩为一段简洁摘要（保留关键事实/结论/用户目标，不超过 300 字）。\
+                    不要提及本次压缩请求，只输出摘要文本。",
+    }));
     // 摘要调用无工具
     let content = crate::llm::client::chat_completion_with_tools_raw(
         provider,
@@ -272,6 +313,35 @@ pub async fn maybe_compact(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn trim_unclosed_tool_round_keeps_valid_prefix() {
+        // DSH 2026-07-21 compaction-summary-prefix-cache-reuse：
+        // 摘要重放前剥离尾部未闭合工具轮，保证消息序合法
+        let closed = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "a", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "c1", "content": "ok"}),
+        ];
+        let trimmed = trim_unclosed_tool_round(&closed);
+        assert_eq!(trimmed.len(), 2, "已闭合工具轮应保留: {trimmed:?}");
+        let unclosed = vec![
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c2", "type": "function", "function": {"name": "b", "arguments": "{}"}}]}),
+        ];
+        let trimmed2 = trim_unclosed_tool_round(&unclosed);
+        assert!(trimmed2.is_empty(), "未闭合工具轮应剥离: {trimmed2:?}");
+        let partial = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c3", "type": "function", "function": {"name": "c", "arguments": "{}"}}]}),
+            json!({"role": "tool", "tool_call_id": "c3", "content": "ok"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [{"id": "c4", "type": "function", "function": {"name": "d", "arguments": "{}"}}]}),
+        ];
+        let trimmed3 = trim_unclosed_tool_round(&partial);
+        assert_eq!(
+            trimmed3.len(),
+            3,
+            "已闭合轮保留、尾部未闭合剥离: {trimmed3:?}"
+        );
+    }
 
     #[test]
     fn estimate_and_threshold() {

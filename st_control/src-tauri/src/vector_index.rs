@@ -90,12 +90,6 @@ impl VectorIndex {
         );
     }
 
-    /// 当前 generation
-    #[allow(dead_code)]
-    pub fn generation(&self) -> u64 {
-        self.db_generation.load(Ordering::Relaxed)
-    }
-
     /// 获取缓存的向量数据（必要时从数据库加载）
     fn ensure_loaded(&self, db: &KbDatabase, visible_kbs: &[i64]) -> Arc<Vec<CachedVector>> {
         let current_gen = self.db_generation.load(Ordering::Relaxed);

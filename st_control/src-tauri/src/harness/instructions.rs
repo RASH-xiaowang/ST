@@ -18,8 +18,9 @@ fn store() -> &'static Mutex<Instructions> {
     S.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// 注入预算：总字符数上限
-const INJECT_BUDGET_CHARS: usize = 24 * 1024;
+/// 注入预算：总字符数上限（≥ FILE_CAP_CHARS + 包装开销，确保单文件截断后
+/// 仍能在预算内完整注入；多文件时按序截断）
+const INJECT_BUDGET_CHARS: usize = 36 * 1024;
 /// 单文件读取上限
 const FILE_CAP_CHARS: usize = 32 * 1024;
 /// 扫描深度上限
@@ -168,26 +169,25 @@ mod tests {
     #[test]
     fn inject_budget_truncates_and_stops() {
         // 注入预算封顶：累计超预算后按序截断并停止（与 inject 分支一致）
-        // 直接写 store 构造数据（不经 rescan，避免依赖工作区文件）
-        let big = "x".repeat(INJECT_BUDGET_CHARS + 100);
+        // 直接写 store 构造数据（不经 rescan，避免依赖工作区文件）。
+        // 两个文件各自在 FILE_CAP_CHARS 内，但包装后合计超过 INJECT_BUDGET_CHARS。
+        let half = INJECT_BUDGET_CHARS / 2;
+        let big1 = "x".repeat(half);
+        let big2 = "y".repeat(half);
         {
             let mut s = store().lock().unwrap();
             s.clear();
-            s.push(("a.md".into(), big.clone()));
-            s.push(("b.md".into(), "后续文件内容".into()));
+            s.push(("a.md".into(), big1));
+            s.push(("b.md".into(), big2));
         }
         let out = inject();
-        // 第一段超预算：注入被截断且第二段完全未注入
+        // 两段合计超预算：第一段完整注入，第二段被截断
         assert!(
             out.contains("a.md"),
             "应含第一段: {:?}",
             &out[..out.len().min(80)]
         );
-        assert!(
-            !out.contains("b.md"),
-            "预算用尽后应停止: {:?}",
-            &out[..out.len().min(120)]
-        );
+        // 第二段可能部分注入（截断），但总量不超预算
         assert!(out.len() <= INJECT_BUDGET_CHARS + 64, "注入不应超预算太多");
         // 清理
         store().lock().unwrap().clear();

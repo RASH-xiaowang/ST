@@ -8,8 +8,13 @@ use crate::llm::types::{ProviderConfig, ProviderType};
 use std::error::Error;
 
 /// 带超时的 HTTP 客户端（避免连接挂起导致界面无响应）
+/// 产品归属标识（DSH 2026-06-21 mandatory-app-attribution-headers：
+/// 提供方请求按 RFC 9110 User-Agent 标识发出请求的产品）
+const APP_USER_AGENT: &str = concat!("ST-Control/", env!("CARGO_PKG_VERSION"));
+
 pub(crate) fn http_client() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(APP_USER_AGENT)
         .timeout(std::time::Duration::from_secs(90))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -18,6 +23,7 @@ pub(crate) fn http_client() -> reqwest::Client {
 /// 忽略代理环境变量、强制直连的客户端（代理不可用时回退）
 pub(crate) fn http_client_no_proxy() -> reqwest::Client {
     reqwest::Client::builder()
+        .user_agent(APP_USER_AGENT)
         .timeout(std::time::Duration::from_secs(90))
         .no_proxy()
         .build()

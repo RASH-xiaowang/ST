@@ -941,9 +941,9 @@ pub async fn kb_fetch_url(
     input: FetchUrlInput,
 ) -> Result<serde_json::Value, String> {
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
-    if !crate::kb::retrieval::can_access_kb(&db, input.kb_id, uid) {
-        return Err("无权限：你不是该知识库成员".to_string());
-    }
+    // 权限：需 editor 及以上角色（与 kb_upload_document 一致：网页抓取=创建文档）
+    crate::kb::retrieval::require_kb_role(&db, input.kb_id, uid, "editor")
+        .map_err(|_| "无权限：仅知识库 owner/admin/editor 可抓取网页".to_string())?;
     let url = input.url.trim().to_string();
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Err("URL 必须以 http:// 或 https:// 开头".to_string());
@@ -1220,9 +1220,9 @@ pub async fn kb_batch_fetch_url(
     dir_id: Option<i64>,
 ) -> Result<serde_json::Value, String> {
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
-    if !crate::kb::retrieval::can_access_kb(&db, kb_id, uid) {
-        return Err("无权限".to_string());
-    }
+    // 权限：需 editor 及以上角色（批量抓取=批量创建文档，与 kb_upload_document 一致）
+    crate::kb::retrieval::require_kb_role(&db, kb_id, uid, "editor")
+        .map_err(|_| "无权限：仅知识库 owner/admin/editor 可抓取网页".to_string())?;
     let (emb_provider, emb_model) = super::settings::resolve_embedding_pair(&db, None, None);
     let mut ok = 0usize;
     let mut err = 0usize;

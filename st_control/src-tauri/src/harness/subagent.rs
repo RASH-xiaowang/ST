@@ -32,7 +32,10 @@ pub async fn run_subagent(
         serde_json::json!({ "role": "system", "content": system_prompt }),
         serde_json::json!({ "role": "user", "content": task }),
     ];
-    let tools_json = crate::harness::tools::tools_json_scoped(scope);
+    // one-shot 子代理非分叉可继续子代理：移除 report（DSH 仅在
+    // continuable 子代理作用域注册 report；one-shot 子代理调用会报错）
+    let tools_json =
+        crate::harness::tools::strip_report_tool(crate::harness::tools::tools_json_scoped(scope));
     let mut final_content = String::new();
 
     for _round in 1..=SUBAGENT_MAX_ROUNDS {
@@ -164,20 +167,20 @@ pub(crate) fn check_child(parent_id: &str, child_id: &str) -> Result<(), String>
     }
 }
 
-/// 子代理结论 = 最后一条助手消息
+/// 子代理结论 = 最后一条**非空**助手消息（DSH 2026-08-10
+/// subagent-empty-terminal-message-output：max-tokens 截断产生的空内容
+/// usage-only 消息不计入输出，避免把真实部分答案挤掉）。
 pub(crate) fn conclusion(child_id: &str) -> Result<String, String> {
     let store = session_store()?;
     let msgs = store.derive_display_messages(child_id)?;
-    match msgs
-        .iter()
-        .rev()
-        .find(|m| matches!(m, crate::harness::session::DisplayMessage::Assistant { .. }))
-    {
-        Some(crate::harness::session::DisplayMessage::Assistant { content, .. }) => {
-            Ok(content.clone())
+    for m in msgs.iter().rev() {
+        if let crate::harness::session::DisplayMessage::Assistant { content, .. } = m {
+            if !content.trim().is_empty() {
+                return Ok(content.clone());
+            }
         }
-        _ => Ok("（子代理尚无结论）".to_string()),
     }
+    Ok("（子代理尚无结论）".to_string())
 }
 
 /// 本会话的子代理会话 id 列表
@@ -209,6 +212,38 @@ pub(crate) fn list_children(parent_id: &str) -> Vec<String> {
         })
         .map(|m| m.id)
         .collect()
+}
+
+/// 查找子代理会话的直接父会话 id（fork 溯源；DSH 语义：report 仅直达
+/// 直接父代理）。非子代理（无 SessionForked 溯源）返回 Err。
+pub(crate) fn parent_of(child_id: &str) -> Result<String, String> {
+    let store = session_store()?;
+    let events = store.events(child_id, 0)?;
+    // 取最近一次分叉溯源（孙代理 fork 出曾孙后，最近来源即直接父）
+    let parent = events.iter().rev().find_map(|(_, e)| match e {
+        crate::harness::session::HarnessEvent::SessionForked { source, .. } => Some(source.clone()),
+        _ => None,
+    });
+    parent.ok_or_else(|| "report 仅子代理可调用：当前会话不是任何会话的子代理".to_string())
+}
+
+/// 子代理 report 工具执行：把内容作为 SubagentReported 事件写入直接父会话
+/// 日志（模型可见 ⟺ 落日志；父代理下一回合可读到），返回父会话内事件 seq
+/// 作为 messageId（DSH tool-subagent-report 输出同构）。
+pub(crate) fn report(child_id: &str, content: &str) -> Result<i64, String> {
+    let content = content.trim();
+    if content.is_empty() {
+        return Err("report 内容不能为空".to_string());
+    }
+    let parent = parent_of(child_id)?;
+    let store = session_store()?;
+    store.append(
+        &parent,
+        &crate::harness::session::HarnessEvent::SubagentReported {
+            child: child_id.to_string(),
+            content: content.to_string(),
+        },
+    )
 }
 
 /// 子代理目录节点（DSH ui-subagent SubagentCatalog 迁移：
@@ -290,6 +325,71 @@ mod tests {
         SEEDED.call_once(|| {
             crate::harness::init(None, crate::db::Database::new().unwrap());
         });
+    }
+
+    #[test]
+    fn parent_of_and_report_deliver_to_direct_parent() {
+        seed();
+        let store = session_store().unwrap();
+        let parent = store.create().unwrap();
+        let child_id = fork_child(&parent.id).unwrap();
+        // 直接父会话解析（fork 溯源）
+        assert_eq!(parent_of(&child_id).unwrap(), parent.id);
+        // 根会话（无分叉溯源）调用 report 应报错（DSH：仅子代理可见/可用）
+        assert!(parent_of(&parent.id).is_err());
+        // report：写入父会话日志并返回父会话内 seq（模型可见 ⟺ 落日志）
+        let seq = report(&child_id, "子任务完成，输出写入 out.txt").unwrap();
+        assert!(seq > 0);
+        let evs = store.events(&parent.id, 0).unwrap();
+        assert!(evs.iter().any(|(s, e)| {
+            *s == seq
+                && matches!(
+                    e,
+                    crate::harness::session::HarnessEvent::SubagentReported { child, content }
+                        if child == &child_id && content.contains("out.txt")
+                )
+        }));
+        // 父代理模型投影能看到报告内容
+        let model = store.derive_model_messages(&parent.id).unwrap();
+        assert!(model.iter().any(|m| m["role"] == "user"
+            && m["content"]
+                .as_str()
+                .map(|t| t.contains("out.txt"))
+                .unwrap_or(false)));
+        // 空内容报错
+        assert!(report(&child_id, "   ").is_err());
+    }
+
+    #[test]
+    fn conclusion_selects_last_non_empty_assistant_message() {
+        // DSH 2026-08-10 subagent-empty-terminal-message-output：
+        // max-tokens 截断产生的空内容 usage-only 消息不计入输出
+        seed();
+        let store = session_store().unwrap();
+        let meta = store.create().unwrap();
+        store
+            .append(
+                &meta.id,
+                &crate::harness::session::HarnessEvent::AssistantMessage {
+                    id: "a1".into(),
+                    content: "真实部分答案".into(),
+                    reasoning: None,
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                &meta.id,
+                &crate::harness::session::HarnessEvent::AssistantMessage {
+                    id: "a2".into(),
+                    content: String::new(),
+                    reasoning: None,
+                },
+            )
+            .unwrap();
+        let out = conclusion(&meta.id).unwrap();
+        assert_eq!(out, "真实部分答案", "应选最后非空助手消息: {out}");
+        let _ = store.delete(&meta.id);
     }
 
     #[test]

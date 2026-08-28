@@ -59,7 +59,7 @@
     if (!newPassword.trim()) { createErr = '请输入密码'; return; }
     createBusy = true; createErr = '';
     try {
-      await kbApi.invoke<number>('kb_create_user', {
+      await kbApi.createUser({
         username: newUsername.trim(),
         displayName: newDisplayName.trim() || null,
         password: newPassword,
@@ -83,7 +83,7 @@
     if (!resetTarget || !resetPassword.trim()) { resetErr = '请输入新密码'; return; }
     resetBusy = true; resetErr = '';
     try {
-      await kbApi.invoke<void>('kb_reset_password', {
+      await kbApi.resetPassword({
         userId: resetTarget.id,
         newPassword: resetPassword,
       });
@@ -104,7 +104,7 @@
       message: `确定将「${user.displayName || user.username}」${action}？`,
     })) return;
     try {
-      await kbApi.invoke<void>('kb_set_admin', { userId: user.id, isAdmin: newStatus });
+      await kbApi.setAdmin({ userId: user.id, isAdmin: newStatus });
       await loadUsers();
       notify(action + '成功');
     } catch (e: unknown) {
@@ -120,7 +120,7 @@
       confirmText: '删除',
     })) return;
     try {
-      await kbApi.invoke<void>('kb_delete_user', { userId: user.id });
+      await kbApi.deleteUser(user.id);
       await loadUsers();
       notify('用户已删除');
     } catch (e: unknown) {

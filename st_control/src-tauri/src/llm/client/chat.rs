@@ -785,8 +785,10 @@ where
     }
     let wall_ms = started.elapsed().as_millis() as u64;
 
-    // 仅思考无正文的推理模型回退（与流式正文版一致）
-    if full.trim().is_empty() && !reasoning.trim().is_empty() {
+    // 推理模型「先思考后调工具」的回合：有 tool_calls 时无正文是正常行为，
+    // 不回退、不告警（思考已由调用方经 reasoning_delta 单独收集展示）。
+    // 仅「无正文且无工具调用」的退化响应（纯思考无输出）才回退为正文。
+    if full.trim().is_empty() && !reasoning.trim().is_empty() && frags.is_empty() {
         log::warn!(
             "[llm] 流式工具响应无正文，回退使用 reasoning_content（{} 字符）",
             reasoning.chars().count()

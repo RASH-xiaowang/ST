@@ -1,0 +1,86 @@
+# CI — 全量质量门禁（对齐 AGENTS.md 回归门 + DSH quality-gates 原则：
+# 串行门禁、失败即中断（默认 fail-fast）、确定性顺序）。
+# 门禁集：
+#   后端：cargo fmt --check → clippy（0 警告）→ test --lib --no-default-features → build
+#   前端：svelte-check（0 错 0 警告）→ vitest → .codex_tests 冒烟脚本 → 生产构建
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+defaults:
+  run:
+    working-directory: st_control
+
+jobs:
+  backend:
+    name: Rust (fmt + clippy + tests + build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: st_control/src-tauri
+
+      - name: Format check
+        working-directory: st_control/src-tauri
+        run: cargo fmt --check
+
+      - name: Clippy (0 warnings)
+        working-directory: st_control/src-tauri
+        run: cargo clippy --lib --no-default-features
+
+      # 最小依赖面单测（与 scripts/run-rust-tests.ps1 一致；
+      # 不链接 ort/DirectML，规避测试二进制启动 0xC0000139）
+      - name: Rust unit tests
+        working-directory: st_control/src-tauri
+        run: cargo test --lib --no-default-features
+
+      - name: Build app (default features)
+        working-directory: st_control/src-tauri
+        run: cargo build
+
+  frontend:
+    name: Frontend (typecheck + vitest + smoke + build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: st_control/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Svelte typecheck (0 errors, 0 warnings)
+        run: npx svelte-check --output human
+
+      - name: Vitest
+        run: npm test
+
+      - name: Smoke / regression scripts (.codex_tests)
+        shell: pwsh
+        run: |
+          $failed = @()
+          Get-ChildItem .codex_tests -Filter *.mjs | Sort-Object Name | ForEach-Object {
+            Write-Host "==> $($_.Name)"
+            node $_.FullName
+            if ($LASTEXITCODE -ne 0) { $failed += $_.Name }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Error "Smoke scripts failed: $($failed -join ', ')"
+            exit 1
+          }
+          Write-Host "All smoke scripts passed."
+
+      - name: Production build
+        run: npm run build

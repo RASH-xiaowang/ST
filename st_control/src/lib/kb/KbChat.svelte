@@ -1,6 +1,7 @@
 <script lang="ts">
   import { Channel } from '@tauri-apps/api/core';
   import { kbApi, type KbRagInput } from './services/ipc';
+  import { kbUser } from './auth.svelte';
   import { kbConfirm } from './KbConfirm.svelte';
   import { onMount, untrack } from 'svelte';
   import type { RetrievedChunk, ModelInfo, KbSummary, QaSessionItem, QaMessageItem, SearchLogItem, RecommendItem } from './kbTypes';
@@ -222,12 +223,15 @@
   let draftEditId = $state<number | null>(null);
   let draftEditText = $state('');
 
+  // 当前登录用户 ID（后端以 session 为准、无越权风险，此处仅替代硬编码）
+  const currentUserId = $derived(kbUser.user?.id ?? 1);
+
   async function runDraftSearch() {
     if (!ragQuery.trim()) { notify('请输入问题', 'warn'); return; }
     draftBusy = true;
     try {
       const res = await kbApi.search({
-        input: { userId: 1, kbId: effKbId, query: ragQuery, topK: 10, mode: ragMode, providerId: chatProvider || null, model: chatModel || null },
+        input: { userId: currentUserId, kbId: effKbId, query: ragQuery, topK: 10, mode: ragMode, providerId: chatProvider || null, model: chatModel || null },
       });
       draftChunks = res.map((r) => ({ chunkId: r.chunk_id, docTitle: r.doc_title, section: r.section, content: r.content, score: r.score, source: r.source }));
       draftSelected = new Set(draftChunks.map((c) => c.chunkId));
@@ -316,7 +320,7 @@
     searching = true;
     try {
       searchResults = await kbApi.search({
-        input: { userId: 1, kbId: effKbId, query: searchQuery, topK: searchTopK, mode: searchMode, providerId: chatProvider || null, model: chatModel || null },
+        input: { userId: currentUserId, kbId: effKbId, query: searchQuery, topK: searchTopK, mode: searchMode, providerId: chatProvider || null, model: chatModel || null },
       });
       // 回退策略：混合检索中文整句 0 命中时，用提取的关键词重试
       if (searchResults.length === 0 && searchMode === 'hybrid' && /[\u4e00-\u9fa5]/.test(searchQuery)) {
@@ -324,7 +328,7 @@
         if (terms.length > 0) {
           const fallbackQuery = terms.slice(0, 5).join(' ');  // 取前 5 个关键词
           const fallbackResults = await kbApi.search({
-            input: { userId: 1, kbId: effKbId, query: fallbackQuery, topK: searchTopK, mode: searchMode, providerId: chatProvider || null, model: chatModel || null },
+            input: { userId: currentUserId, kbId: effKbId, query: fallbackQuery, topK: searchTopK, mode: searchMode, providerId: chatProvider || null, model: chatModel || null },
           });
           if (fallbackResults.length > 0) {
             searchResults = fallbackResults;
@@ -379,7 +383,7 @@
         content: draftEditId === c.chunkId ? draftEditText : c.content,
       }));
     const input: KbRagInput = {
-      userId: 1,
+      userId: currentUserId,
       kbId: effKbId,
       query: userQuery,
       providerId: chatProvider || null,

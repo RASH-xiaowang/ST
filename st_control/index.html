@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
@@ -144,12 +144,12 @@
   </head>
   <body>
     <!-- 启动页：应用挂载后由 main.ts 淡出移除 -->
-    <div id="app-splash" role="status" aria-label="ST 控制台 正在启动">
-      <div class="splash-logo">ST</div>
-      <div class="splash-title">ST 控制台</div>
-      <div class="splash-sub">v1.0 · 专业版</div>
-      <div class="splash-dots"><span></span><span></span><span></span></div>
-      <div class="splash-tip">正在初始化…</div>
+    <div id="app-splash" data-tauri-drag-region role="status" aria-label="ST 控制台 正在启动">
+      <div class="splash-logo" data-tauri-drag-region>ST</div>
+      <div class="splash-title" data-tauri-drag-region>ST 控制台</div>
+      <div class="splash-sub" data-tauri-drag-region>v1.0 · 专业版</div>
+      <div class="splash-dots" data-tauri-drag-region><span></span><span></span><span></span></div>
+      <div class="splash-tip" data-tauri-drag-region>正在初始化…</div>
     </div>
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>

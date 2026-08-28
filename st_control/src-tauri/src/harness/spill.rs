@@ -55,6 +55,19 @@ impl SpillStore {
         })
     }
 
+    /// 共享溢写（无会话归属）：供无会话上下文的工具（glob/grep 溢出完整
+    /// 列表）使用；文件仍位于 spills_root 下，spill_read 可跨会话取回。
+    pub fn save_shared(text: &str) -> Result<SpillRef, String> {
+        let dir = spills_root().join("shared");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建共享溢写目录失败: {}", e))?;
+        let file = dir.join(format!("spill-{}.txt", uuid::Uuid::new_v4().simple()));
+        std::fs::write(&file, text.as_bytes()).map_err(|e| format!("写入共享溢写失败: {}", e))?;
+        Ok(SpillRef {
+            locator: file.display().to_string(),
+            retrieval_hint: "完整输出已落盘：用 spill_read 工具并传入 locator 取回".to_string(),
+        })
+    }
+
     /// 按定位符读取（校验必须位于溢写目录内）
     pub fn read(locator: &str) -> Result<String, String> {
         let p = std::path::PathBuf::from(locator);

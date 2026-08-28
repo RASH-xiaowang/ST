@@ -699,7 +699,6 @@ pub fn run() {
             kb::handlers::kb_test_model,
             kb::handlers::kb_export,
             kb::handlers::kb_import,
-            kb::handlers::kb_fetch_url,
             kb::handlers::kb_batch_fetch_url,
             kb::handlers::kb_get_stats,
             kb::handlers::kb_get_analytics,

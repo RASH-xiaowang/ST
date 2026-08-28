@@ -549,3 +549,25 @@ fn test_valid_docx_still_parses_after_guards() {
     let parsed = parse_document("docx", &docx).unwrap();
     assert!(!parsed.text.trim().is_empty(), "正常 docx 应能解析出文本");
 }
+
+/// 文本类文件超过 MAX_TEXT_PARSE_BYTES（64MB）上限时应返回 Err。
+/// 选择直接构造 64MB+1 字节的方式（而非提取可测函数测小上限），
+/// 理由：直接测真实常量更贴近生产路径，且 64MB 分配在测试环境中可接受。
+#[test]
+fn test_text_file_size_guard_rejects_oversized() {
+    let big = vec![b'a'; super::MAX_TEXT_PARSE_BYTES + 1];
+    let err = parse_document("txt", &big).unwrap_err();
+    assert!(
+        err.contains("文本类文件过大") && err.contains("请拆分后上传"),
+        "错误信息应含上限与建议，实际: {}",
+        err
+    );
+}
+
+/// 边界：恰好等于上限的文本数据应正常解析（不触发拒绝）
+#[test]
+fn test_text_file_size_guard_allows_at_limit() {
+    let data = vec![b'a'; super::MAX_TEXT_PARSE_BYTES];
+    let doc = parse_document("txt", &data).unwrap();
+    assert_eq!(doc.text.len(), super::MAX_TEXT_PARSE_BYTES);
+}

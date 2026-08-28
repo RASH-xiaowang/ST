@@ -121,6 +121,15 @@ pub enum HarnessEvent {
     SkillInjected {
         skills: Vec<String>,
     },
+    /// 子代理回传（DSH tool-subagent-report 迁移）：分叉子代理通过 report 工具
+    /// 把内容回传给直接父会话，落父会话日志（模型可见 ⟺ 落日志；
+    /// UI 投影为「子代理报告」元信息行；仅直接父代理可见）。
+    SubagentReported {
+        /// 来源子代理会话 id（fork 溯源）
+        child: String,
+        /// 回传内容（自包含结论/进度）
+        content: String,
+    },
 }
 
 /// 待办条目
@@ -173,6 +182,7 @@ pub(crate) fn event_type_name(ev: &HarnessEvent) -> &'static str {
         HarnessEvent::SessionCleared => "session_cleared",
         HarnessEvent::ContextInjected { .. } => "context_injected",
         HarnessEvent::SkillInjected { .. } => "skill_injected",
+        HarnessEvent::SubagentReported { .. } => "subagent_reported",
     }
 }
 
@@ -665,6 +675,9 @@ impl SessionStore {
                 ("context_injected", serde_json::to_string(event))
             }
             HarnessEvent::SkillInjected { .. } => ("skill_injected", serde_json::to_string(event)),
+            HarnessEvent::SubagentReported { .. } => {
+                ("subagent_reported", serde_json::to_string(event))
+            }
         };
         let payload = payload.map_err(|e| format!("事件序列化失败: {}", e))?;
         let seq = self
@@ -1067,8 +1080,26 @@ impl SessionStore {
                 HarnessEvent::UserMessage { content, .. } => {
                     out.push(serde_json::json!({ "role": "user", "content": content }));
                 }
-                HarnessEvent::AssistantMessage { content, .. } => {
-                    out.push(serde_json::json!({ "role": "assistant", "content": content }));
+                // 子代理报告投影为用户消息（父代理模型可见；DSH user/message 语义）
+                HarnessEvent::SubagentReported { child, content } => {
+                    out.push(serde_json::json!({
+                        "role": "user",
+                        "content": format!("[子代理 {child} 报告]\n{}", content),
+                    }));
+                }
+                HarnessEvent::AssistantMessage {
+                    content, reasoning, ..
+                } => {
+                    // DSH deepseek-reasoning-passback（2026-08-19）：每个含推理的
+                    // 助手轮次都回传 reasoning_content（与是否带工具调用无关），
+                    // 否则经 OpenAI 兼容网关转发时对话无法按推理签名重建。
+                    let mut m = serde_json::json!({ "role": "assistant", "content": content });
+                    if let Some(r) = reasoning {
+                        if !r.trim().is_empty() {
+                            m["reasoning_content"] = serde_json::json!(r);
+                        }
+                    }
+                    out.push(m);
                 }
                 HarnessEvent::AssistantToolCalls { calls, .. } => {
                     let calls_json: Vec<serde_json::Value> = calls
@@ -1097,7 +1128,77 @@ impl SessionStore {
                 _ => {}
             }
         }
+        // 防御性清理（重放有效性）：进程崩溃/回合中断可能在日志尾部残留
+        // 未闭合 tool_calls（有调用无结果），直接投影会给模型 API 非法序列
+        Self::sanitize_model_messages(&mut out);
         Ok(out)
+    }
+
+    /// 防御性清理模型消息序列（DSH 重放有效性不变式）：
+    /// 追加式日志在进程崩溃/回合中断时可能残留「尾部未闭合 tool_calls」
+    /// （有调用无结果），直接投影会让模型 API 400（与 fork 的
+    /// clean_boundary 同理）。投影层剥离最后一条未闭合的 assistant
+    /// tool_calls 及其后的孤儿 tool 结果；只影响投影、不改日志
+    /// （模型可见 ⟺ 落日志不变式保持：投影内容仍全部来自日志）。
+    fn sanitize_model_messages(out: &mut Vec<serde_json::Value>) {
+        // 先剥离孤儿 tool 结果：tool_call_id 未被任何前置 assistant tool_calls
+        // 引用的 tool 消息对模型 API 恒为非法（防御：正常流程不会产生，崩溃
+        // 日志可能残留）。
+        let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+        out.retain(|m| match m.get("role").and_then(|r| r.as_str()) {
+            Some("assistant") => {
+                if let Some(calls) = m.get("tool_calls").and_then(|c| c.as_array()) {
+                    for c in calls {
+                        if let Some(id) = c.get("id").and_then(|i| i.as_str()) {
+                            referenced.insert(id.to_string());
+                        }
+                    }
+                }
+                true
+            }
+            Some("tool") => m
+                .get("tool_call_id")
+                .and_then(|i| i.as_str())
+                .map(|id| referenced.contains(id))
+                .unwrap_or(false),
+            _ => true,
+        });
+        // 定位最后一条 assistant tool_calls（非空调用集）
+        let mut last_calls: Option<usize> = None;
+        for (i, m) in out.iter().enumerate() {
+            let is_calls = m.get("role").and_then(|r| r.as_str()) == Some("assistant")
+                && m.get("tool_calls")
+                    .and_then(|c| c.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(false);
+            if is_calls {
+                last_calls = Some(i);
+            }
+        }
+        let Some(k) = last_calls else {
+            return;
+        };
+        let ids: std::collections::HashSet<String> = out[k]
+            .get("tool_calls")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| c.get("id").and_then(|i| i.as_str()).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // 该调用之后必须由匹配的 tool 结果全部闭合（否则为尾部未闭合）
+        let after = &out[k + 1..];
+        let all_resolved = !ids.is_empty()
+            && ids.iter().all(|id| {
+                after
+                    .iter()
+                    .any(|m| m.get("tool_call_id").and_then(|i| i.as_str()) == Some(id.as_str()))
+            });
+        if !all_resolved {
+            // 未闭合：剥离该调用及其后的孤儿 tool 结果（投影层，日志保留可审计）
+            out.truncate(k);
+        }
     }
 
     /// UI 投影：日志 → 展示消息（assistant_chunk 按 id 归组；assistant_message
@@ -1228,6 +1329,15 @@ impl SessionStore {
                         workflow: None,
                     });
                 }
+                HarnessEvent::SubagentReported { child, content } => {
+                    // 子代理报告行（DSH tool-subagent-report 迁移）：来源 + 内容可展开
+                    out.push(DisplayMessage::MetaLine {
+                        kind: "subagent".to_string(),
+                        title: format!("子代理 {child} 报告"),
+                        detail: content,
+                        workflow: None,
+                    });
+                }
                 HarnessEvent::WorkflowRun {
                     workflow_id,
                     name,
@@ -1235,10 +1345,11 @@ impl SessionStore {
                     total,
                     output,
                 } => {
-                    // 工作流阶段行（DSH WorkflowRunPanel 等价投影：阶段进度点 + 输出）
+                    // 工作流阶段行（DSH WorkflowRunPanel 等价投影：阶段进度点 + 输出；
+                    // stage 从 0 起存储，展示时 +1 对齐用户可读序号）
                     out.push(DisplayMessage::MetaLine {
                         kind: "workflow".to_string(),
-                        title: format!("工作流「{}」阶段 {}/{}", name, stage, total),
+                        title: format!("工作流「{}」阶段 {}/{}", name, stage + 1, total),
                         detail: output,
                         workflow: Some(WorkflowStageView {
                             workflow_id: workflow_id.clone(),
@@ -1541,6 +1652,15 @@ impl SessionStore {
                         event: "skill".to_string(),
                         summary: format!("注入技能 · {} 个", skills.len()),
                         detail: skills.join("\n"),
+                    });
+                }
+                HarnessEvent::SubagentReported { child, content } => {
+                    entries.push(TrajectoryEntry::System {
+                        seq,
+                        time,
+                        event: "subagent_report".to_string(),
+                        summary: format!("子代理 {child} 报告"),
+                        detail: content,
                     });
                 }
             }
@@ -2696,6 +2816,7 @@ mod tests {
                     HarnessEvent::SessionCleared => "cleared",
                     HarnessEvent::ContextInjected { .. } => "context",
                     HarnessEvent::SkillInjected { .. } => "skill",
+                    HarnessEvent::SubagentReported { .. } => "subagent_report",
                 };
                 eprintln!("  #{seq} {kind}");
             }
@@ -2883,6 +3004,280 @@ mod tests {
             DisplayMessage::MetaLine { kind, title, detail, .. }
                 if kind == "skill" && title.contains('2') && detail.contains("sk-1")
         ));
+        let _ = s.delete(&meta.id);
+    }
+
+    #[test]
+    fn subagent_report_event_roundtrips_and_projects() {
+        // DSH tool-subagent-report 迁移：SubagentReported 落父会话日志，
+        // 模型投影为用户消息（父代理可见），UI 投影为「子代理报告」meta 行
+        let s = test_store();
+        let meta = s.create().unwrap();
+        let seq = s
+            .append(
+                &meta.id,
+                &HarnessEvent::SubagentReported {
+                    child: "child-1".into(),
+                    content: "任务完成：输出已写入 src/out.rs".into(),
+                },
+            )
+            .unwrap();
+        assert!(seq > 0);
+        // 事件持久化可读回
+        let evs = s.events(&meta.id, 0).unwrap();
+        assert!(matches!(
+            &evs[0].1,
+            HarnessEvent::SubagentReported { child, content }
+                if child == "child-1" && content.contains("src/out.rs")
+        ));
+        // 模型投影：user 消息，内容含来源与正文（模型可见 ⟺ 落日志）
+        let model = s.derive_model_messages(&meta.id).unwrap();
+        assert_eq!(model.len(), 1);
+        assert_eq!(model[0]["role"], "user");
+        let text = model[0]["content"].as_str().unwrap();
+        assert!(text.contains("child-1") && text.contains("src/out.rs"));
+        // UI 投影：meta 行 kind=subagent
+        let msgs = s.derive_display_messages(&meta.id).unwrap();
+        assert!(matches!(
+            &msgs[0],
+            DisplayMessage::MetaLine { kind, title, detail, .. }
+                if kind == "subagent" && title.contains("child-1") && detail.contains("src/out.rs")
+        ));
+        let _ = s.delete(&meta.id);
+    }
+
+    #[test]
+    fn derive_model_messages_strips_trailing_unclosed_tool_calls() {
+        // 崩溃/中断残留：assistant tool_calls 无对应 tool 结果 → 投影必须剥离，
+        // 否则模型 API 400（与 fork clean_boundary 同理；投影层剥离、日志保留）
+        let s = test_store();
+        let meta = s.create().unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::UserMessage {
+                id: "u1".into(),
+                content: "跑一下".into(),
+            },
+        )
+        .unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::AssistantToolCalls {
+                id: "as1".into(),
+                calls: vec![ToolCallView {
+                    id: "c1".into(),
+                    name: "exec_command".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+        )
+        .unwrap();
+        let model = s.derive_model_messages(&meta.id).unwrap();
+        assert_eq!(model.len(), 1, "未闭合 tool_calls 应从投影剥离: {model:?}");
+        assert_eq!(model[0]["role"], "user");
+        // 日志保留（模型可见 ⟺ 落日志：审计可恢复）
+        let evs = s.events(&meta.id, 0).unwrap();
+        assert!(evs
+            .iter()
+            .any(|(_, e)| matches!(e, HarnessEvent::AssistantToolCalls { .. })));
+        let _ = s.delete(&meta.id);
+    }
+
+    #[test]
+    fn derive_model_messages_strips_partially_resolved_tool_round() {
+        // 部分结果（多调用中仅一个落结果）也视为未闭合：整轮从投影剥离
+        let s = test_store();
+        let meta = s.create().unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::UserMessage {
+                id: "u1".into(),
+                content: "跑一下".into(),
+            },
+        )
+        .unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::AssistantToolCalls {
+                id: "as1".into(),
+                calls: vec![
+                    ToolCallView {
+                        id: "c1".into(),
+                        name: "a".into(),
+                        arguments: "{}".into(),
+                    },
+                    ToolCallView {
+                        id: "c2".into(),
+                        name: "b".into(),
+                        arguments: "{}".into(),
+                    },
+                ],
+            },
+        )
+        .unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::ToolResult {
+                id: "c1".into(),
+                ok: true,
+                result: "r1".into(),
+                duration_ms: 5,
+            },
+        )
+        .unwrap();
+        let model = s.derive_model_messages(&meta.id).unwrap();
+        assert_eq!(model.len(), 1, "部分闭合的工具轮应从投影剥离: {model:?}");
+        let _ = s.delete(&meta.id);
+    }
+
+    #[test]
+    fn derive_model_messages_strips_orphan_tool_results() {
+        // 孤儿 tool 结果（tool_call_id 无前置引用）对模型 API 恒为非法：
+        // 投影剥离、日志保留
+        let s = test_store();
+        let meta = s.create().unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::UserMessage {
+                id: "u1".into(),
+                content: "跑一下".into(),
+            },
+        )
+        .unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::AssistantToolCalls {
+                id: "as1".into(),
+                calls: vec![ToolCallView {
+                    id: "c1".into(),
+                    name: "exec_command".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+        )
+        .unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::ToolResult {
+                id: "c1".into(),
+                ok: true,
+                result: "ok".into(),
+                duration_ms: 5,
+            },
+        )
+        .unwrap();
+        // 孤儿结果：id 无对应调用
+        s.append(
+            &meta.id,
+            &HarnessEvent::ToolResult {
+                id: "ghost".into(),
+                ok: true,
+                result: "ghost-result".into(),
+                duration_ms: 1,
+            },
+        )
+        .unwrap();
+        let model = s.derive_model_messages(&meta.id).unwrap();
+        assert_eq!(model.len(), 3, "孤儿 tool 结果应从投影剥离: {model:?}");
+        assert!(!model
+            .iter()
+            .any(|m| m.get("tool_call_id").and_then(|i| i.as_str()) == Some("ghost")));
+        let _ = s.delete(&meta.id);
+    }
+
+    #[test]
+    fn derive_model_messages_keeps_closed_tool_rounds() {
+        // 正常闭合工具轮（调用 + 全部结果 + 回复）不被剥离
+        let s = test_store();
+        let meta = s.create().unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::UserMessage {
+                id: "u1".into(),
+                content: "跑一下".into(),
+            },
+        )
+        .unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::AssistantToolCalls {
+                id: "as1".into(),
+                calls: vec![ToolCallView {
+                    id: "c1".into(),
+                    name: "exec_command".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+        )
+        .unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::ToolResult {
+                id: "c1".into(),
+                ok: true,
+                result: "ok".into(),
+                duration_ms: 5,
+            },
+        )
+        .unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::AssistantMessage {
+                id: "as2".into(),
+                content: "完成".into(),
+                reasoning: None,
+            },
+        )
+        .unwrap();
+        let model = s.derive_model_messages(&meta.id).unwrap();
+        assert_eq!(model.len(), 4, "闭合工具轮应完整保留: {model:?}");
+        assert_eq!(model[3]["role"], "assistant");
+        let _ = s.delete(&meta.id);
+    }
+
+    #[test]
+    fn derive_model_messages_passes_back_reasoning_content() {
+        // DSH 2026-08-19 deepseek-reasoning-passback：每个含推理的助手轮次
+        // 都回传 reasoning_content（含无工具调用的纯作答轮次）
+        let s = test_store();
+        let meta = s.create().unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::UserMessage {
+                id: "u1".into(),
+                content: "分析问题".into(),
+            },
+        )
+        .unwrap();
+        s.append(
+            &meta.id,
+            &HarnessEvent::AssistantMessage {
+                id: "as1".into(),
+                content: "结论".into(),
+                reasoning: Some("推理过程".into()),
+            },
+        )
+        .unwrap();
+        let model = s.derive_model_messages(&meta.id).unwrap();
+        assert_eq!(model[1]["role"], "assistant");
+        assert_eq!(
+            model[1]["reasoning_content"].as_str(),
+            Some("推理过程"),
+            "推理应回传: {}",
+            model[1]
+        );
+        // 无推理的助手消息不携带该字段
+        s.append(
+            &meta.id,
+            &HarnessEvent::AssistantMessage {
+                id: "as2".into(),
+                content: "普通回复".into(),
+                reasoning: None,
+            },
+        )
+        .unwrap();
+        let model2 = s.derive_model_messages(&meta.id).unwrap();
+        assert!(model2[2].get("reasoning_content").is_none());
         let _ = s.delete(&meta.id);
     }
 
@@ -3118,6 +3513,46 @@ mod tests {
         assert!(
             !hits.iter().any(|h| h.session_id == b.id),
             "不应命中会话 b: {hits:?}"
+        );
+        // 工具结果也可检索（DSH session-query：tool calls/results 贡献语义文本）
+        s.append(
+            &a.id,
+            &HarnessEvent::ToolResult {
+                id: "t1".into(),
+                ok: true,
+                result: "数据库索引优化建议：覆盖索引".into(),
+                duration_ms: 3,
+            },
+        )
+        .unwrap();
+        let hits2 = s.search("覆盖索引").unwrap();
+        assert!(
+            hits2.iter().any(|h| h.session_id == a.id),
+            "tool_result 应可检索: {hits2:?}"
+        );
+        // 片段应包含命中词上下文（长结果中段命中可见）
+        assert!(
+            hits2
+                .iter()
+                .find(|h| h.session_id == a.id)
+                .map(|h| h.snippet.contains("覆盖索引"))
+                .unwrap_or(false),
+            "片段应含命中词: {:?}",
+            hits2
+        );
+        // 子代理报告也可检索
+        s.append(
+            &b.id,
+            &HarnessEvent::SubagentReported {
+                child: "c1".into(),
+                content: "已把数据库迁移脚本写入 migrate.sql".into(),
+            },
+        )
+        .unwrap();
+        let hits3 = s.search("migrate.sql").unwrap();
+        assert!(
+            hits3.iter().any(|h| h.session_id == b.id),
+            "subagent_reported 应可检索: {hits3:?}"
         );
         // 无结果
         let none = s.search("不存在的词xyz").unwrap();

@@ -754,151 +754,58 @@ pub fn can_access_kb(db: &KbDatabase, kb_id: i64, user_id: i64) -> bool {
     acl_allow(db, "kb", user_id, Some(kb_id), None)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// 测试模块移至文件末尾（acl_allow 之后），以便测试 can_access_doc / require_kb_role
 
-    fn chunk(id: i64, score: f64) -> RetrievedChunk {
-        RetrievedChunk {
-            chunk_id: id,
-            doc_id: 1,
-            kb_id: 1,
-            content: format!("chunk {}", id),
-            page_no: None,
-            section: None,
-            score,
-            source: "test".to_string(),
-            doc_title: "测试文档".to_string(),
-        }
-    }
-
-    #[test]
-    fn test_rrf_single_list() {
-        let v = vec![chunk(1, 0.9), chunk(2, 0.8)];
-        let fused = rrf_fuse(v.clone(), vec![], 60);
-        assert_eq!(fused.len(), 2);
-        assert!(
-            (fused[0].score - 1.0 / 61.0).abs() < 1e-12,
-            "rank0 分数应为 1/(k+1)"
-        );
-        assert!((fused[1].score - 1.0 / 62.0).abs() < 1e-12);
-        assert_eq!(fused[0].chunk_id, 1, "排序应保持原始相对顺序");
-        assert!(fused.iter().all(|c| c.source == "hybrid"));
-    }
-
-    #[test]
-    fn test_rrf_fusion_accumulates() {
-        // chunk2 在两路都出现，分数应累加并排第一
-        let v = vec![chunk(1, 0.9), chunk(2, 0.8)];
-        let b = vec![chunk(2, 0.7), chunk(3, 0.6)];
-        let fused = rrf_fuse(v, b, 60);
-        assert_eq!(fused.len(), 3, "两路共 3 个不同 chunk");
-        assert_eq!(fused[0].chunk_id, 2, "重复出现的 chunk 分数最高");
-        let expect = 1.0 / 62.0 + 1.0 / 61.0;
-        assert!(
-            (fused[0].score - expect).abs() < 1e-12,
-            "分数应为两路 RRF 之和"
-        );
-        // 其余按 RRF 分数降序：chunk1 (1/61) > chunk3 (1/62)
-        assert_eq!(fused[1].chunk_id, 1);
-        assert_eq!(fused[2].chunk_id, 3);
-    }
-
-    #[test]
-    fn test_rrf_empty_lists() {
-        assert!(rrf_fuse(vec![], vec![], 60).is_empty());
-        assert!(rrf_fuse(vec![chunk(1, 1.0)], vec![], 60).len() == 1);
-    }
-
-    #[test]
-    fn test_rrf_custom_k() {
-        let v = vec![chunk(9, 0.5)];
-        let fused = rrf_fuse(v, vec![], 10);
-        assert!((fused[0].score - 1.0 / 11.0).abs() < 1e-12);
-    }
-
-    #[test]
-    fn test_rrf_priority_orders() {
-        // 两路相同的重复情况：即使单路分数低，重复出现应占优
-        let v = vec![chunk(1, 1.0), chunk(2, 0.0)];
-        let b = vec![chunk(2, 0.0), chunk(3, 0.0)];
-        let fused = rrf_fuse(v, b, 60);
-        assert_eq!(fused[0].chunk_id, 2, "重复 chunk 优先于单路高分");
-    }
-
-    #[test]
-    fn test_fts_query_cjk_short_phrase() {
-        assert_eq!(crate::kb::fts_safe_query("测试文章"), "\"测 试 文 章\"");
-    }
-
-    #[test]
-    fn test_fts_query_cjk_long_sentence_or_terms() {
-        // 长中文整句不再作为单一短语，而是按单字 OR 展开，避免 0 命中
-        let q = crate::kb::fts_safe_query("自动化测试知识库中关于测试文章的要点有哪些？");
-        assert!(q.contains(" OR "), "长句应按单字 OR 展开，实际: {}", q);
-        assert!(!q.contains("？"), "中文标点应被过滤，实际: {}", q);
-        assert!(
-            q.starts_with("自 OR 动 OR 化"),
-            "应以单字 OR 开头，实际: {}",
-            q
-        );
-    }
-
-    #[test]
-    fn test_fts_query_cjk_punct_filtered() {
-        assert_eq!(crate::kb::fts_safe_query("要点？"), "\"要 点\"");
-        assert_eq!(crate::kb::fts_safe_query("知识库。"), "\"知 识 库\"");
-    }
-
-    #[test]
-    fn test_fts_query_ascii_quoted() {
-        assert_eq!(
-            crate::kb::fts_safe_query("hello world"),
-            "\"hello\" \"world\""
-        );
-        assert_eq!(crate::kb::fts_safe_query("RAG 检索"), "\"RAG\" \"检 索\"");
-    }
-
-    #[test]
-    fn test_fts_query_mixed_cjk_ascii() {
-        assert_eq!(
-            crate::kb::fts_safe_query("UI 测试文章"),
-            "\"UI\" \"测 试 文 章\""
-        );
-    }
-
-    #[test]
-    fn test_fts_query_empty_and_special_chars() {
-        assert!(crate::kb::fts_safe_query("").is_empty());
-        assert!(crate::kb::fts_safe_query("   ").is_empty());
-        assert_eq!(
-            crate::kb::fts_safe_query("测试(自动化)"),
-            "测 OR 试 OR 自 OR 动 OR 化"
-        );
-        assert!(crate::kb::fts_safe_query("……").is_empty(), "纯标点应返回空");
-    }
-}
-
-/// 是否可访问文档：知识库可访问 且 文档级 ACL 未拒绝
+/// 是否可访问文档：知识库可访问 且 文档级 ACL 未拒绝。
+/// 若文档存在针对当前用户（user / role / public）的 ACL 规则则以规则为准，
+/// 否则继承知识库权限（无匹配规则 = 不受限）。
 pub fn can_access_doc(db: &KbDatabase, kb_id: i64, doc_id: i64, user_id: i64) -> bool {
     if !can_access_kb(db, kb_id, user_id) {
         return false;
     }
-    let allowed = acl_allow(db, "document", user_id, Some(kb_id), Some(doc_id));
-    // 若文档无 ACL 规则则继承知识库权限
-    let has_rule: bool = {
+    // 检查是否存在匹配当前用户的文档级 ACL 规则（user / role / public）
+    let has_matching_rule: bool = {
+        let roles: Vec<i64> = {
+            let c = db.conn_lock();
+            c.prepare("SELECT role_id FROM user_roles WHERE user_id = ?1")
+                .ok()
+                .and_then(|mut s| {
+                    s.query_map(params![user_id], |r| r.get::<_, i64>(0))
+                        .ok()
+                        .map(|rs| rs.filter_map(|r| r.ok()).collect())
+                })
+                .unwrap_or_default()
+        };
         let c = db.conn_lock();
-        c.query_row(
-            "SELECT 1 FROM kb_acl WHERE scope='document' AND doc_id=?1 LIMIT 1",
-            params![doc_id],
-            |_| Ok(true),
+        c.prepare(
+            "SELECT grantee_type, user_id, role_id FROM kb_acl WHERE scope='document' AND doc_id=?1",
         )
+        .ok()
+        .and_then(|mut stmt| {
+            stmt.query_map(params![doc_id], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })
+            .ok()
+            .map(|rows| {
+                rows.flatten().any(|(gtype, uid, rid)| match gtype.as_str() {
+                    "user" => uid == Some(user_id),
+                    "role" => rid.map(|r| roles.contains(&r)).unwrap_or(false),
+                    "public" => true,
+                    _ => false,
+                })
+            })
+        })
         .unwrap_or(false)
     };
-    if !has_rule {
+    if !has_matching_rule {
+        // 文档无针对当前用户的 ACL 规则，继承知识库权限
         return true;
     }
-    allowed
+    acl_allow(db, "document", user_id, Some(kb_id), Some(doc_id))
 }
 
 /// ACL deny 判定：只要存在匹配当前用户的 deny 规则即拒绝（deny 优先）。
@@ -1021,4 +928,395 @@ fn acl_allow(
         }
     }
     allow
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn chunk(id: i64, score: f64) -> RetrievedChunk {
+        RetrievedChunk {
+            chunk_id: id,
+            doc_id: 1,
+            kb_id: 1,
+            content: format!("chunk {}", id),
+            page_no: None,
+            section: None,
+            score,
+            source: "test".to_string(),
+            doc_title: "测试文档".to_string(),
+        }
+    }
+
+    /// 创建临时测试数据库，预置 users / roles / knowledge_bases / documents / kb_members。
+    /// 返回 (db, tmp_dir)，调用方可继续插入 kb_acl / user_roles 等测试数据。
+    /// 临时目录由调用方负责清理。
+    fn setup_test_db() -> (KbDatabase, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "kb_acl_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("test.db");
+        let db = KbDatabase::open_at(db_path).expect("open test db");
+        {
+            let conn = db.conn_lock();
+            conn.execute_batch(
+                "INSERT INTO roles (id, name) VALUES (1, 'admin'), (2, 'editor_role');
+                 INSERT INTO users (id, username) VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie');
+                 INSERT INTO knowledge_bases (id, name, owner_id) VALUES (10, '测试库', 1);
+                 INSERT INTO documents (id, kb_id, title, source, status) VALUES (100, 10, '测试文档', 'upload', 'ready');
+                 INSERT INTO kb_members (kb_id, user_id, role) VALUES (10, 1, 'editor'), (10, 2, 'viewer');",
+            )
+            .expect("seed data");
+        }
+        (db, dir)
+    }
+
+    // ─── RRF 融合测试 ───
+
+    #[test]
+    fn test_rrf_single_list() {
+        let v = vec![chunk(1, 0.9), chunk(2, 0.8)];
+        let fused = rrf_fuse(v.clone(), vec![], 60);
+        assert_eq!(fused.len(), 2);
+        assert!(
+            (fused[0].score - 1.0 / 61.0).abs() < 1e-12,
+            "rank0 分数应为 1/(k+1)"
+        );
+        assert!((fused[1].score - 1.0 / 62.0).abs() < 1e-12);
+        assert_eq!(fused[0].chunk_id, 1, "排序应保持原始相对顺序");
+        assert!(fused.iter().all(|c| c.source == "hybrid"));
+    }
+
+    #[test]
+    fn test_rrf_fusion_accumulates() {
+        // chunk2 在两路都出现，分数应累加并排第一
+        let v = vec![chunk(1, 0.9), chunk(2, 0.8)];
+        let b = vec![chunk(2, 0.7), chunk(3, 0.6)];
+        let fused = rrf_fuse(v, b, 60);
+        assert_eq!(fused.len(), 3, "两路共 3 个不同 chunk");
+        assert_eq!(fused[0].chunk_id, 2, "重复出现的 chunk 分数最高");
+        let expect = 1.0 / 62.0 + 1.0 / 61.0;
+        assert!(
+            (fused[0].score - expect).abs() < 1e-12,
+            "分数应为两路 RRF 之和"
+        );
+        // 其余按 RRF 分数降序：chunk1 (1/61) > chunk3 (1/62)
+        assert_eq!(fused[1].chunk_id, 1);
+        assert_eq!(fused[2].chunk_id, 3);
+    }
+
+    #[test]
+    fn test_rrf_empty_lists() {
+        assert!(rrf_fuse(vec![], vec![], 60).is_empty());
+        assert!(rrf_fuse(vec![chunk(1, 1.0)], vec![], 60).len() == 1);
+    }
+
+    #[test]
+    fn test_rrf_custom_k() {
+        let v = vec![chunk(9, 0.5)];
+        let fused = rrf_fuse(v, vec![], 10);
+        assert!((fused[0].score - 1.0 / 11.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_rrf_priority_orders() {
+        // 两路相同的重复情况：即使单路分数低，重复出现应占优
+        let v = vec![chunk(1, 1.0), chunk(2, 0.0)];
+        let b = vec![chunk(2, 0.0), chunk(3, 0.0)];
+        let fused = rrf_fuse(v, b, 60);
+        assert_eq!(fused[0].chunk_id, 2, "重复 chunk 优先于单路高分");
+    }
+
+    // ─── FTS 查询测试 ───
+
+    #[test]
+    fn test_fts_query_cjk_short_phrase() {
+        assert_eq!(crate::kb::fts_safe_query("测试文章"), "\"测 试 文 章\"");
+    }
+
+    #[test]
+    fn test_fts_query_cjk_long_sentence_or_terms() {
+        // 长中文整句不再作为单一短语，而是按单字 OR 展开，避免 0 命中
+        let q = crate::kb::fts_safe_query("自动化测试知识库中关于测试文章的要点有哪些？");
+        assert!(q.contains(" OR "), "长句应按单字 OR 展开，实际: {}", q);
+        assert!(!q.contains("？"), "中文标点应被过滤，实际: {}", q);
+        assert!(
+            q.starts_with("自 OR 动 OR 化"),
+            "应以单字 OR 开头，实际: {}",
+            q
+        );
+    }
+
+    #[test]
+    fn test_fts_query_cjk_punct_filtered() {
+        assert_eq!(crate::kb::fts_safe_query("要点？"), "\"要 点\"");
+        assert_eq!(crate::kb::fts_safe_query("知识库。"), "\"知 识 库\"");
+    }
+
+    #[test]
+    fn test_fts_query_ascii_quoted() {
+        assert_eq!(
+            crate::kb::fts_safe_query("hello world"),
+            "\"hello\" \"world\""
+        );
+        assert_eq!(crate::kb::fts_safe_query("RAG 检索"), "\"RAG\" \"检 索\"");
+    }
+
+    #[test]
+    fn test_fts_query_mixed_cjk_ascii() {
+        assert_eq!(
+            crate::kb::fts_safe_query("UI 测试文章"),
+            "\"UI\" \"测 试 文 章\""
+        );
+    }
+
+    #[test]
+    fn test_fts_query_empty_and_special_chars() {
+        assert!(crate::kb::fts_safe_query("").is_empty());
+        assert!(crate::kb::fts_safe_query("   ").is_empty());
+        assert_eq!(
+            crate::kb::fts_safe_query("测试(自动化)"),
+            "测 OR 试 OR 自 OR 动 OR 化"
+        );
+        assert!(crate::kb::fts_safe_query("……").is_empty(), "纯标点应返回空");
+    }
+
+    // ─── can_access_doc ACL 回归测试 ───
+
+    /// 测试1：无 ACL 规则时，库成员可访问、非成员不可访问
+    #[test]
+    fn test_can_access_doc_no_acl_inherits_kb() {
+        let (db, dir) = setup_test_db();
+        // user 1（alice）是 kb_members 中的 editor → 应可访问
+        assert!(can_access_doc(&db, 10, 100, 1), "kb 成员应可访问文档");
+        // user 3（charlie）不是 kb_members → 不可访问
+        assert!(!can_access_doc(&db, 10, 100, 3), "非 kb 成员不应访问文档");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试2（P1 回归）：给文档加一条只针对用户 C 的 deny 规则，用户 A（库成员）仍应可访问
+    /// 修复前的 bug：只要有任意文档级 ACL 规则就进入规则判定，导致规则只针对他人时误伤当前用户
+    #[test]
+    fn test_can_access_doc_rule_for_other_user_does_not_block() {
+        let (db, dir) = setup_test_db();
+        {
+            let conn = db.conn_lock();
+            // 给用户 3（charlie）加文档级 deny（scope=document）
+            conn.execute(
+                "INSERT INTO kb_acl (scope, doc_id, kb_id, grantee_type, user_id, effect, created_by)
+                 VALUES ('document', 100, 10, 'user', 3, 'deny', 1)",
+                [],
+            )
+            .expect("insert acl");
+        }
+        // user 1（alice, editor）：ACL 规则只针对 charlie，alice 无匹配规则 → 继承 kb 权限 → true
+        assert!(
+            can_access_doc(&db, 10, 100, 1),
+            "ACL 规则针对其他用户时，当前 kb 成员不应被误伤"
+        );
+        // user 3（charlie）：命中 deny → false
+        assert!(
+            !can_access_doc(&db, 10, 100, 3),
+            "被 deny 的用户应被拒绝访问"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试3：给当前用户加 deny → false
+    #[test]
+    fn test_can_access_doc_deny_current_user() {
+        let (db, dir) = setup_test_db();
+        {
+            let conn = db.conn_lock();
+            conn.execute(
+                "INSERT INTO kb_acl (scope, doc_id, kb_id, grantee_type, user_id, effect, created_by)
+                 VALUES ('document', 100, 10, 'user', 1, 'deny', 2)",
+                [],
+            )
+            .expect("insert deny acl");
+        }
+        assert!(
+            !can_access_doc(&db, 10, 100, 1),
+            "文档级 deny 应阻止当前用户访问"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试4：文档级 allow 生效；替换为 deny 后阻止访问；
+    /// 同时验证：非成员即使有文档级 allow 也被 KB 层拦截。
+    #[test]
+    fn test_can_access_doc_allow_current_user() {
+        let (db, dir) = setup_test_db();
+        {
+            let conn = db.conn_lock();
+            // 文档级 allow（user 1 是 kb 成员）
+            conn.execute(
+                "INSERT INTO kb_acl (scope, doc_id, kb_id, grantee_type, user_id, effect, created_by)
+                 VALUES ('document', 100, 10, 'user', 1, 'allow', 2)",
+                [],
+            )
+            .expect("insert allow");
+        }
+        // kb 成员 user 1 + 文档级 allow → true
+        assert!(
+            can_access_doc(&db, 10, 100, 1),
+            "文档级 allow 对 kb 成员应生效"
+        );
+        // 非成员 user 3 有文档级 allow 仍被 KB 层拦截
+        {
+            let conn = db.conn_lock();
+            conn.execute(
+                "INSERT INTO kb_acl (scope, doc_id, kb_id, grantee_type, user_id, effect, created_by)
+                 VALUES ('document', 100, 10, 'user', 3, 'allow', 1)",
+                [],
+            )
+            .expect("insert allow for user 3");
+        }
+        assert!(
+            !can_access_doc(&db, 10, 100, 3),
+            "非成员即使有文档级 allow 也被 KB 权限层拦截"
+        );
+        // 将 user 1 的规则从 allow 替换为 deny（先删后插，模拟 kb_set_acl 行为）
+        {
+            let conn = db.conn_lock();
+            conn.execute(
+                "DELETE FROM kb_acl WHERE scope='document' AND doc_id=100 AND grantee_type='user' AND user_id=1",
+                [],
+            )
+            .expect("delete allow");
+            conn.execute(
+                "INSERT INTO kb_acl (scope, doc_id, kb_id, grantee_type, user_id, effect, created_by)
+                 VALUES ('document', 100, 10, 'user', 1, 'deny', 2)",
+                [],
+            )
+            .expect("insert deny");
+        }
+        assert!(
+            !can_access_doc(&db, 10, 100, 1),
+            "将 allow 替换为 deny 后应阻止访问"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试5：public allow → 成员 true；public deny → false
+    #[test]
+    fn test_can_access_doc_public_rules() {
+        let (db, dir) = setup_test_db();
+        {
+            let conn = db.conn_lock();
+            // public allow（文档级 public 规则对所有用户生效，但需先通过 can_access_kb）
+            conn.execute(
+                "INSERT INTO kb_acl (scope, doc_id, kb_id, grantee_type, effect, created_by)
+                 VALUES ('document', 100, 10, 'public', 'allow', 1)",
+                [],
+            )
+            .expect("insert public allow");
+        }
+        // 成员 user 1 → true（通过 kb 权限 + public allow 匹配）
+        assert!(
+            can_access_doc(&db, 10, 100, 1),
+            "public allow 时成员应可访问"
+        );
+        {
+            let conn = db.conn_lock();
+            // 追加 public deny → deny 优先，即使成员也被拒
+            conn.execute(
+                "INSERT INTO kb_acl (scope, doc_id, kb_id, grantee_type, effect, created_by)
+                 VALUES ('document', 100, 10, 'public', 'deny', 1)",
+                [],
+            )
+            .expect("insert public deny");
+        }
+        assert!(
+            !can_access_doc(&db, 10, 100, 1),
+            "public deny 应覆盖 public allow（deny 优先），成员也被拒"
+        );
+        // 非成员 user 3 → false（can_access_kb 已拒绝，public deny 兜底也拒绝）
+        assert!(
+            !can_access_doc(&db, 10, 100, 3),
+            "非成员无论 public 规则如何均应被拒（KB 层先拦截）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 测试6：角色级 ACL 规则生效（role allow / role deny）
+    #[test]
+    fn test_can_access_doc_role_rules() {
+        let (db, dir) = setup_test_db();
+        // 给 user 1 分配 editor_role（role_id=2）
+        {
+            let conn = db.conn_lock();
+            conn.execute(
+                "INSERT INTO user_roles (user_id, role_id) VALUES (1, 2)",
+                [],
+            )
+            .expect("insert user role");
+            // 文档级 role deny
+            conn.execute(
+                "INSERT INTO kb_acl (scope, doc_id, kb_id, grantee_type, role_id, effect, created_by)
+                 VALUES ('document', 100, 10, 'role', 2, 'deny', 2)",
+                [],
+            )
+            .expect("insert role deny");
+        }
+        // user 1 有 editor_role → 命中 role deny → false
+        assert!(
+            !can_access_doc(&db, 10, 100, 1),
+            "角色级 deny 应阻止拥有该角色的用户"
+        );
+        // user 2 无 editor_role → 无匹配规则 → 继承 kb 权限 → true
+        assert!(
+            can_access_doc(&db, 10, 100, 2),
+            "无匹配角色规则时应继承 kb 权限"
+        );
+        {
+            let conn = db.conn_lock();
+            // 删 deny，改为 role allow
+            conn.execute(
+                "DELETE FROM kb_acl WHERE scope='document' AND doc_id=100 AND grantee_type='role' AND role_id=2",
+                [],
+            )
+            .expect("delete deny");
+            conn.execute(
+                "INSERT INTO kb_acl (scope, doc_id, kb_id, grantee_type, role_id, effect, created_by)
+                 VALUES ('document', 100, 10, 'role', 2, 'allow', 1)",
+                [],
+            )
+            .expect("insert role allow");
+        }
+        assert!(
+            can_access_doc(&db, 10, 100, 1),
+            "角色级 allow 应允许拥有该角色的用户"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ─── require_kb_role 测试 ───
+
+    /// viewer 被拒、editor 通过（验证 kb_members 的 role 字段）
+    #[test]
+    fn test_require_kb_role_viewer_rejected_editor_passes() {
+        let (db, dir) = setup_test_db();
+        // user 1 的 kb_members.role = 'editor' → require "editor" 应通过
+        let role = require_kb_role(&db, 10, 1, "editor");
+        assert!(role.is_ok(), "editor 应通过 require_kb_role('editor')");
+        assert_eq!(role.unwrap(), "editor");
+        // user 2 的 kb_members.role = 'viewer' → require "editor" 应被拒
+        let err = require_kb_role(&db, 10, 2, "editor");
+        assert!(err.is_err(), "viewer 不应通过 require_kb_role('editor')");
+        assert!(
+            err.unwrap_err().contains("无权限"),
+            "错误信息应包含「无权限」"
+        );
+        // user 3 非成员 → require 任意角色均应被拒
+        let err = require_kb_role(&db, 10, 3, "viewer");
+        assert!(err.is_err(), "非成员不应通过 require_kb_role");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

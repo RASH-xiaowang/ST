@@ -623,23 +623,50 @@ pub async fn kb_create(
     })
 }
 
-/// 首次启动确保存在「系统知识库」（知识收集的核心载体，不可删除/重命名）
+/// 首次启动确保存在「系统知识库」（知识收集的核心载体，不可删除/重命名）。
+/// 同时把全局管理员（含默认 admin / id=1）加入为 owner 成员——
+/// 否则 kb_list 按「成员 ∪ ACL」过滤时，系统库对谁都不可见。
 pub fn ensure_system_kb(db: &KbDatabase) {
     let conn = db.conn_lock();
-    let exists: i64 = conn
+    let kb_id: Option<i64> = conn
         .query_row(
-            "SELECT COUNT(*) FROM knowledge_bases WHERE is_system = 1",
+            "SELECT id FROM knowledge_bases WHERE is_system = 1 ORDER BY id LIMIT 1",
             [],
             |r| r.get(0),
         )
-        .unwrap_or(0);
-    if exists == 0 {
-        let _ = conn.execute(
-            "INSERT INTO knowledge_bases (name, description, is_system, owner_id)
-             VALUES ('系统知识库', '知识收集的核心载体，用于统一归档、解析与检索', 1, 1)",
-            [],
-        );
-    }
+        .ok();
+    let kb_id = match kb_id {
+        Some(id) => Some(id),
+        None => {
+            // owner_id 取首个管理员；首启尚未 seed 用户时置 NULL，避免外键失败
+            let owner_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM users WHERE is_admin = 1 OR lower(username) = 'admin' OR id = 1 ORDER BY id LIMIT 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
+            let _ = conn.execute(
+                "INSERT INTO knowledge_bases (name, description, is_system, owner_id)
+                 VALUES ('系统知识库', '知识收集的核心载体，用于统一归档、解析与检索', 1, ?1)",
+                rusqlite::params![owner_id],
+            );
+            conn.query_row(
+                "SELECT id FROM knowledge_bases WHERE is_system = 1 ORDER BY id LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+        }
+    };
+    let Some(kb_id) = kb_id else { return };
+    // 管理员成员（幂等）；若用户尚未 seed，登录后再次触发本函数即可补上
+    let _ = conn.execute(
+        "INSERT OR IGNORE INTO kb_members (kb_id, user_id, role)
+         SELECT ?1, u.id, 'owner' FROM users u
+         WHERE u.is_admin = 1 OR lower(u.username) = 'admin' OR u.id = 1",
+        rusqlite::params![kb_id],
+    );
 }
 
 #[tauri::command]
@@ -650,6 +677,8 @@ pub async fn kb_list(
 ) -> Result<Vec<KbSummary>, String> {
     // 以登录态为准，不允许回退到前端传入的 user_id（防越权）
     let uid = session.get().map(|u| u.id).ok_or("请先登录知识库")?;
+    // 懒加载确保系统知识库存在（覆盖升级前已存在的老库；登录后管理员可见）
+    ensure_system_kb(&db);
     // 与检索侧一致：用 visible_kb_ids（成员 ∪ ACL allow − deny）过滤
     let visible = crate::kb::retrieval::visible_kb_ids(&db, uid);
     if visible.is_empty() {
@@ -688,7 +717,8 @@ pub async fn kb_list(
 }
 
 /// 删除知识库（原子事务 + 全表清理），供 tauri 命令与集成测试复用。
-/// 逐表显式清理（不依赖外键级联），保证删除后不残留任何关联数据。
+/// 逐表显式清理主表（documents 等），依赖外键级联（ON DELETE CASCADE）清理子表
+/// （document_chunks、document_versions 等），要求 PRAGMA foreign_keys = ON。
 pub(crate) fn delete_kb_clean(db: &KbDatabase, kb_id: i64) -> Result<(), String> {
     let mut conn = db.conn_lock();
     // 整体包在事务里：任何一步失败都整体回滚，绝不留下“删了一半”的知识库残留。
@@ -717,8 +747,8 @@ pub(crate) fn delete_kb_clean(db: &KbDatabase, kb_id: i64) -> Result<(), String>
         rows.filter_map(|r| r.ok()).collect()
     };
 
-    // 2) 显式清理全部关联表（依赖顺序：先子后父；FTS 表无外键必须手动清理）
-    //    即使外键级联已开启，显式删除也更稳、更快、不依赖 FK 配置。
+    // 2) 显式清理关联表：FTS 表无外键必须手动清理；其余子表按 doc_id 等关联显式删除。
+    //    主表 documents 在下方循环中删除，其子表（document_chunks 等）依赖 ON DELETE CASCADE 兜底。
     for doc_id in &doc_ids {
         crate::kb::db::fts_delete_chunks_by_doc(&tx, *doc_id)?;
     }
@@ -1163,6 +1193,80 @@ mod tests {
             .unwrap();
         assert_eq!(keep, 1, "其他知识库数据不受影响");
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// 系统知识库：ensure_system_kb 幂等创建，并把全局管理员加入为 owner 成员（否则列表不可见）。
+    #[test]
+    fn ensure_system_kb_creates_and_grants_admin() {
+        let dir = std::env::temp_dir().join(format!(
+            "kb_sys_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).ok();
+        let db = KbDatabase::open_at(dir.join("test.db")).expect("open kb db");
+        // 首启：无任何用户 → 系统库创建成功（owner 为 NULL，避免外键失败）
+        ensure_system_kb(&db);
+        {
+            let conn = db.conn_lock();
+            let (cnt, owner): (i64, Option<i64>) = conn
+                .query_row(
+                    "SELECT COUNT(*), (SELECT owner_id FROM knowledge_bases WHERE is_system = 1) FROM knowledge_bases WHERE is_system = 1",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(cnt, 1, "系统知识库应恰好一个");
+            assert!(owner.is_none(), "无用户时 owner 应为 NULL");
+        }
+        // 幂等：再次调用不重复创建
+        ensure_system_kb(&db);
+        {
+            let conn = db.conn_lock();
+            let cnt: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM knowledge_bases WHERE is_system = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(cnt, 1, "重复调用不应重复创建");
+        }
+        // 登录后（admin 已 seed）：管理员成为 owner 成员，且系统库对其可见
+        {
+            let conn = db.conn_lock();
+            conn.execute(
+                "INSERT INTO users (id, username, is_admin) VALUES (1, 'admin', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        ensure_system_kb(&db);
+        {
+            let conn = db.conn_lock();
+            let is_member: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM kb_members m JOIN knowledge_bases k ON k.id = m.kb_id WHERE k.is_system = 1 AND m.user_id = 1 AND m.role = 'owner'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(is_member, 1, "管理员应是系统库 owner 成员");
+        }
+        let sys_id: i64 = {
+            let conn = db.conn_lock();
+            conn.query_row(
+                "SELECT id FROM knowledge_bases WHERE is_system = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let visible = crate::kb::retrieval::visible_kb_ids(&db, 1);
+        assert!(visible.contains(&sys_id), "系统库应对管理员可见");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

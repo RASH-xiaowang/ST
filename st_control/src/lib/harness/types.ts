@@ -377,7 +377,8 @@ export interface FeedbackRecord {
   id: number;
   session_id: string;
   rating: string;
-  comment: string;  /** 助手消息序号（消息级反馈） */
+  comment: string;
+  /** 助手消息序号（消息级反馈） */
   message_seq?: number | null;
   created_at: string;
 }

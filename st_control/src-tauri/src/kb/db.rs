@@ -6,6 +6,7 @@
 // ============================================================
 
 use rusqlite::{Connection, Result as SqlResult};
+use serde::Serialize;
 use std::path::PathBuf;
 
 /// 知识库数据库连接（单例，由 Tauri State 管理）。
@@ -361,6 +362,18 @@ impl KbDatabase {
         Ok(())
     }
 
+    /// 检查 FTS 索引与内容表的一致性（轻量，不重建）
+    pub fn check_fts_consistency(&self) -> Result<FtsConsistencyReport, String> {
+        let conn = self.pool.get().map_err(|e| e.to_string())?;
+        check_fts_consistency_conn(&conn)
+    }
+
+    /// 检查并修复 FTS 索引一致性：若存在不一致则全量重建
+    pub fn repair_fts_consistency(&self) -> Result<FtsConsistencyReport, String> {
+        let conn = self.pool.get().map_err(|e| e.to_string())?;
+        repair_fts_consistency_conn(&conn)
+    }
+
     // ─── 通用访问 ───
 
     pub fn conn_lock(&self) -> r2d2::PooledConnection<r2d2_sqlite::SqliteConnectionManager> {
@@ -492,10 +505,127 @@ pub fn fts_delete_wiki_pages_by_kb(conn: &Connection, kb_id: i64) -> Result<(), 
     .map(|_| ())
 }
 
-/// 当前登录用户占位（后续接入真实登录态后替换为运行时身份）
-pub const CURRENT_USER: i64 = 1;
+/// FTS 索引一致性检查报告
+#[derive(Serialize, Default)]
+pub struct FtsConsistencyReport {
+    pub chunks_total: i64,
+    pub chunks_fts_total: i64,
+    pub missing_chunks: Vec<i64>,
+    pub orphan_chunks: Vec<i64>,
+    pub wiki_total: i64,
+    pub wiki_fts_total: i64,
+    pub missing_wiki: Vec<i64>,
+    pub orphan_wiki: Vec<i64>,
+    pub ok: bool,
+    pub fixed: bool,
+}
 
-/// 将 f64 向量序列化为 BLOB（小端 f32，节省空间）
+/// 对连接执行 FTS 一致性检查（内部辅助，便于内存连接测试）
+fn check_fts_consistency_conn(conn: &Connection) -> Result<FtsConsistencyReport, String> {
+    // 总数
+    let chunks_total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM document_chunks", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let chunks_fts_total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks_fts", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let wiki_total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM wiki_pages", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    let wiki_fts_total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM wiki_pages_fts", [], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+
+    // a) missing_chunks: 在 document_chunks 但不在 chunks_fts
+    let missing_chunks: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT c.id FROM document_chunks c LEFT JOIN chunks_fts f ON f.rowid = c.id WHERE f.rowid IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // b) orphan_chunks: 在 chunks_fts 但不在 document_chunks
+    let orphan_chunks: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT f.rowid FROM chunks_fts f LEFT JOIN document_chunks c ON c.id = f.rowid WHERE c.id IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // c) missing_wiki: 在 wiki_pages 但不在 wiki_pages_fts
+    let missing_wiki: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT p.id FROM wiki_pages p LEFT JOIN wiki_pages_fts f ON f.rowid = p.id WHERE f.rowid IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    // d) orphan_wiki: 在 wiki_pages_fts 但不在 wiki_pages
+    let orphan_wiki: Vec<i64> = {
+        let mut stmt = conn
+            .prepare("SELECT f.rowid FROM wiki_pages_fts f LEFT JOIN wiki_pages p ON p.id = f.rowid WHERE p.id IS NULL")
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, i64>(0))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+
+    let ok = missing_chunks.is_empty()
+        && orphan_chunks.is_empty()
+        && missing_wiki.is_empty()
+        && orphan_wiki.is_empty();
+
+    Ok(FtsConsistencyReport {
+        chunks_total,
+        chunks_fts_total,
+        missing_chunks,
+        orphan_chunks,
+        wiki_total,
+        wiki_fts_total,
+        missing_wiki,
+        orphan_wiki,
+        ok,
+        ..Default::default()
+    })
+}
+
+/// 检查并修复 FTS 一致性：不一致时全量重建
+fn repair_fts_consistency_conn(conn: &Connection) -> Result<FtsConsistencyReport, String> {
+    let report = check_fts_consistency_conn(conn)?;
+    if report.ok {
+        return Ok(report);
+    }
+    log::warn!(
+        "FTS 索引不一致：missing_chunks={} orphan_chunks={} missing_wiki={} orphan_wiki={}，执行全量重建",
+        report.missing_chunks.len(),
+        report.orphan_chunks.len(),
+        report.missing_wiki.len(),
+        report.orphan_wiki.len(),
+    );
+    KbDatabase::rebuild_fts_indexes(conn).map_err(|e| e.to_string())?;
+    let mut final_report = check_fts_consistency_conn(conn)?;
+    final_report.fixed = true;
+    Ok(final_report)
+}
+
+// ════════════════════════════════════════════════════════════
+// 向量序列化 / 余弦相似度
+// ════════════════════════════════════════════════════════════
+
+/// 将 f64 向量序列化为 BLOB（小端 f32，节省空间）。
+///
+/// 精度说明：f32 相对误差约 1e-6，对余弦相似度排序影响可忽略；
+/// 如未来需要更高精度（如需要精确还原原始向量），应改用 f64 存储并升级 schema（每维 8 字节）。
 pub fn serialize_embedding(vec: &[f64]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(vec.len() * 4);
     for v in vec {
@@ -608,5 +738,115 @@ mod tests {
             0.0,
             "零向量返回 0"
         );
+    }
+
+    /// 创建一个初始化好 schema 的内存连接（用于 FTS 一致性测试）
+    fn test_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; PRAGMA foreign_keys=ON;",
+        )
+        .unwrap();
+        KbDatabase::init_tables(&conn).unwrap();
+        conn
+    }
+
+    /// 空库应完全一致
+    #[test]
+    fn test_fts_consistency_empty_db() {
+        let conn = test_conn();
+        let report = check_fts_consistency_conn(&conn).unwrap();
+        assert!(report.ok, "空库 FTS 应一致");
+        assert_eq!(report.chunks_total, 0);
+        assert_eq!(report.chunks_fts_total, 0);
+        assert_eq!(report.wiki_total, 0);
+        assert_eq!(report.wiki_fts_total, 0);
+        assert!(report.missing_chunks.is_empty());
+        assert!(report.orphan_chunks.is_empty());
+        assert!(report.missing_wiki.is_empty());
+        assert!(report.orphan_wiki.is_empty());
+    }
+
+    /// 手动插入 document_chunks 但不插 chunks_fts → check 报告 missing；repair 后 ok 且 fixed=true
+    #[test]
+    fn test_fts_consistency_missing_chunk_then_repair() {
+        let conn = test_conn();
+        // 构造外键依赖
+        conn.execute(
+            "INSERT INTO knowledge_bases (id, name) VALUES (1, 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (id, kb_id, title) VALUES (1, 1, 'test_doc')",
+            [],
+        )
+        .unwrap();
+        // 插入分块，但跳过 FTS（模拟漏调）
+        conn.execute(
+            "INSERT INTO document_chunks (id, kb_id, doc_id, seq, content) VALUES (1, 1, 1, 1, '你好世界')",
+            [],
+        )
+        .unwrap();
+
+        let report = check_fts_consistency_conn(&conn).unwrap();
+        assert!(!report.ok, "应检测到不一致");
+        assert_eq!(report.missing_chunks, vec![1i64]);
+        assert_eq!(report.chunks_total, 1);
+        assert_eq!(report.chunks_fts_total, 0);
+
+        // 修复
+        let repaired = repair_fts_consistency_conn(&conn).unwrap();
+        assert!(repaired.ok, "修复后应一致");
+        assert!(repaired.fixed, "fixed 应为 true");
+        assert!(repaired.missing_chunks.is_empty());
+    }
+
+    /// 手动向 chunks_fts 插入一条不存在的 rowid → 报告 orphan；repair 后 ok
+    #[test]
+    fn test_fts_consistency_orphan_chunk_then_repair() {
+        let conn = test_conn();
+        // 直接向 FTS 表插入孤立记录（document_chunks 无对应 id=999）
+        conn.execute(
+            "INSERT INTO chunks_fts (rowid, content) VALUES (999, '孤立内容')",
+            [],
+        )
+        .unwrap();
+
+        let report = check_fts_consistency_conn(&conn).unwrap();
+        assert!(!report.ok, "应检测到 orphan");
+        assert_eq!(report.orphan_chunks, vec![999i64]);
+        assert_eq!(report.chunks_fts_total, 1);
+        assert_eq!(report.chunks_total, 0);
+
+        // 修复
+        let repaired = repair_fts_consistency_conn(&conn).unwrap();
+        assert!(repaired.ok, "修复后应一致");
+        assert!(repaired.fixed);
+        assert!(repaired.orphan_chunks.is_empty());
+    }
+
+    /// wiki_pages 侧缺失：插入 wiki_pages 但不插 wiki_pages_fts → check 报告 missing_wiki
+    #[test]
+    fn test_fts_consistency_missing_wiki_then_repair() {
+        let conn = test_conn();
+        conn.execute(
+            "INSERT INTO knowledge_bases (id, name) VALUES (1, 'test')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO wiki_pages (id, kb_id, title, slug) VALUES (1, 1, '测试页', 'test')",
+            [],
+        )
+        .unwrap();
+
+        let report = check_fts_consistency_conn(&conn).unwrap();
+        assert!(!report.ok);
+        assert_eq!(report.missing_wiki, vec![1i64]);
+
+        let repaired = repair_fts_consistency_conn(&conn).unwrap();
+        assert!(repaired.ok);
+        assert!(repaired.fixed);
     }
 }

@@ -10,6 +10,8 @@
 // ============================================================
 
 use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// 文件系统政策（来自用户设置）
 #[derive(Clone, Debug, Default)]
@@ -34,6 +36,65 @@ fn is_heavy_dir(name: &str) -> bool {
         name,
         "target" | "node_modules" | ".git" | "dist" | ".svelte-kit" | "build"
     )
+}
+
+// ─── 读-改-写观察策略（DSH fs-observation-policy 迁移） ───
+// edit/write 现有文件前须先读取过该文件（read_file / str_replace_editor view），
+// 并校验当前指纹与观察指纹一致（防陈旧覆盖）；新建文件豁免。
+// 全局简化版：真实 owner（会话）粒度需把 session 传入工具执行
+// （execute_tool_guarded 走 spawn_blocking，线程局部不可用），故以
+// 「最近被读取过」为最小安全门槛。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FileFingerprint {
+    len: u64,
+    modified_ms: u64,
+}
+
+fn observations() -> &'static Mutex<HashMap<std::path::PathBuf, FileFingerprint>> {
+    static O: OnceLock<Mutex<HashMap<std::path::PathBuf, FileFingerprint>>> = OnceLock::new();
+    O.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn fingerprint_of(p: &std::path::Path) -> Option<FileFingerprint> {
+    let meta = std::fs::metadata(p).ok()?;
+    let modified_ms = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Some(FileFingerprint {
+        len: meta.len(),
+        modified_ms,
+    })
+}
+
+fn record_observation(p: &std::path::Path) {
+    if let Some(fp) = fingerprint_of(p) {
+        observations().lock().unwrap().insert(p.to_path_buf(), fp);
+    }
+}
+
+fn forget_observation(p: &std::path::Path) {
+    observations().lock().unwrap().remove(p);
+}
+
+/// 校验观察：存在且指纹未变则 Ok；未观察或已变更则 Err（引导先 read_file）
+fn require_observation(p: &std::path::Path) -> Result<(), String> {
+    let obs = observations().lock().unwrap();
+    match obs.get(p) {
+        Some(observed) => match fingerprint_of(p) {
+            Some(cur) if cur == *observed => Ok(()),
+            _ => Err(format!(
+                "文件已被修改：{}（请先 read_file 重新读取后再编辑/写入，避免基于陈旧内容覆盖）",
+                p.display()
+            )),
+        },
+        None => Err(format!(
+            "尚未读取过该文件：{}（请先 read_file 读取后再编辑/写入）",
+            p.display()
+        )),
+    }
 }
 
 /// 文件系统能力服务（本地工作区沙箱提供者）
@@ -72,6 +133,7 @@ impl FsService {
         }
         let bytes = std::fs::read(&p).map_err(|e| format!("读取失败: {}", e))?;
         let text = String::from_utf8_lossy(&bytes);
+        record_observation(&p);
         // 上限 64KB，超出截断（字符边界安全，避免中文内容 panic）
         Ok(if text.len() > 64 * 1024 {
             let end = text.floor_char_boundary(64 * 1024);
@@ -81,6 +143,33 @@ impl FsService {
         })
     }
 
+    /// 行窗口读取（DSH read(file_path, offset?, limit?) 语义）：返回带行号的
+    /// [offset, offset+limit) 行区间与总行数；offset 1-based。记录观察
+    /// （读-改-写策略），返回的窗口内容授权后续 edit/write。
+    pub fn read_lines(
+        &self,
+        path: &str,
+        offset: usize,
+        limit: usize,
+        policy: &FsPolicy,
+    ) -> Result<(Vec<(usize, String)>, usize), String> {
+        let p = self.resolve(path, policy)?;
+        if !p.is_file() {
+            return Err(format!("不是文件: {}", p.display()));
+        }
+        let bytes = std::fs::read(&p).map_err(|e| format!("读取失败: {}", e))?;
+        let text = String::from_utf8_lossy(&bytes);
+        let all: Vec<&str> = text.lines().collect();
+        let total = all.len();
+        let start = (offset.max(1) - 1).min(total);
+        let end = (start + limit).min(total);
+        let mut out = Vec::new();
+        for (i, line) in all[start..end].iter().enumerate() {
+            out.push((start + i + 1, line.to_string()));
+        }
+        record_observation(&p);
+        Ok((out, total))
+    }
     pub fn write_text(
         &self,
         path: &str,
@@ -94,7 +183,11 @@ impl FsService {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
         }
+        if p.exists() {
+            require_observation(&p)?;
+        }
         std::fs::write(&p, content).map_err(|e| format!("写入失败: {}", e))?;
+        record_observation(&p);
         Ok(content.len())
     }
 
@@ -117,6 +210,7 @@ impl FsService {
             std::fs::remove_dir_all(&p).map_err(|e| format!("删除目录失败: {}", e))?;
         } else {
             std::fs::remove_file(&p).map_err(|e| format!("删除文件失败: {}", e))?;
+            forget_observation(&p);
         }
         Ok(())
     }
@@ -138,6 +232,7 @@ impl FsService {
         if !p.is_file() {
             return Err(format!("不是文件: {}", p.display()));
         }
+        require_observation(&p)?;
         let text = std::fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
         let count = text.matches(old_string).count();
         if count == 0 {
@@ -154,6 +249,7 @@ impl FsService {
             text.replacen(old_string, new_string, 1)
         };
         std::fs::write(&p, new_text.as_bytes()).map_err(|e| format!("写入失败: {}", e))?;
+        record_observation(&p);
         Ok(count)
     }
 
@@ -202,6 +298,7 @@ impl FsService {
             return Err(format!("不是文件也不是目录: {}", p.display()));
         }
         let text = std::fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
+        record_observation(&p);
         let all_lines: Vec<&str> = text.split('\n').collect();
         let total = all_lines.len();
         let (start, end) = match view_range {
@@ -257,6 +354,7 @@ impl FsService {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {}", e))?;
         }
         std::fs::write(&p, file_text.as_bytes()).map_err(|e| format!("写入失败: {}", e))?;
+        record_observation(&p);
         Ok(format!("已创建新文件: {}", p.display()))
     }
 
@@ -273,6 +371,7 @@ impl FsService {
         if !p.is_file() {
             return Err(format!("不是文件: {}", p.display()));
         }
+        require_observation(&p)?;
         let text = std::fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
         let mut offsets: Vec<usize> = Vec::new();
         let mut from = 0usize;
@@ -295,6 +394,7 @@ impl FsService {
                     &text[offset + old_str.len()..]
                 );
                 std::fs::write(&p, new_text.as_bytes()).map_err(|e| format!("写入失败: {}", e))?;
+                record_observation(&p);
                 Ok(format!("文件已编辑成功: {}", p.display()))
             }
             _ => {
@@ -325,6 +425,7 @@ impl FsService {
         if !p.is_file() {
             return Err(format!("不是文件: {}", p.display()));
         }
+        require_observation(&p)?;
         let text = std::fs::read_to_string(&p).map_err(|e| format!("读取失败: {}", e))?;
         let lines: Vec<&str> = text.split('\n').collect();
         let n = lines.len() as i64;
@@ -340,46 +441,65 @@ impl FsService {
         out.extend_from_slice(&lines[at..]);
         let joined = out.join("\n");
         std::fs::write(&p, joined.as_bytes()).map_err(|e| format!("写入失败: {}", e))?;
+        record_observation(&p);
         Ok(format!("文件已编辑成功: {}", p.display()))
     }
 
-    /// glob 文件发现（DSH glob 工具语义）：当前工作区内匹配，支持 **、*、?
-    pub fn glob(&self, pattern: &str, policy: &FsPolicy) -> Result<Vec<String>, String> {
+    /// glob 文件发现（DSH glob 工具语义）：工作区内按模式发现文件/目录。
+    /// pattern 支持 **、*、?、[...] 字符类与 {a,b} 交替（先编译为等价正则，
+    /// 无效模式提前报错）；path 为搜索根（空 = 工作区根，相对路径锚定工作区）。
+    pub fn glob(
+        &self,
+        pattern: &str,
+        path: &str,
+        policy: &FsPolicy,
+    ) -> Result<Vec<String>, String> {
         let pattern = pattern.trim().replace('\\', "/");
         if pattern.is_empty() {
             return Err("pattern 不能为空".to_string());
         }
         let root = crate::harness::workspace::sandbox_root();
-        // 模式锚定：以 / 开头视为相对工作区根
+        // 搜索根：path 空 = 工作区根；否则按政策解析（越界需 policy 放行）
+        let base = if path.trim().is_empty() {
+            root.clone()
+        } else {
+            self.resolve(path, policy)?
+        };
+        if !base.is_dir() {
+            return Err(format!("搜索根不是目录: {}", base.display()));
+        }
+        // 模式锚定：以 / 开头视为相对搜索根
         let pattern = pattern.trim_start_matches('/').to_string();
+        let re = compile_glob(&pattern)?;
         let mut out = Vec::new();
-        let mut stack = vec![root.clone()];
+        let mut stack = vec![base.clone()];
         while let Some(dir) = stack.pop() {
             let entries = match std::fs::read_dir(&dir) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
             for e in entries.flatten() {
-                let path = e.path();
+                let p = e.path();
                 let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
                 if is_dir && is_heavy_dir(&e.file_name().to_string_lossy()) {
                     continue; // 跳过构建/依赖重目录（项目根工作区下避免扫 target/node_modules）
                 }
-                let rel = path
-                    .strip_prefix(&root)
-                    .unwrap_or(&path)
+                let rel = p
+                    .strip_prefix(&base)
+                    .unwrap_or(&p)
                     .to_string_lossy()
                     .replace('\\', "/");
+                let rel = rel.strip_prefix('/').unwrap_or(&rel).to_string();
                 if is_dir {
                     // ** 段可匹配任意深度：目录也尝试匹配，并继续下钻
-                    if glob_match(&pattern, &rel) {
+                    if re.is_match(&rel) {
                         out.push(format!("{}/", rel));
                     }
-                    stack.push(path);
+                    stack.push(p);
                     if out.len() > 2000 {
                         break;
                     }
-                } else if glob_match(&pattern, &rel) {
+                } else if re.is_match(&rel) {
                     out.push(rel);
                     if out.len() > 2000 {
                         break;
@@ -388,17 +508,49 @@ impl FsService {
             }
         }
         out.sort();
-        out.truncate(200);
-        if out.is_empty() {
+        let total = out.len();
+        if total > 200 {
+            // 截断感知 + 完整列表落盘（DSH sampleOverCapGlobResults）：
+            // 模型经 spill_read 可跨会话取回全部匹配；提示位于首行
+            let full = out.join("\n");
+            let note = match crate::harness::spill::SpillStore::save_shared(&full) {
+                Ok(r) => format!(
+                    "（共 {total} 条匹配，仅显示前 200 条；完整列表 locator: {}，可用 spill_read 取回）",
+                    r.locator
+                ),
+                Err(_) => format!(
+                    "（共 {total} 条匹配，仅显示前 200 条；可缩小 glob 模式或指定 path 收窄范围）"
+                ),
+            };
+            out.insert(0, note);
+            out.truncate(201);
+        } else if out.is_empty() {
             return Ok(Vec::new());
         }
-        let _ = policy; // 工作区锚定即沙箱约束
         Ok(out)
     }
 
     /// grep 文本搜索（DSH grep 工具语义）：regex 匹配，返回 file:line:内容
-    pub fn grep(&self, pattern: &str, path: &str, policy: &FsPolicy) -> Result<String, String> {
-        let re = regex::Regex::new(pattern).map_err(|e| format!("正则表达式无效: {e}"))?;
+    /// grep 文本搜索（DSH grep 工具语义）：regex 匹配，返回 file:line:内容。
+    /// include 为正向 glob 过滤器（仅搜索路径匹配该 glob 的文件）；
+    /// 二进制文件（探测段含 NUL）与超大文件（> 8MB）自动跳过（对齐 ripgrep）。
+    pub fn grep(
+        &self,
+        pattern: &str,
+        path: &str,
+        include: &str,
+        case_insensitive: bool,
+        policy: &FsPolicy,
+    ) -> Result<String, String> {
+        let re = regex::RegexBuilder::new(pattern)
+            .case_insensitive(case_insensitive)
+            .build()
+            .map_err(|e| format!("正则表达式无效: {e}"))?;
+        let include_re = if include.trim().is_empty() {
+            None
+        } else {
+            Some(compile_glob(&include.trim().replace('\\', "/"))?)
+        };
         let base = self.resolve(if path.is_empty() { "." } else { path }, policy)?;
         let mut files: Vec<std::path::PathBuf> = Vec::new();
         if base.is_file() {
@@ -424,16 +576,48 @@ impl FsService {
             }
         }
         files.sort();
+        let sandbox_root = crate::harness::workspace::sandbox_root();
         let mut out_lines = Vec::new();
         'outer: for f in files {
-            if out_lines.len() >= 200 {
+            if out_lines.len() >= GREP_MAX_COLLECT {
                 break;
             }
-            let Ok(text) = std::fs::read_to_string(&f) else {
+            // include 过滤器：相对工作区根（或绝对路径原文）的 / 归一化路径
+            if let Some(inc) = &include_re {
+                let rel = f
+                    .strip_prefix(&sandbox_root)
+                    .unwrap_or(&f)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let rel = rel.strip_prefix("//?/").unwrap_or(&rel);
+                let rel = rel.strip_prefix('/').unwrap_or(rel);
+                if !inc.is_match(rel) {
+                    // ripgrep -g 语义：无 / 的 glob（如 *.rs）匹配任意层级 basename
+                    let basename = std::path::Path::new(&f)
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    if !inc.is_match(&basename) {
+                        continue;
+                    }
+                }
+            }
+            // 大小上限 + 二进制检测（DSH ripgrep：默认跳过二进制与超大文件）
+            let Ok(meta) = std::fs::metadata(&f) else {
                 continue;
             };
+            if meta.len() > GREP_MAX_FILE_BYTES {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&f) else {
+                continue;
+            };
+            if looks_binary(&bytes) {
+                continue;
+            }
+            let text = String::from_utf8_lossy(&bytes);
             let rel = f
-                .strip_prefix(crate::harness::workspace::sandbox_root())
+                .strip_prefix(&sandbox_root)
                 .unwrap_or(&f)
                 .to_string_lossy()
                 .replace('\\', "/");
@@ -447,7 +631,7 @@ impl FsService {
                         i + 1,
                         line.trim_end().chars().take(300).collect::<String>()
                     ));
-                    if out_lines.len() >= 200 {
+                    if out_lines.len() >= GREP_MAX_COLLECT {
                         break 'outer;
                     }
                 }
@@ -456,7 +640,22 @@ impl FsService {
         if out_lines.is_empty() {
             return Ok("（无匹配）".to_string());
         }
-        Ok(out_lines.join("\n"))
+        let mut body = out_lines.join("\n");
+        // 截断感知 + 完整列表落盘（DSH sampleOverCapGlobResults）：
+        // 命中超过内联上限时把完整列表存共享溢写，模型经 spill_read 取回
+        if out_lines.len() > 200 {
+            let full = out_lines.join("\n");
+            let note = match crate::harness::spill::SpillStore::save_shared(&full) {
+                Ok(r) => format!(
+                    "（共 {} 条匹配，已显示前 200 条；完整列表 locator: {}，可用 spill_read 取回）",
+                    out_lines.len(),
+                    r.locator
+                ),
+                Err(_) => "（匹配超过 200 条已截断，可加 include 过滤或缩小 path）".to_string(),
+            };
+            body = format!("{}\n{}", note, body);
+        }
+        Ok(body)
     }
 
     /// 读取图片为 base64 data URL（DSH read_image 工具语义；
@@ -493,52 +692,171 @@ impl FsService {
     }
 }
 
-/// glob 模式匹配（** 跨目录、* 任意字符、? 单字符；纯函数便于单测）
-fn glob_match(pattern: &str, path: &str) -> bool {
-    let ps: Vec<&str> = pattern.split('/').collect();
-    let xs: Vec<&str> = path.split('/').collect();
-    // 段级递归匹配
-    fn seg_match(p: &str, x: &str) -> bool {
-        // 单段 glob：* / ? 展开
-        let pc: Vec<char> = p.chars().collect();
-        let xc: Vec<char> = x.chars().collect();
-        let mut dp = vec![vec![false; xc.len() + 1]; pc.len() + 1];
-        dp[0][0] = true;
-        for i in 0..pc.len() {
-            if pc[i] == '*' {
-                dp[i + 1][0] = dp[i][0];
-            }
-        }
-        for i in 0..pc.len() {
-            for j in 0..xc.len() {
-                match pc[i] {
-                    '*' => dp[i + 1][j + 1] = dp[i][j + 1] || dp[i + 1][j],
-                    '?' => dp[i + 1][j + 1] = dp[i][j],
-                    c => dp[i + 1][j + 1] = dp[i][j] && c == xc[j],
+/// grep 单文件大小上限（跳过超大文件，避免内存/耗时失控）
+const GREP_MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
+/// grep 单次收集上限（超过内联上限 200 后继续收集到此，供完整列表落盘）
+const GREP_MAX_COLLECT: usize = 2000;
+
+/// 二进制探测：前 8KB 含 NUL 即视为二进制（与 ripgrep 默认行为一致）
+fn looks_binary(bytes: &[u8]) -> bool {
+    let probe = &bytes[..bytes.len().min(8192)];
+    probe.contains(&0u8)
+}
+
+/// 编译 glob 模式为等价正则（^…$ 锚定；无效模式提前报错）
+fn compile_glob(pattern: &str) -> Result<regex::Regex, String> {
+    // DSH glob 语义（2026-07-27 glob-sampling）：无 / 的模式匹配任意深度
+    // 的 basename（如 *.rs 匹配 src/a.rs），等价于 **/<pattern>；
+    // 含 / 的模式按字面路径层级匹配。
+    let anchored = if !pattern.contains('/') {
+        format!("**/{}", pattern)
+    } else {
+        pattern.to_string()
+    };
+    let rx = glob_to_regex(&anchored)?;
+    regex::Regex::new(&format!("^{}$", rx)).map_err(|e| format!("glob 模式无效: {e}"))
+}
+
+/// glob → 正则翻译（ripgrep/DSH glob 语义子集）：** 任意深度、* 段内任意、
+/// ? 单字符、[...] 字符类（[!…] 否定）、{a,b} 交替；其余字符字面（正则
+/// 元字符转义）。纯函数便于单测。
+fn glob_to_regex(pattern: &str) -> Result<String, String> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => {
+                if i + 1 < chars.len() && chars[i + 1] == '*' {
+                    i += 2;
+                    if i < chars.len() && chars[i] == '/' {
+                        out.push_str("(?:.*/)?");
+                        i += 1;
+                    } else {
+                        out.push_str(".*");
+                    }
+                } else {
+                    out.push_str("[^/]*");
+                    i += 1;
                 }
             }
-        }
-        dp[pc.len()][xc.len()]
-    }
-    fn rec(pi: usize, xi: usize, ps: &[&str], xs: &[&str]) -> bool {
-        if pi == ps.len() {
-            return xi == xs.len();
-        }
-        if ps[pi] == "**" {
-            // ** 可匹配零段或任意多段
-            for k in xi..=xs.len() {
-                if rec(pi + 1, k, ps, xs) {
-                    return true;
+            '?' => {
+                out.push_str("[^/]");
+                i += 1;
+            }
+            '[' => {
+                let mut j = i + 1;
+                let mut cls = String::from("[");
+                if j < chars.len() && (chars[j] == '!' || chars[j] == '^') {
+                    cls.push('^');
+                    j += 1;
+                }
+                let mut closed = false;
+                while j < chars.len() {
+                    let ch = chars[j];
+                    if ch == ']' && cls.len() > 1 {
+                        closed = true;
+                        cls.push(']');
+                        j += 1;
+                        break;
+                    }
+                    if ch == '\\' && j + 1 < chars.len() {
+                        cls.push('\\');
+                        cls.push(chars[j + 1]);
+                        j += 2;
+                        continue;
+                    }
+                    cls.push(ch);
+                    j += 1;
+                }
+                if closed {
+                    out.push_str(&cls);
+                    i = j;
+                } else {
+                    return Err("glob 模式无效：未闭合的字符类 [".to_string());
                 }
             }
-            return false;
+            '{' => match find_brace_close(&chars, i) {
+                Some(close) => {
+                    let inner: String = chars[i + 1..close].iter().collect();
+                    let alts = split_brace_alts(&inner);
+                    let parts: Result<Vec<String>, String> =
+                        alts.iter().map(|a| glob_to_regex(a)).collect();
+                    out.push_str(&format!("(?:{})", parts?.join("|")));
+                    i = close + 1;
+                }
+                None => {
+                    out.push_str("\\{");
+                    i += 1;
+                }
+            },
+            '\\' => {
+                if i + 1 < chars.len() {
+                    out.push_str(&format!("\\{}", chars[i + 1]));
+                    i += 2;
+                } else {
+                    out.push_str("\\\\");
+                    i += 1;
+                }
+            }
+            c if "()+^$|.".contains(c) => {
+                out.push('\\');
+                out.push(c);
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
         }
-        if xi == xs.len() {
-            return false;
-        }
-        seg_match(ps[pi], xs[xi]) && rec(pi + 1, xi + 1, ps, xs)
     }
-    rec(0, 0, &ps, &xs)
+    Ok(out)
+}
+
+/// 定位 { 的匹配 }（嵌套深度跟踪；无匹配返回 None）
+fn find_brace_close(chars: &[char], open: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (idx, &c) in chars.iter().enumerate().skip(open) {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 按顶层逗号拆分 {a,b} 交替项（嵌套花括号不受影响）
+fn split_brace_alts(inner: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut cur = String::new();
+    for c in inner.chars() {
+        match c {
+            '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+            }
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
 }
 
 /// str_replace_editor 输出截断：按字符边界截到 16K 并标注 <response clipped>
@@ -722,14 +1040,54 @@ mod tests {
     }
 
     #[test]
-    fn glob_match_basics() {
-        assert!(glob_match("*.rs", "main.rs"));
-        assert!(!glob_match("*.rs", "main.ts"));
-        assert!(glob_match("src/**/*.rs", "src/lib/a.rs"));
-        assert!(glob_match("src/**/*.rs", "src/a.rs"));
-        assert!(glob_match("**/README.md", "a/b/README.md"));
-        assert!(glob_match("a?c.txt", "abc.txt"));
-        assert!(!glob_match("a?c.txt", "ac.txt"));
+    fn glob_compiles_and_matches_patterns() {
+        // ** 任意深度 / * 段内 / ? 单字符
+        assert!(compile_glob("*.rs").unwrap().is_match("main.rs"));
+        assert!(!compile_glob("*.rs").unwrap().is_match("main.ts"));
+        assert!(compile_glob("src/**/*.rs")
+            .unwrap()
+            .is_match("src/lib/a.rs"));
+        assert!(compile_glob("src/**/*.rs").unwrap().is_match("src/a.rs"));
+        assert!(compile_glob("**/README.md")
+            .unwrap()
+            .is_match("a/b/README.md"));
+        assert!(compile_glob("a?c.txt").unwrap().is_match("abc.txt"));
+        assert!(!compile_glob("a?c.txt").unwrap().is_match("ac.txt"));
+        // {a,b} 交替
+        let re = compile_glob("src/**/*.{ts,js}").unwrap();
+        assert!(re.is_match("src/lib/a.ts"));
+        assert!(re.is_match("src/lib/a.js"));
+        assert!(!re.is_match("src/lib/a.rs"));
+        // [...] 字符类与否定类
+        assert!(compile_glob("file[0-9].txt").unwrap().is_match("file7.txt"));
+        assert!(!compile_glob("file[0-9].txt").unwrap().is_match("filex.txt"));
+        assert!(compile_glob("[!a]x.txt").unwrap().is_match("bx.txt"));
+        assert!(!compile_glob("[!a]x.txt").unwrap().is_match("ax.txt"));
+        // 正则元字符按字面（无 glob 语义时）
+        assert!(compile_glob("a.b").unwrap().is_match("a.b"));
+        assert!(!compile_glob("a.b").unwrap().is_match("axb"));
+        // 无效模式提前报错
+        assert!(compile_glob("[").is_err());
+    }
+
+    #[test]
+    fn glob_brace_alts_and_search_root() {
+        let svc = FsService;
+        let policy = FsPolicy {
+            allow_workspace_escape: false,
+        };
+        svc.write_text("hfs_glob2/x.rs", "one", &policy).unwrap();
+        svc.write_text("hfs_glob2/y.ts", "two", &policy).unwrap();
+        svc.write_text("hfs_glob2/z.md", "three", &policy).unwrap();
+        // {a,b} 交替 + 工作区根搜索
+        let hits = svc.glob("hfs_glob2/*.{rs,ts}", "", &policy).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.ends_with("x.rs")));
+        assert!(hits.iter().any(|h| h.ends_with("y.ts")));
+        // path 参数：搜索根定位到子目录，模式相对该根
+        let hits2 = svc.glob("*.{rs,ts}", "hfs_glob2", &policy).unwrap();
+        assert_eq!(hits2.len(), 2);
+        svc.delete("hfs_glob2", &policy).unwrap();
     }
 
     #[test]
@@ -742,12 +1100,145 @@ mod tests {
             .unwrap();
         svc.write_text("hfs_glob/b.txt", "nothing", &policy)
             .unwrap();
-        let hits = svc.glob("hfs_glob/*.txt", &policy).unwrap();
+        let hits = svc.glob("hfs_glob/*.txt", "", &policy).unwrap();
         assert_eq!(hits.len(), 2);
-        let g = svc.grep("needle", "hfs_glob", &policy).unwrap();
+        let g = svc.grep("needle", "hfs_glob", "", false, &policy).unwrap();
         assert!(g.contains("hfs_glob/a.txt:1: needle-one"));
         assert!(!g.contains("b.txt"));
         svc.delete("hfs_glob", &policy).unwrap();
+    }
+
+    #[test]
+    fn grep_include_filter_and_binary_skip() {
+        let svc = FsService;
+        let policy = FsPolicy {
+            allow_workspace_escape: false,
+        };
+        svc.write_text("hfs_grep3/a.rs", "needle-rust", &policy)
+            .unwrap();
+        svc.write_text("hfs_grep3/b.ts", "needle-ts", &policy)
+            .unwrap();
+        // include 过滤器：只搜 *.rs
+        let g = svc
+            .grep("needle", "hfs_grep3", "*.rs", false, &policy)
+            .unwrap();
+        assert!(g.contains("a.rs:1: needle-rust"));
+        assert!(!g.contains("b.ts"));
+        // 二进制文件跳过：写一个含 NUL 的文件，不应出现在结果中
+        std::fs::write(
+            crate::harness::workspace::sandbox_root().join("hfs_grep3/c.bin"),
+            b"needle-bin\x00needle",
+        )
+        .unwrap();
+        let g2 = svc.grep("needle", "hfs_grep3", "", false, &policy).unwrap();
+        assert!(!g2.contains("c.bin"), "二进制文件应被跳过: {g2}");
+        // 显式指向单文件时仍跳过二进制
+        let g3 = svc
+            .grep("needle", "hfs_grep3/c.bin", "", false, &policy)
+            .unwrap();
+        assert!(!g3.contains("c.bin"));
+        svc.delete("hfs_grep3", &policy).unwrap();
+    }
+
+    #[test]
+    fn grep_case_insensitive_option() {
+        let svc = FsService;
+        let policy = FsPolicy {
+            allow_workspace_escape: false,
+        };
+        svc.write_text("hfs_grep4/a.txt", "Hello World", &policy)
+            .unwrap();
+        // 默认大小写敏感：hello 不命中
+        let g = svc.grep("hello", "hfs_grep4", "", false, &policy).unwrap();
+        assert!(!g.contains("a.txt"));
+        // case_insensitive=true 命中
+        let g2 = svc.grep("hello", "hfs_grep4", "", true, &policy).unwrap();
+        assert!(g2.contains("a.txt:1: Hello World"));
+        svc.delete("hfs_grep4", &policy).unwrap();
+    }
+
+    #[test]
+    fn glob_reports_truncation_with_total_count() {
+        // DSH glob maxResults：命中超过内联上限时提示总数，模型可据此收窄
+        let svc = FsService;
+        let policy = FsPolicy {
+            allow_workspace_escape: false,
+        };
+        let dir = format!("hfs_many/{}", uuid::Uuid::new_v4().simple());
+        for i in 0..205 {
+            svc.write_text(&format!("{dir}/f{i:03}.txt"), "x", &policy)
+                .unwrap();
+        }
+        let hits = svc.glob(&format!("{dir}/*.txt"), "", &policy).unwrap();
+        // 205 条匹配：内联 200 + 首行提示（共 205 条）
+        assert_eq!(hits.len(), 201, "200 条内联 + 1 条提示: len={}", hits.len());
+        assert!(
+            hits[0].contains("共 205 条匹配"),
+            "提示应含总数: {}",
+            hits[0]
+        );
+
+        // 完整列表已落盘：spill_read 可跨会话取回全部 205 条匹配
+        let loc = hits[0]
+            .find("完整列表 locator: ")
+            .map(|p| {
+                hits[0][p + "完整列表 locator: ".len()..]
+                    .split('，')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .unwrap();
+        let back = crate::harness::spill::SpillStore::read(&loc).unwrap();
+        assert_eq!(back.lines().count(), 205, "共享溢写应含全部 205 条匹配");
+        let _ = std::fs::remove_file(&loc);
+        // 少量匹配不触发提示
+        let few = svc.glob(&format!("{dir}/f000.txt"), "", &policy).unwrap();
+        assert_eq!(few.len(), 1);
+        assert!(!few[0].contains("条匹配"));
+        svc.delete(&format!("hfs_many"), &policy).unwrap();
+    }
+
+    #[test]
+    fn grep_reports_truncation_note() {
+        // DSH grep maxMatches：命中超过内联上限时提示已截断
+        let svc = FsService;
+        let policy = FsPolicy {
+            allow_workspace_escape: false,
+        };
+        let dir = format!("hfs_grep_many/{}", uuid::Uuid::new_v4().simple());
+        let big: String = (0..250)
+            .map(|i| format!("needle-{i}\n"))
+            .collect::<String>();
+        svc.write_text(&format!("{dir}/a.txt"), &big, &policy)
+            .unwrap();
+        let out = svc.grep("needle", &dir, "", false, &policy).unwrap();
+        // 完整列表已落盘：提示含总数与 locator（DSH sampleOverCapGlobResults）
+        assert!(
+            out.starts_with("（共 250 条匹配，已显示前 200 条；完整列表 locator:"),
+            "应提示总数与 locator: {}",
+            &out[..80.min(out.len())]
+        );
+        let loc = out
+            .lines()
+            .find_map(|l| {
+                l.find("完整列表 locator: ")
+                    .map(|p| l[p + "完整列表 locator: ".len()..].to_string())
+            })
+            .map(|s| s.split('，').next().unwrap_or("").to_string())
+            .unwrap();
+        let back = crate::harness::spill::SpillStore::read(&loc).unwrap();
+        assert_eq!(back.lines().count(), 250, "共享溢写应含全部 250 条匹配");
+        let lines = out.lines().count();
+        assert!(lines >= 201, "提示 + 至少 200 条命中: {lines}");
+        svc.write_text(&format!("{dir}/b.txt"), "needle-only", &policy)
+            .unwrap();
+        let out2 = svc.grep("needle-only", &dir, "", false, &policy).unwrap();
+        assert!(
+            !out2.starts_with("（匹配超过 200 条"),
+            "少量匹配不应提示: {out2}"
+        );
+        svc.delete("hfs_grep_many", &policy).unwrap();
     }
 
     #[test]
@@ -779,6 +1270,69 @@ mod tests {
         assert!(text.contains("内容过长已截断"));
         assert!(text.len() <= 64 * 1024 + 64, "截断后应接近 64KB 上限");
         svc.delete("hns_big.txt", &policy).unwrap();
+    }
+
+    #[test]
+    fn read_before_write_policy_blocks_stale_and_unobserved() {
+        // DSH 2026-06-17 fs-observation-policy：edit/write 现有文件须先读取；
+        // 新建文件豁免；写/编辑后指纹更新，外部变更触发陈旧错误
+        let svc = FsService;
+        let policy = FsPolicy {
+            allow_workspace_escape: false,
+        };
+        let dir = format!("hfs_rbw/{}", uuid::Uuid::new_v4().simple());
+        let f = format!("{dir}/a.txt");
+        // 未读取过就编辑 → 拒绝（引导先 read_file）
+        // 用 std::fs 直接创建（不经 FsService），保持「未观察」状态
+        std::fs::create_dir_all(crate::harness::workspace::sandbox_root().join(&dir)).unwrap();
+        std::fs::write(crate::harness::workspace::sandbox_root().join(&f), "hello").unwrap();
+        let err = svc
+            .edit_text(&f, "hello", "world", false, &policy)
+            .unwrap_err();
+        assert!(err.contains("尚未读取过该文件"), "未观察编辑应报错: {err}");
+        // 读取后再编辑 → 放行
+        let _ = svc.read_text(&f, &policy).unwrap();
+        svc.edit_text(&f, "hello", "world", false, &policy).unwrap();
+        // 外部变更后（指纹变化）再编辑 → 陈旧错误
+        let _ = svc.read_text(&f, &policy).unwrap();
+        std::fs::write(
+            crate::harness::workspace::sandbox_root().join(&f),
+            "external-change",
+        )
+        .unwrap();
+        let err2 = svc
+            .edit_text(&f, "world", "again", false, &policy)
+            .unwrap_err();
+        assert!(err2.contains("已被修改"), "陈旧编辑应报错: {err2}");
+        // 陈旧覆盖写 → 拒绝（已被外部修改）
+        let err3 = svc.write_text(&f, "overwrite", &policy).unwrap_err();
+        assert!(err3.contains("已被修改"), "陈旧覆盖写应报错: {err3}");
+        // 读取后覆盖写 → 放行
+        let _ = svc.read_text(&f, &policy).unwrap();
+        svc.write_text(&f, "overwrite", &policy).unwrap();
+        svc.delete(&dir, &policy).unwrap();
+    }
+
+    #[test]
+    fn read_lines_windows_with_line_numbers() {
+        // DSH read(file_path, offset?, limit?)：1-based 行窗口 + 行号
+        let svc = FsService;
+        let policy = FsPolicy {
+            allow_workspace_escape: false,
+        };
+        let dir = format!("hfs_rl/{}", uuid::Uuid::new_v4().simple());
+        let f = format!("{dir}/a.txt");
+        svc.write_text(&f, "l1\nl2\nl3\nl4\nl5", &policy).unwrap();
+        let (rows, total) = svc.read_lines(&f, 2, 3, &policy).unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], (2, "l2".to_string()));
+        assert_eq!(rows[2], (4, "l4".to_string()));
+        // 越界窗口：返回空 + 总数
+        let (rows2, total2) = svc.read_lines(&f, 10, 3, &policy).unwrap();
+        assert_eq!(total2, 5);
+        assert!(rows2.is_empty());
+        svc.delete(&dir, &policy).unwrap();
     }
 
     #[test]

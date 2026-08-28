@@ -110,6 +110,33 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 static TURN_CANCEL: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+/// 当前回合是否由直接人类消息发起（DSH 2026-07-19 model-facing-goal-tools：
+/// 目标变更工具仅允许在含直接人类消息的 live root-agent 回合内执行；
+/// 自动续跑/子代理/定时任务回合不得静默改写人类目标）。回合级临时标记，
+/// 非持久状态。
+static TURN_HUMAN: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+
+fn turn_human_flags() -> &'static Mutex<HashMap<String, bool>> {
+    TURN_HUMAN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn mark_human_turn(session_id: &str, human: bool) {
+    let mut m = turn_human_flags().lock().unwrap();
+    if human {
+        m.insert(session_id.to_string(), true);
+    } else {
+        m.remove(session_id);
+    }
+}
+
+fn is_human_turn(session_id: &str) -> bool {
+    turn_human_flags()
+        .lock()
+        .unwrap()
+        .get(session_id)
+        .copied()
+        .unwrap_or(false)
+}
 
 /// 运行中回合注册表（子代理目录「正在运行」标记；harness_chat_stream
 /// 入口标记、出口清除——含 goal 自动续跑整段序列）
@@ -308,6 +335,22 @@ fn spawn_subagent_background(
         )
         .await;
         mark_turn_idle(&child_id);
+        // DSH 2026-08-11 background-job-completion-wakes：后台子代理
+        // 结束后向直接父会话送达完成通知（user-role 消息），父模型
+        // 下一回合可见并可经 subagent_output 读取结论。
+        if let Ok(parent) = super::subagent::parent_of(&child_id) {
+            if let Some(store) = super::registry::get::<SessionStore>("harness.sessions") {
+                let _ = store.append(
+                    &parent,
+                    &HarnessEvent::UserMessage {
+                        id: format!("sys-sub-{}", uuid::Uuid::new_v4().simple()),
+                        content: format!(
+                            "（后台子代理 {child_id} 已结束；结论可用 subagent_output {child_id} 读取，如需继续可 send_message 跟进）"
+                        ),
+                    },
+                );
+            }
+        }
     });
 }
 
@@ -360,6 +403,8 @@ async fn harness_chat_stream_inner(
         if is_cancelled(&session_id) {
             return Ok(());
         }
+        // 首轮 = 用户直接消息（可改目标）；自动续跑轮 = 非人类（不可改写）
+        mark_human_turn(&session_id, auto_rounds == 0);
         run_turn(
             &app,
             session_id.clone(),
@@ -407,6 +452,8 @@ async fn harness_chat_stream_inner(
             max_rounds
         );
     }
+    // 回合序列结束：清除人类标记（防止泄漏到后续非人类回合）
+    mark_human_turn(&session_id, false);
     Ok(())
 }
 
@@ -639,6 +686,32 @@ pub(crate) async fn run_turn(
     if !attachment_ctx.is_empty() {
         system_prompt = format!("{}\n\n[attachments]\n{}", system_prompt, attachment_ctx);
     }
+    // DSH tool-subagent-report：仅子代理（有 fork 溯源）注入 report 工具与
+    // 「tool:report」使用指引；非子代理从工具目录移除 report。
+    let is_child = super::subagent::parent_of(&session_id).is_ok();
+    if is_child {
+        system_prompt = format!(
+            "{}\n\n[子代理回传指引]\n用 report 工具把你的结论回传给启动你的父代理：\
+             结束前调用一次、附上自包含的最终答案；中途有新发现影响父代理下一步行动时\
+             也可提前回传（回传不会结束你的回合）。父代理共享你的工作区，但不会自动\
+             收到你的转录、工具输出或推理过程，因此只输出「完成」对它没有可用信息。\
+             只有直接父代理会收到你的报告。",
+            system_prompt
+        );
+    }
+    // DSH 2026-07-16 durable-per-step-time-context：每回合注入当前本地时间，
+    // DSH 2026-07-28 web-agent-runtime-context：声明当前工作区目录，
+    // 模型据此知道文件操作锚定在哪里
+    let ws_dir =
+        crate::harness::workspace::workspace_dir(&crate::harness::workspace::current().dir);
+    system_prompt = format!("{}\n\n[工作区]\n{}", system_prompt, ws_dir.display());
+    // 模型无需额外调用 get_current_time；时间敏感推理（日程/时效）据此判断。
+    let now = chrono::Local::now();
+    system_prompt = format!(
+        "{}\n\n[当前时间]\n{}（UTC%:z）",
+        system_prompt,
+        now.format("%Y-%m-%d %H:%M:%S %A")
+    );
     if !system_prompt.is_empty() {
         messages.insert(
             0,
@@ -691,7 +764,13 @@ pub(crate) async fn run_turn(
             last_user["content"] = serde_json::json!(blocks);
         }
     }
-    let tools_json = tools::tools_json_scoped(&scope);
+    let tools_json = {
+        let mut j = tools::tools_json_scoped(&scope);
+        if !is_child {
+            j = tools::strip_report_tool(j);
+        }
+        j
+    };
     let assistant_id = format!("a-{}", uuid::Uuid::new_v4().simple());
     let mut final_content = String::new();
     let mut total_prompt = 0u64;
@@ -771,6 +850,9 @@ pub(crate) async fn run_turn(
     }
 
     // 3. 工具循环
+    // 空响应有界重试计数（DSH 2026-07-24 empty-model-response-is-retryable：
+    // 模型返回空正文/空推理/无工具调用时最多重试一次，避免空 assistant 消息与误报轮次用尽）
+    let mut empty_response_retries = 0u32;
     for _round in 1..=max_rounds {
         // 取消检查（interrupt_agent 请求中断进行中回合）
         if is_cancelled(&session_id) {
@@ -1097,6 +1179,19 @@ pub(crate) async fn run_turn(
                 }
             }
             _ => {
+                // DSH 2026-07-24：空响应（无正文/无推理/无工具调用）视为可重试
+                // EMPTY_RESPONSE——重试一次而不是当作成功/轮次用尽结束
+                if final_content.trim().is_empty()
+                    && streamed_reasoning.trim().is_empty()
+                    && empty_response_retries < 1
+                {
+                    empty_response_retries += 1;
+                    messages.push(serde_json::json!({
+                        "role": "system",
+                        "content": "（模型返回了空响应，正在重试一次…）",
+                    }));
+                    continue;
+                }
                 final_content = content_out;
                 break;
             }
@@ -1257,10 +1352,13 @@ async fn handle_session_tool(
         }
         "exec_command" => {
             // 后台作业模式：run_in_background=true 时不阻塞等待，立即返回作业 id
+            // DSH 2026-08-11 background-first-continuable-delegation：
+            // 可继续子代理默认后台执行（立即返回子代理 id），仅当下一步
+            // 依赖其结果时才显式传 run_in_background=false 前台等待
             let bg = args
                 .get("run_in_background")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(true);
             let Some(command) = args.get("command").and_then(|v| v.as_str()) else {
                 return Some((false, "缺少 command 参数".to_string(), 0));
             };
@@ -1652,6 +1750,28 @@ async fn handle_session_tool(
             request_cancel(agent_id);
             Some((true, format!("已请求中断子代理 {agent_id} 的进行中回合"), 0))
         }
+        "list_agents" => {
+            // 枚举全部代理运行状态（DSH list_agents 语义）：当前会话 + 子代理
+            let mut lines = vec![format!(
+                "- {session_id}（当前会话）{}",
+                if is_turn_running(session_id) {
+                    "运行中"
+                } else {
+                    "空闲"
+                }
+            )];
+            for child in super::subagent::list_children(session_id) {
+                lines.push(format!(
+                    "- {child}（子代理）{}",
+                    if is_turn_running(&child) {
+                        "运行中"
+                    } else {
+                        "空闲"
+                    }
+                ));
+            }
+            Some((true, lines.join("\n"), started.elapsed().as_millis() as u64))
+        }
         "subagent_list" => {
             let children = super::subagent::list_children(session_id);
             if children.is_empty() {
@@ -1680,7 +1800,32 @@ async fn handle_session_tool(
                 Err(e) => Some((false, e, 0)),
             }
         }
+        "report" => {
+            // 子代理 → 父会话回传（DSH tool-subagent-report 迁移）：
+            // 仅分叉子代理可调用，内容写入直接父会话日志（模型可见 ⟺ 落日志），
+            // 返回父会话内事件 seq 作为 messageId。
+            let Some(output) = args.get("output").and_then(|v| v.as_str()) else {
+                return Some((false, "缺少 output 参数".to_string(), 0));
+            };
+            match super::subagent::report(session_id, output) {
+                Ok(seq) => Some((
+                    true,
+                    format!("report 已送达启动你的父代理（消息 {seq}）"),
+                    started.elapsed().as_millis() as u64,
+                )),
+                Err(e) => Some((false, e, 0)),
+            }
+        }
         "goal_create" => {
+            // DSH 2026-07-19 model-facing-goal-tools：目标变更仅允许在含
+            // 直接人类消息的回合内（自动续跑/子代理/定时任务回合不可改写）
+            if !is_human_turn(session_id) {
+                return Some((
+                    false,
+                    "目标变更需要直接的人类消息（当前回合非人类发起：自动续跑/子代理/定时任务不可改写目标）。请先让用户确认后再操作。".to_string(),
+                    0,
+                ));
+            }
             let Some(objective) = args.get("objective").and_then(|v| v.as_str()) else {
                 return Some((false, "缺少 objective 参数".to_string(), 0));
             };
@@ -1745,6 +1890,15 @@ async fn handle_session_tool(
             ))
         }
         "goal_update" => {
+            // DSH 2026-07-19 model-facing-goal-tools：目标变更仅允许在含
+            // 直接人类消息的回合内（自动续跑/子代理/定时任务回合不可改写）
+            if !is_human_turn(session_id) {
+                return Some((
+                    false,
+                    "目标变更需要直接的人类消息（当前回合非人类发起：自动续跑/子代理/定时任务不可改写目标）。请先让用户确认后再操作。".to_string(),
+                    0,
+                ));
+            }
             let Some(action) = args.get("action").and_then(|v| v.as_str()) else {
                 return Some((false, "缺少 action 参数".to_string(), 0));
             };
@@ -2176,6 +2330,15 @@ async fn handle_session_tool(
             Some((true, text, started.elapsed().as_millis() as u64))
         }
         "goal_set" => {
+            // DSH 2026-07-19 model-facing-goal-tools：目标变更仅允许在含
+            // 直接人类消息的回合内（自动续跑/子代理/定时任务回合不可改写）
+            if !is_human_turn(session_id) {
+                return Some((
+                    false,
+                    "目标变更需要直接的人类消息（当前回合非人类发起：自动续跑/子代理/定时任务不可改写目标）。请先让用户确认后再操作。".to_string(),
+                    0,
+                ));
+            }
             let Some(objective) = args.get("objective").and_then(|v| v.as_str()) else {
                 return Some((false, "缺少 objective 参数".to_string(), 0));
             };
@@ -2566,10 +2729,13 @@ pub(crate) async fn handle_subagent_tool(
             let Some(task) = args.get("task").and_then(|v| v.as_str()) else {
                 return Some((false, "缺少 task 参数".to_string(), 0));
             };
+            // DSH 2026-08-11 background-first-continuable-delegation：
+            // 可继续子代理默认后台执行（立即返回子代理 id），仅当下一步
+            // 依赖其结果时才显式传 run_in_background=false 前台等待
             let bg = args
                 .get("run_in_background")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+                .unwrap_or(true);
             let child_id = match super::subagent::fork_child(session_id) {
                 Ok(id) => id,
                 Err(e) => return Some((false, e, 0)),
@@ -2794,6 +2960,9 @@ async fn execute_tool_command_inner(
         )
         .ok();
     let timeout = scope.tool_timeout(name, super::settings::current().effective_timeout_secs());
+    // 手动派发（前端 CLI / ctx.tools 桥）由人类发起：标记人类回合，
+    // 允许目标变更工具（DSH model-facing-goal-tools 权限边界）
+    mark_human_turn(session_id, true);
     // 会话编排工具（todo/plan/goal/task）由运行时处理（需会话上下文）；
     // provider 解析失败不阻断 todo/plan/goal（仅 task 需要提供方）
     let provider_model = resolve_provider_model(None, None).ok();
@@ -2841,6 +3010,7 @@ async fn execute_tool_command_inner(
             session_id,
             json!({ "tool": name, "ok": ok, "duration_ms": duration_ms }),
         );
+        mark_human_turn(session_id, false);
         return Ok(
             json!({ "id": call_id, "ok": ok, "result": persisted, "duration_ms": duration_ms }),
         );
@@ -2874,12 +3044,25 @@ async fn execute_tool_command_inner(
         session_id,
         json!({ "tool": name, "ok": ok, "duration_ms": duration_ms }),
     );
+    mark_human_turn(session_id, false);
     Ok(json!({ "id": call_id, "ok": ok, "result": persisted, "duration_ms": duration_ms }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn human_turn_flag_gates_goal_mutations() {
+        // DSH 2026-07-19 model-facing-goal-tools：目标变更仅允许在含直接
+        // 人类消息的回合内；自动续跑/子代理回合不可改写
+        let sid = format!("goal-gate-{}", uuid::Uuid::new_v4().simple());
+        assert!(!is_human_turn(&sid), "默认非人类回合");
+        mark_human_turn(&sid, true);
+        assert!(is_human_turn(&sid), "人类回合应放行");
+        mark_human_turn(&sid, false);
+        assert!(!is_human_turn(&sid), "回合结束应清除标记");
+    }
 
     #[test]
     fn goal_auto_round_continues_within_budget() {

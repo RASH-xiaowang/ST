@@ -1,6 +1,6 @@
 // 知识库全局共享设置（Svelte 5 runes 模块）
 // 供「设置」页与文档上传/重处理共用，避免各页面各自维护一份分块参数。
-import { invoke } from '@tauri-apps/api/core';
+import { kbApi } from './services/ipc';
 
 export const kbChunkCfg = $state<{
   strategy: 'recursive' | 'title' | 'parent_child';
@@ -18,7 +18,7 @@ export const kbChunkCfg = $state<{
 // 从后端加载已保存的分块设置（首次进入知识库时调用）
 export async function loadKbChunkCfg() {
   try {
-    const s = await invoke<{ strategy: string; size: number; overlap: number; vectorScanCap?: number }>('kb_get_chunk_settings');
+    const s = await kbApi.getChunkSettings();
     if (s?.strategy === 'recursive' || s?.strategy === 'title' || s?.strategy === 'parent_child') {
       kbChunkCfg.strategy = s.strategy;
     }
@@ -35,7 +35,7 @@ let saveTimer: ReturnType<typeof setTimeout> | null = null;
 export function saveKbChunkCfg() {
   if (saveTimer) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
-    invoke('kb_set_chunk_settings', {
+    kbApi.setChunkSettings({
       strategy: kbChunkCfg.strategy,
       size: kbChunkCfg.size,
       overlap: kbChunkCfg.overlap,

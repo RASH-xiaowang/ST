@@ -214,17 +214,92 @@ pub(crate) fn tool_web_search(
     _app: Option<tauri::AppHandle>,
     args: Value,
 ) -> Result<String, String> {
-    // Consumer：联网搜索能力统一经 Harness WebService（DSH 能力接缝）
-    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    crate::harness::web::WebService.search(query)
+    // Consumer：联网搜索能力统一经 Harness WebService（DSH 能力接缝）。
+    // DSH 2026-08-17 web-search-multiple-queries：接受 queries 数组（最多 4 个），
+    // 逐查询搜索并按查询分组标注，URL 跨查询去重；单查询保持原返回格式。
+    let queries: Vec<String> = args
+        .get("queries")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|q| q.as_str().map(|s| s.trim().to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .or_else(|| {
+            args.get("query")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| vec![s.trim().to_string()])
+        })
+        .unwrap_or_default();
+    if queries.is_empty() {
+        return Err("缺少 queries 参数（至少一个搜索词）".to_string());
+    }
+    if queries.len() > 4 {
+        return Err("queries 最多 4 个".to_string());
+    }
+    // 精确重复去重（保留首位置，DSH 语义）
+    let mut seen_q = std::collections::HashSet::new();
+    let queries: Vec<String> = queries
+        .into_iter()
+        .filter(|q| seen_q.insert(q.clone()))
+        .collect();
+    if queries.len() == 1 {
+        return crate::harness::web::WebService.search(&queries[0]);
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut seen_url = std::collections::HashSet::new();
+    for q in &queries {
+        out.push(format!("### {q}"));
+        let raw = crate::harness::web::WebService.search(q)?;
+        let parsed: Vec<Value> = serde_json::from_str(&raw).unwrap_or_default();
+        let mut shown = 0usize;
+        for item in parsed {
+            if shown >= 8 {
+                break;
+            }
+            let url = item
+                .get("url")
+                .and_then(|u| u.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !url.is_empty() && !seen_url.insert(url.clone()) {
+                continue; // 跨查询 URL 去重
+            }
+            let title = item.get("title").and_then(|t| t.as_str()).unwrap_or("");
+            let snippet = item.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
+            out.push(format!("- {title}：{snippet}（{url}）"));
+            shown += 1;
+        }
+    }
+    Ok(out.join("\n"))
 }
 pub(crate) fn tool_read_file(
     _app: Option<tauri::AppHandle>,
     args: Value,
 ) -> Result<String, String> {
-    // Consumer：文件系统能力统一经 Harness FsService（DSH 能力接缝）
+    // Consumer：文件系统能力统一经 Harness FsService（DSH 能力接缝）。
+    // DSH read(file_path, offset?, limit?)：1-based 行窗口 + 行号输出
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    crate::harness::fs::FsService.read_text(path, &crate::harness::fs::FsPolicy::current())
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(200)
+        .clamp(1, 2000) as usize;
+    let (rows, total) = crate::harness::fs::FsService.read_lines(
+        path,
+        offset,
+        limit,
+        &crate::harness::fs::FsPolicy::current(),
+    )?;
+    if rows.is_empty() {
+        return Ok(format!("（共 {total} 行，当前窗口无内容）"));
+    }
+    let mut out: Vec<String> = rows.iter().map(|(n, t)| format!("{n}: {t}")).collect();
+    out.push(format!("…（共 {total} 行，显示 {} 行）", rows.len()));
+    Ok(out.join("\n"))
 }
 
 pub(crate) fn tool_write_file(
@@ -343,8 +418,12 @@ pub(crate) fn tool_str_replace_editor(
 
 pub(crate) fn tool_glob(_app: Option<tauri::AppHandle>, args: Value) -> Result<String, String> {
     let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let hits =
-        crate::harness::fs::FsService.glob(pattern, &crate::harness::fs::FsPolicy::current())?;
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let hits = crate::harness::fs::FsService.glob(
+        pattern,
+        path,
+        &crate::harness::fs::FsPolicy::current(),
+    )?;
     if hits.is_empty() {
         Ok("（无匹配文件）".to_string())
     } else {
@@ -358,7 +437,18 @@ pub(crate) fn tool_grep(_app: Option<tauri::AppHandle>, args: Value) -> Result<S
         return Err("缺少 pattern 参数".to_string());
     }
     let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    crate::harness::fs::FsService.grep(pattern, path, &crate::harness::fs::FsPolicy::current())
+    let include = args.get("include").and_then(|v| v.as_str()).unwrap_or("");
+    let case_insensitive = args
+        .get("case_insensitive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    crate::harness::fs::FsService.grep(
+        pattern,
+        path,
+        include,
+        case_insensitive,
+        &crate::harness::fs::FsPolicy::current(),
+    )
 }
 
 pub(crate) fn tool_read_image(
@@ -545,11 +635,13 @@ pub(crate) fn builtin_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "web_search".to_string(),
-            description: "联网搜索：返回与查询相关的网页标题、链接与摘要（JSON 数组，最多 8 条）。当需要最新信息或事实核查时使用。".to_string(),
+            description: "联网搜索：可一次传入多个搜索词（queries 数组，最多 4 个），逐查询返回标题/链接/摘要并按查询分组标注。当需要最新信息、事实核查或多个角度时使用。".to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "query": { "type": "string", "description": "搜索关键词" } },
-                "required": ["query"],
+                "properties": {
+                    "queries": { "type": "array", "items": { "type": "string" }, "description": "搜索词列表（1-4 个，精确重复自动去重）" },
+                },
+                "required": ["queries"],
             }),
             requires_approval: false,
             run: ToolRunner::Fn(tool_web_search),
@@ -559,7 +651,7 @@ pub(crate) fn builtin_tools() -> Vec<ToolSpec> {
             description: "读取当前工作区内指定路径的文本文件内容（默认工作区 = 应用项目根，可读自身源码；越界需政策放行）。".to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "path": { "type": "string", "description": "相对或绝对路径" } },
+                "properties": { "path": { "type": "string", "description": "相对或绝对路径" }, "offset": { "type": "integer", "description": "起始行号（1-based，默认 1）" }, "limit": { "type": "integer", "description": "最多返回行数（1-2000，默认 200）" } },
                 "required": ["path"],
             }),
             requires_approval: false,
@@ -643,10 +735,13 @@ pub(crate) fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "glob".to_string(),
-            description: "按 glob 模式在工作区内发现文件（支持 **、*、?，如 src/**/*.rs），返回匹配路径列表（最多 200 条）。".to_string(),
+            description: "按 glob 模式在工作区内发现文件/目录（支持 **、*、?、[...] 字符类、{a,b} 交替，如 src/**/*.{ts,js}），返回匹配路径列表（最多 200 条）。".to_string(),
             parameters: json!({
                 "type": "object",
-                "properties": { "pattern": { "type": "string", "description": "glob 模式，如 **/*.rs" } },
+                "properties": {
+                    "pattern": { "type": "string", "description": "glob 模式，如 **/*.rs" },
+                    "path": { "type": "string", "description": "搜索根目录（空 = 工作区根，相对路径锚定工作区）" },
+                },
                 "required": ["pattern"],
             }),
             requires_approval: false,
@@ -654,12 +749,14 @@ pub(crate) fn builtin_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "grep".to_string(),
-            description: "在工作区内按正则表达式搜索文件内容，返回 file:line:内容 列表（最多 200 条）。".to_string(),
+            description: "在工作区内按正则表达式搜索文件内容，返回 file:line:内容 列表（最多 200 条；二进制与超大文件自动跳过）。".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "正则表达式" },
                     "path": { "type": "string", "description": "文件或目录路径，空为工作区根" },
+                    "include": { "type": "string", "description": "正向 glob 过滤器：仅搜索路径匹配该 glob 的文件（如 *.rs）" },
+                    "case_insensitive": { "type": "boolean", "description": "true 时忽略大小写（默认 false）" },
                 },
                 "required": ["pattern"],
             }),
@@ -1140,6 +1237,8 @@ mod tests {
     fn workspace_sandbox_blocks_escape() {
         let root = workspace_root();
         std::fs::create_dir_all(&root).ok();
+        // 清理：文件实际落在沙箱根（safe_join 锚定 app base），非 agent_workspace
+        let _ = std::fs::remove_file(safe_join("agent_test.txt").unwrap());
         // 正常路径
         assert!(safe_join("a.txt").is_ok());
         // 越界路径（.. 逃逸到上级目录）应被拒绝
@@ -1174,15 +1273,18 @@ mod tests {
 
     #[test]
     fn file_tools_roundtrip_in_workspace() {
+        // 用 UUID 唯一文件名：读-改-写策略下，失败运行残留的固定名文件会
+        // 被视作「未观察的已存在文件」阻断下次写入（stale-file flake）
         let root = workspace_root();
         std::fs::create_dir_all(&root).ok();
-        let r = tool_write_file(None, json!({ "path": "agent_test.txt", "content": "你好" }));
+        let name = format!("agent_test_{}.txt", uuid::Uuid::new_v4().simple());
+        let r = tool_write_file(None, json!({ "path": name, "content": "你好" }));
         assert!(r.is_ok(), "{:?}", r);
-        let read = tool_read_file(None, json!({ "path": "agent_test.txt" }));
-        assert_eq!(read.unwrap(), "你好");
+        let read = tool_read_file(None, json!({ "path": name }));
+        assert!(read.unwrap().contains("你好"), "read_file 应返回带行号内容");
         let list = tool_list_dir(None, json!({ "path": "" }));
-        assert!(list.unwrap().contains("agent_test.txt"));
-        let _ = std::fs::remove_file(root.join("agent_test.txt"));
+        assert!(list.unwrap().contains(&name));
+        let _ = std::fs::remove_file(safe_join(&name).unwrap());
     }
 
     #[test]

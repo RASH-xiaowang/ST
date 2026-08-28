@@ -384,12 +384,12 @@ fn orchestration_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "subagent".to_string(),
-            description: "派生子代理：分叉当前会话为子会话并运行任务（继承父上下文）。run_in_background=true 时后台运行、立即返回子代理 id，用 send_message 跟进、subagent_output 读结论、interrupt_agent 中断。".to_string(),
+            description: "派生子代理：分叉当前会话为子会话并运行任务（继承父上下文，可继续）。默认后台执行（DSH background-first）：立即返回子代理 id，可并行启动多个独立子代理并继续当前工作；仅当下一步直接依赖子代理结果时才传 run_in_background=false 前台等待其结论。跟进用 send_message、读结论用 subagent_output、中断用 interrupt_agent、查状态用 list_agents。".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "task": { "type": "string", "description": "子代理任务描述" },
-                    "run_in_background": { "type": "boolean", "description": "true 时后台运行（默认 false，同步等待结论）" },
+                    "run_in_background": { "type": "boolean", "description": "true 时后台运行、立即返回子代理 id（默认 true）；false 时前台同步等待结论（仅当下一步依赖结果时用）" },
                 },
                 "required": ["task"],
             }),
@@ -435,6 +435,26 @@ fn orchestration_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": { "agent_id": { "type": "string", "description": "子代理会话 id" } },
                 "required": ["agent_id"],
+            }),
+            requires_approval: false,
+            run: crate::llm::agent::ToolRunner::Fn(stub),
+        },
+        ToolSpec {
+            name: "list_agents".to_string(),
+            description: "枚举全部代理的运行状态（DSH list_agents 语义）：当前会话 + 各子代理（运行中/空闲），用于编排时检查后台子代理是否仍在运行。".to_string(),
+            parameters: json!({ "type": "object", "properties": {} }),
+            requires_approval: false,
+            run: crate::llm::agent::ToolRunner::Fn(stub),
+        },
+        ToolSpec {
+            name: "report".to_string(),
+            description: "把选定的内容回传给启动你的父代理（DSH tool-subagent-report 语义）。仅在子代理会话内可用：结束前调用一次、附上自包含的最终结论，中途有新发现也可提前回传（回传不结束回合）。父代理共享你的工作区，但不会自动收到你的转录/工具输出/推理过程，因此只输出「完成」对它没有可用信息。只有直接父代理收到。".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "output": { "type": "string", "description": "回传给父代理的可执行内容：总结结论并引用相关共享路径" },
+                },
+                "required": ["output"],
             }),
             requires_approval: false,
             run: crate::llm::agent::ToolRunner::Fn(stub),
@@ -491,7 +511,7 @@ fn orchestration_tools() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "session_search".to_string(),
-            description: "跨会话检索消息内容（多词 AND 语义），返回会话 id/事件类型/内容片段（最多 50 条）。".to_string(),
+            description: "跨会话检索语义文本（多词 AND 语义，覆盖用户/助手消息、工具调用与结果、子代理报告、待办、目标与压缩摘要），返回会话 id/事件类型/命中上下文片段（最多 50 条）。".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": { "query": { "type": "string", "description": "检索关键词（空格分隔多词）" } },
@@ -628,6 +648,7 @@ fn orchestration_tools() -> Vec<ToolSpec> {
                             "required": ["content", "status"],
                         },
                     },
+                    "allow_parallel_in_progress": { "type": "boolean", "description": "true 时允许多个进行中项（默认 true，适合并行子任务）；false 时同一时刻仅一个进行中项" },
                 },
                 "required": ["items"],
             }),
@@ -831,6 +852,7 @@ fn orchestration_tools() -> Vec<ToolSpec> {
                     "language": { "type": "string", "description": "语言（typescript / javascript）" },
                     "code": { "type": "string", "description": "程序：async 函数体" },
                     "args": { "type": "object", "description": "传入 args 的对象（可空）" },
+                    "description": { "type": "string", "description": "本次调用的用途说明（DSH run_code 语义：用于界面标注该次程序执行）" },
                 },
                 "required": ["code"],
             }),
@@ -845,6 +867,7 @@ fn orchestration_tools() -> Vec<ToolSpec> {
                 "properties": {
                     "code": { "type": "string", "description": "编排脚本：async 函数体" },
                     "args": { "type": "object", "description": "传入 args 的对象（可空）" },
+                    "description": { "type": "string", "description": "本次调用的用途说明（DSH run_code 语义：用于界面标注该次程序执行）" },
                 },
                 "required": ["code"],
             }),
@@ -913,6 +936,22 @@ pub fn tools_json_scoped(scope: &crate::harness::preset::SessionScope) -> Value 
     Value::Array(arr)
 }
 
+/// 从工具目录中移除 report（DSH tool-subagent-report：report 仅注入
+/// 子代理作用域，根代理不可见）。调用方（agent 循环）在会话非子代理
+/// 时使用，避免根代理看到并尝试调用、浪费模型回合。
+pub fn strip_report_tool(tools: Value) -> Value {
+    let mut arr = tools;
+    if let Some(items) = arr.as_array_mut() {
+        items.retain(|t| {
+            t.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                != Some("report")
+        });
+    }
+    arr
+}
+
 /// 计划模式下仍可用的只读工具（其余被拦截；DSH plan 模式守卫）
 pub fn is_readonly_tool(name: &str) -> bool {
     matches!(
@@ -923,6 +962,9 @@ pub fn is_readonly_tool(name: &str) -> bool {
             | "search_knowledge_base"
             | "read_file"
             | "list_dir"
+            | "glob"
+            | "grep"
+            | "read_image"
             | "todo_write"
             | "job_list"
             | "job_output"
@@ -935,6 +977,7 @@ pub fn is_readonly_tool(name: &str) -> bool {
             | "terminal_read"
             | "schedule_list"
             | "subagent_list"
+            | "list_agents"
             | "subagent_output"
             | "goal_get"
             | "session_search"
@@ -1200,6 +1243,27 @@ mod tests {
     }
 
     #[test]
+    fn strip_report_tool_removes_report_only_for_root_scopes() {
+        // DSH tool-subagent-report：report 仅子代理作用域可见
+        let reg = registry();
+        let all = reg.lock().unwrap();
+        let spec = all.get("report");
+        assert!(spec.is_some(), "report 工具应已注册");
+        drop(all);
+        // 完整目录含 report
+        let scope = crate::harness::preset::SessionScope::default();
+        let full = tools_json_scoped(&scope);
+        assert!(full.to_string().contains("\"report\""));
+        // strip 后不含 report，其余工具保留
+        let stripped = strip_report_tool(full.clone());
+        assert!(!stripped.to_string().contains("\"report\""));
+        assert!(
+            stripped.as_array().map(|a| a.len()).unwrap_or(0) + 1
+                == full.as_array().map(|a| a.len()).unwrap_or(0)
+        );
+    }
+
+    #[test]
     fn readonly_whitelist_covers_query_tools_and_excludes_writers() {
         // plan 模式守卫：查询/只读工具全在白名单，写/执行工具被排除
         let expected_readonly = [
@@ -1221,6 +1285,7 @@ mod tests {
             "terminal_read",
             "schedule_list",
             "subagent_list",
+            "list_agents",
             "subagent_output",
             "goal_get",
             "session_search",
@@ -1230,6 +1295,9 @@ mod tests {
             "session_event_trace",
             "session_list",
             "attachment_list",
+            "glob",
+            "grep",
+            "read_image",
             "lsp_hover",
             "lsp_definition",
             "lsp_references",
@@ -1257,6 +1325,7 @@ mod tests {
             "goal_update",
             "subagent",
             "send_message",
+            "report",
             "workflow_run_js",
             "schedule_create",
             "schedule_delete",

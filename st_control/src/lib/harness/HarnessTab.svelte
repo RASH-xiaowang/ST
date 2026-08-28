@@ -273,6 +273,8 @@
   let questionChecks = $state<Record<string, Set<string>>>({});
   /** 提问卡翻页（DSH QuestionFlow：多题分页 + 进度） */
   let questionIndex = $state(0);
+  /** 提问卡折叠（DSH 2026-08-11 collapsible-ask-user-question-card） */
+  let questionMinimized = $state(false);
   function prevQuestion() {
     questionIndex = Math.max(0, questionIndex - 1);
   }
@@ -526,6 +528,28 @@
     if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
     if (n >= 1e3) return `${(n / 1e3).toFixed(0)}K`;
     return String(n);
+  }
+
+  /** 缓存命中率显示（DSH 2026-08-19 high-cache-hit-decimal-display）：
+   *  整数舍入低于 100% 显示整数；非满命中且整数舍入=100% 时用最小小数
+   *  精度使其低于 100%（99.5%→99.5% 而非 100%）；满命中显示 100%。 */
+  function fmtCacheHit(rate: number): string {
+    if (!Number.isFinite(rate) || rate <= 0) return "0%";
+    if (rate >= 1) return "100%";
+    const pct = rate * 100;
+    if (Math.round(pct) < 100) return `${Math.round(pct)}%`;
+    for (let d = 1; d <= 14; d++) {
+      const factor = Math.pow(10, d);
+      const rounded = Math.round(pct * factor) / factor;
+      if (rounded < 100) return `${rounded.toFixed(d)}%`;
+    }
+    return `${pct.toFixed(14)}%`;
+  }
+
+  /** 系统通知消息（后端生成的 user-role 通知，以全角（开头）：
+   * 如后台子代理完成通知——渲染为居中系统样式而非用户气泡 */
+  function isSysNotice(content: string): boolean {
+    return content.startsWith("（");
   }
 
   function prettyText(s?: string): string {
@@ -1870,19 +1894,19 @@
 
   // ─── CLI ───
   async function runCli() {
-    const input = cliInput.trim();
-    if (!input || cliBusy) return;
+    const cliCmd = cliInput.trim();
+    if (!cliCmd || cliBusy) return;
     cliBusy = true;
     try {
-      const out = await harnessApi.cli(input);
-      cliOutput = `$ ${input}\n${out}\n\n${cliOutput}`.slice(0, 4000);
+      const out = await harnessApi.cli(cliCmd);
+      cliOutput = `$ ${cliCmd}\n${out}\n\n${cliOutput}`.slice(0, 4000);
       cliInput = "";
       refreshSessions().catch(() => {});
       if (activeId) {
         refreshOrchestration().catch(() => {});
       }
     } catch (e) {
-      cliOutput = `$ ${input}\n错误：${errText(e)}\n\n${cliOutput}`.slice(0, 4000);
+      cliOutput = `$ ${cliCmd}\n错误：${errText(e)}\n\n${cliOutput}`.slice(0, 4000);
     } finally {
       cliBusy = false;
     }
@@ -3110,7 +3134,7 @@
         <span class="hns-stats-sep" aria-hidden="true">|</span>
         <span>首 token 平均 {fmtSec(usage.first_token_avg_ms)} · {Math.round(usage.tokens_per_sec)} tok/s</span>
         <span class="hns-stats-sep" aria-hidden="true">|</span>
-        <span>缓存命中 {Math.round(usage.cache_hit_rate * 100)}%</span>
+        <span>缓存命中 {fmtCacheHit(usage.cache_hit_rate)}</span>
         <span class="hns-stats-sep" aria-hidden="true">|</span>
         <span>输入 {fmtTok(usage.input_tokens)} tok · 输出 {fmtTok(usage.output_tokens)} tok</span>
         {#if usage.cost > 0}
@@ -4230,6 +4254,7 @@
               {#if m.kind === "compaction"}🗜️{/if}
               {#if m.kind === "context"}📄{/if}
               {#if m.kind === "skill"}🧩{/if}
+              {#if m.kind === "subagent"}🤖{/if}
               {m.title}
             </span>
             {#if m.detail}
@@ -4247,14 +4272,20 @@
           </div>
           {/if}
         {:else if m.role === "user"}
-          <div class="hns-msg hns-msg-user" class:cmd={m.content.startsWith("/goal")}>
+          <div
+            class="hns-msg hns-msg-user"
+            class:cmd={m.content.startsWith("/goal")}
+            class:sys={isSysNotice(m.content)}
+          >
             {#if m.content.startsWith("/goal")}
               <!-- /goal 命令输入视图（DSH GoalCommandInputView：命令气泡，右对齐等宽） -->
               <div class="hns-cmd-bubble" role="group">{m.content}</div>
+            {:else if isSysNotice(m.content)}
+              <div class="hns-sys-notice">{m.content}</div>
             {:else}
               <div class="hns-bubble"><MessageBody msg={{ role: "user", content: m.content }} /></div>
             {/if}
-            {#if m.content}
+            {#if m.content && !isSysNotice(m.content)}
               <button
                 class="hns-session-act hns-copy-btn"
                 onclick={() => copyText(m.content)}
@@ -4543,6 +4574,19 @@
     {/if}
 
     {#if pendingApprovals.length > 0}
+      <div class="hns-q-bar">
+        <span class="hns-q-bar-title" title="有待回答问题待处理">❓ 待回答问题</span>
+        <span class="hns-q-progress">{questionIndex + 1} / {pendingQuestions.length}</span>
+        <button
+          class="hns-q-min"
+          onclick={() => (questionMinimized = !questionMinimized)}
+          aria-expanded={!questionMinimized}
+          title={questionMinimized ? "展开提问卡" : "收起提问卡（查看上方对话）"}
+        >
+          {questionMinimized ? "展开 ▲" : "收起 ▼"}
+        </button>
+      </div>
+      {#if !questionMinimized}
       <div class="hns-approvals">
         {#each pendingApprovals as a (a.id)}
           <div class="hns-approval">
@@ -4629,22 +4673,33 @@
               {#each q.options as o (o)}
                 <button class="hns-approve" onclick={() => answerQuestion(q, o)}>{o}</button>
               {/each}
-              <input
+              <textarea
                 class="hns-question-input"
-                placeholder="自由输入回答…"
+                rows={1}
+                placeholder="自由输入回答…（Shift+Enter 换行）"
                 aria-label="问题回答"
                 value={questionDrafts[q.id] ?? ""}
                 oninput={(e) => {
                   questionDrafts = {
                     ...questionDrafts,
-                    [q.id]: (e.currentTarget as HTMLInputElement).value,
+                    [q.id]: (e.currentTarget as HTMLTextAreaElement).value,
                   };
                 }}
                 onkeydown={(e) => {
-                  if (e.key === "Enter") answerQuestion(q, questionDrafts[q.id] ?? "");
+                  // Enter 提交，Shift+Enter 换行（DSH 2026-08-20 多行回答）
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    answerQuestion(q, questionDrafts[q.id] ?? "");
+                  }
                 }}
-              />
-              <button class="hns-approve" disabled={!(questionDrafts[q.id] ?? "").trim()} onclick={() => answerQuestion(q, questionDrafts[q.id] ?? "")}>回答</button>
+              ></textarea>
+              <button
+                class="hns-approve"
+                disabled={!(questionDrafts[q.id] ?? "").trim()}
+                onclick={() => answerQuestion(q, questionDrafts[q.id] ?? "")}
+              >
+                回答
+              </button>
             </span>
           </div>
         </div>
@@ -4671,6 +4726,7 @@
           </div>
         {/if}
       </div>
+      {/if}
     {/if}
 
     {#if attachments.length > 0}
@@ -4946,7 +5002,7 @@
               <div class="hns-tool-metrics">
                 <span>输入 {fmtTok(usage.input_tokens)}</span>
                 <span>输出 {fmtTok(usage.output_tokens)}</span>
-                <span>缓存命中 {Math.round(usage.cache_hit_rate * 100)}%</span>
+                <span>缓存命中 {fmtCacheHit(usage.cache_hit_rate)}</span>
                 <span>成本 ${usage.cost.toFixed(4)}</span>
               </div>
             </div>
@@ -5980,6 +6036,16 @@
   .hns-turn-retry:hover:not(:disabled) { background: color-mix(in srgb, var(--hns-accent, #4176e6) 12%, transparent); }
   .hns-turn-retry:disabled { opacity: .5; cursor: default; }
   .hns-msg { display: flex; position: relative; }
+  /* 系统通知（后台子代理完成等，DSH 语义：居中弱化、非用户输入） */
+  .hns-msg.sys { justify-content: center; }
+  .hns-sys-notice {
+    max-width: 80%; text-align: center;
+    font-size: 12px; color: #8b8b9e;
+    background: color-mix(in srgb, var(--hns-card) 70%, transparent);
+    border: 1px solid color-mix(in srgb, var(--hns-text) 12%, transparent);
+    border-radius: 999px; padding: 4px 14px; line-height: 1.5;
+  }
+
   .hns-msg-user { justify-content: flex-end; }
   .hns-cmd-bubble {
     max-width: 100%;
@@ -6308,6 +6374,26 @@
   }
   .hns-tool-copy:hover { color: var(--hns-text); background: var(--hns-surface); }
   /* ─── 审批卡 / 问题卡 ─── */
+  /* 问题卡折叠条（DSH 2026-08-11 collapsible-ask-user-question-card）：
+     收起后仅留头部条，用户可回看上方对话，草稿/勾选状态保留 */
+  .hns-q-bar {
+    display: flex; align-items: center; gap: 8px;
+    margin: 10px 16px 0; max-width: 760px; align-self: center; width: calc(100% - 32px);
+    font-size: 12px; color: var(--hns-text);
+    background: var(--hns-amber-soft);
+    border: 1px solid color-mix(in srgb, var(--hns-amber) 42%, transparent);
+    border-left: 3px solid var(--hns-amber);
+    border-radius: 10px; padding: 6px 11px;
+  }
+  .hns-q-bar-title { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hns-q-progress { flex: none; opacity: 0.75; }
+  .hns-q-min {
+    flex: none; border: 1px solid color-mix(in srgb, var(--hns-amber) 55%, transparent);
+    background: color-mix(in srgb, var(--hns-card) 60%, transparent);
+    color: var(--hns-text); border-radius: 6px; padding: 2px 8px; font-size: 11px; cursor: pointer;
+  }
+  .hns-q-min:hover { background: var(--hns-surface); }
+
   .hns-approvals {
     display: flex; flex-direction: column; gap: 7px;
     margin: 10px 16px 0; max-width: 760px; align-self: center; width: calc(100% - 32px);

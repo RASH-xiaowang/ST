@@ -70,9 +70,7 @@ mod tests {
     /// 评分校验：仅 good / bad / 空 合法（命令入口行为）
     #[tokio::test]
     async fn rating_validation_good_bad_only() {
-        let ok = harness_submit_feedback("h-test".into(), "good".into(), None, None).await;
-        // 命令入口先校验评分再触碰运行时（单测环境无注册表）：
-        // 合法评分应走到「运行时未初始化」，非法评分应在校验层即拒绝
+        // 非法评分应在校验层即拒绝（不触碰运行时）
         let invalid = harness_submit_feedback("h-test".into(), "meh".into(), None, None)
             .await
             .unwrap_err();
@@ -80,11 +78,14 @@ mod tests {
             invalid.contains("只能是 good 或 bad"),
             "非法评分应被校验拒绝: {invalid}"
         );
-        // 合法评分（good）不被校验拒绝——单测环境应报运行时未初始化
-        let err = ok.unwrap_err();
-        assert!(
-            err.contains("未初始化"),
-            "合法评分应越过校验、止于运行时检查: {err}"
-        );
+        // 合法评分不应被「评分校验」拒绝：无论运行时是否已初始化，错误绝不能是校验信息；
+        // 运行时已初始化时调用甚至可能成功。不断言具体运行时错误，避免依赖全局注册表状态（测试顺序无关）。
+        match harness_submit_feedback("h-test".into(), "good".into(), None, None).await {
+            Ok(()) => {}
+            Err(err) => assert!(
+                !err.contains("只能是 good 或 bad"),
+                "合法评分应越过校验层: {err}"
+            ),
+        }
     }
 }

@@ -178,7 +178,34 @@ pub async fn kb_housekeeping(
         .await
         .map_err(|e| format!("知识库维护任务失败: {}", e))??
     };
-    Ok(serde_json::json!({ "jobs": jobs, "docs": docs }))
+    // 3) FTS 索引一致性检查与修复
+    let fts_report = {
+        let db_block = (*db).clone();
+        tauri::async_runtime::spawn_blocking(move || db_block.repair_fts_consistency())
+            .await
+            .map_err(|e| format!("FTS 一致性检查失败: {}", e))??
+    };
+    if !fts_report.ok {
+        log::warn!(
+            "FTS 索引修复后仍不一致：missing_chunks={} orphan_chunks={} missing_wiki={} orphan_wiki={}",
+            fts_report.missing_chunks.len(),
+            fts_report.orphan_chunks.len(),
+            fts_report.missing_wiki.len(),
+            fts_report.orphan_wiki.len(),
+        );
+    }
+    Ok(serde_json::json!({
+        "jobs": jobs,
+        "docs": docs,
+        "fts": {
+            "ok": fts_report.ok,
+            "fixed": fts_report.fixed,
+            "missingChunks": fts_report.missing_chunks.len(),
+            "orphanChunks": fts_report.orphan_chunks.len(),
+            "missingWiki": fts_report.missing_wiki.len(),
+            "orphanWiki": fts_report.orphan_wiki.len(),
+        }
+    }))
 }
 fn detail_hit_count(detail: &str) -> i64 {
     serde_json::from_str::<serde_json::Value>(detail)

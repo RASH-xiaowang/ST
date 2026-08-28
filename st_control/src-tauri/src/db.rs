@@ -992,21 +992,35 @@ impl Database {
             .map(|w| w.trim().to_string())
             .filter(|w| !w.is_empty())
             .collect();
+        // 片段：以首个命中词为中心取上下文（长 tool_result 中段命中可见），
+        // 无命中时退回载荷头部（与 event_search 的片段语义一致）
+        let first_word = words[0].clone();
         let sql = format!(
-            "SELECT e.session_id, e.type, substr(e.payload, 1, 200)
+            "SELECT e.session_id, e.type,
+               CASE WHEN instr(lower(e.payload), lower(?1)) > 0
+                    THEN substr(e.payload, max(1, instr(lower(e.payload), lower(?1)) - 60), 200)
+                    ELSE substr(e.payload, 1, 200) END
              FROM harness_events e
-             WHERE (e.type = 'user_message' OR e.type = 'assistant_message')
+             WHERE e.type IN ('user_message','assistant_message','assistant_tool_calls',
+                              'tool_result','subagent_reported','todo_update',
+                              'goal_set','goal_update','compaction')
                AND {} ORDER BY e.id DESC LIMIT 50",
             words
                 .iter()
                 .enumerate()
-                .map(|(i, _)| format!("e.payload LIKE ?{}", i + 1))
+                .map(|(i, _)| format!("e.payload LIKE ?{}", i + 2))
                 .collect::<Vec<_>>()
                 .join(" AND ")
         );
         let mut stmt = conn.prepare(&sql)?;
-        let like_params: Vec<String> = words.iter().map(|w| format!("%{w}%")).collect();
-        let rows = stmt.query_map(rusqlite::params_from_iter(like_params.iter()), |row| {
+        let mut params: Vec<rusqlite::types::Value> =
+            vec![rusqlite::types::Value::from(first_word.clone())];
+        params.extend(
+            words
+                .iter()
+                .map(|w| rusqlite::types::Value::from(format!("%{w}%"))),
+        );
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,

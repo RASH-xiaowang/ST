@@ -85,11 +85,14 @@ pub struct HighlightSegment {
 }
 
 /// 将文本按 query 关键词切分为高亮片段
+///
+/// 基于 char 索引扫描，避免 `content.to_lowercase()` 改变字节长度时（如
+/// 'İ'(U+0130) → "i\u{0307}"）字节偏移错位导致 panic。
 pub fn highlight(content: &str, query: &str) -> Vec<HighlightSegment> {
-    let terms: Vec<String> = query
+    let terms: Vec<Vec<char>> = query
         .split(|c: char| c.is_whitespace() || "，。；！？,.;!?\"'".contains(c))
         .filter(|t| t.chars().count() >= 2)
-        .map(|t| t.to_lowercase())
+        .map(|t| t.to_lowercase().chars().collect())
         .collect();
     if terms.is_empty() {
         return vec![HighlightSegment {
@@ -97,44 +100,65 @@ pub fn highlight(content: &str, query: &str) -> Vec<HighlightSegment> {
             hit: false,
         }];
     }
-    let lower = content.to_lowercase();
+
+    // 逐字符 lowercase，保持与 content 1:1 字符对应（取 to_lowercase() 首字符）
+    let content_chars: Vec<char> = content.chars().collect();
+    let lower_chars: Vec<char> = content_chars
+        .iter()
+        .map(|c| c.to_lowercase().next().unwrap_or(*c))
+        .collect();
+    // 预计算每个 char_index → content 中的字节偏移
+    let mut byte_offsets = Vec::with_capacity(content_chars.len() + 1);
+    let mut off = 0usize;
+    for c in &content_chars {
+        byte_offsets.push(off);
+        off += c.len_utf8();
+    }
+    byte_offsets.push(off); // 哨兵：最后一个字符之后的偏移
+
+    let n = content_chars.len();
     let mut segments = Vec::new();
-    let mut i = 0;
-    let bytes = content.as_bytes();
-    while i < bytes.len() {
-        let mut matched = false;
-        let mut match_len = 0;
-        for t in &terms {
-            if let Some(pos) = lower[i..].find(t.as_str()) {
-                if pos == 0 {
-                    matched = true;
-                    match_len = t.len();
-                    break;
-                }
+    let mut i = 0usize; // char 索引
+    while i < n {
+        // 尝试在当前位置匹配任一 term
+        let mut match_char_len = 0usize;
+        for term in &terms {
+            let tlen = term.len();
+            if tlen > 0 && i + tlen <= n && lower_chars[i..i + tlen] == *term {
+                match_char_len = tlen;
+                break;
             }
         }
-        if matched {
-            let seg = &content[i..i + match_len];
+        if match_char_len > 0 {
             segments.push(HighlightSegment {
-                text: seg.to_string(),
+                text: content[byte_offsets[i]..byte_offsets[i + match_char_len]].to_string(),
                 hit: true,
             });
-            i += match_len;
+            i += match_char_len;
         } else {
-            // 累积到下一个命中或结尾
-            let next = terms
-                .iter()
-                .filter_map(|t| lower[i..].find(t.as_str()))
-                .min()
-                .unwrap_or(content.len() - i);
-            let seg = &content[i..i + next];
+            // 向后扫描到下一个命中位置
+            let mut next = n;
+            'scan: for j in i..n {
+                for term in &terms {
+                    let tlen = term.len();
+                    if tlen > 0 && j + tlen <= n && lower_chars[j..j + tlen] == *term {
+                        next = j;
+                        break 'scan;
+                    }
+                }
+            }
+            let seg = &content[byte_offsets[i]..byte_offsets[next]];
             if !seg.is_empty() {
                 segments.push(HighlightSegment {
                     text: seg.to_string(),
                     hit: false,
                 });
             }
-            i += next.max(1);
+            i = next;
+            // next == i 不会发生（上面分支已处理命中），但防御性保底
+            if i == byte_offsets.len() - 1 {
+                break;
+            }
         }
     }
     if segments.is_empty() {
@@ -482,6 +506,67 @@ fn truncate_utf8(mut s: String, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── highlight 函数 Unicode 安全测试 ──
+
+    /// 'İ'(U+0130) 小写为 "i\u{0307}"（2 字节 → 3 字节），
+    /// 旧实现用同一字节索引同时切 content 和 lower 会 panic；
+    /// 本测试验证不 panic 且拼接回原文、命中段正确。
+    #[test]
+    fn test_highlight_turkish_i_no_panic() {
+        let text = "\\ İSTANBUL İstanbul\\";
+        let segs = highlight(text, "istanbul");
+        // 不 panic 即为通过；额外验证拼接回原文
+        let reconstructed: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(reconstructed, text, "拼接必须还原原文");
+        // 至少有一个命中段
+        assert!(
+            segs.iter().any(|s| s.hit),
+            "query 'istanbul' 应命中 'İSTANBUL' 或 'İstanbul'"
+        );
+    }
+
+    /// 'İ' 出现在内容中间的混合文本，确认不会越界
+    #[test]
+    fn test_highlight_turkish_i_mixed_content() {
+        let text = "Welcome to İSTANBUL city guide.";
+        let segs = highlight(text, "istanbul");
+        let reconstructed: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(reconstructed, text);
+        assert!(segs.iter().any(|s| s.hit));
+    }
+
+    /// 纯英文命中：原有行为回归
+    #[test]
+    fn test_highlight_english_basic() {
+        let text = "Hello World, this is a test.";
+        let segs = highlight(text, "world test");
+        let reconstructed: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(reconstructed, text);
+        assert!(segs.iter().any(|s| s.hit && s.text == "World"));
+        assert!(segs.iter().any(|s| s.hit && s.text == "test"));
+    }
+
+    /// 中文命中：原有行为回归
+    #[test]
+    fn test_highlight_chinese_basic() {
+        let text = "知识库管理功能已更新";
+        let segs = highlight(text, "知识库 更新");
+        let reconstructed: String = segs.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(reconstructed, text);
+        assert!(segs.iter().any(|s| s.hit && s.text == "知识库"));
+        assert!(segs.iter().any(|s| s.hit && s.text == "更新"));
+    }
+
+    /// 空 query / 短词不命中
+    #[test]
+    fn test_highlight_empty_query_returns_full() {
+        let text = "some text";
+        let segs = highlight(text, "");
+        assert_eq!(segs.len(), 1);
+        assert!(!segs[0].hit);
+        assert_eq!(segs[0].text, text);
+    }
 
     #[test]
     fn test_truncate_utf8_boundary_no_panic() {

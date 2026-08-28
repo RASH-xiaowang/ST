@@ -1,0 +1,9 @@
+#!/bin/sh
+# 本地 pre-commit 快检（DSH quality-gates：低成本缺陷本地发现，全量留给 CI）。
+# 暂存区含 src-tauri 变更时快跑 cargo fmt --check；失败即阻止提交。
+set -e
+if git diff --cached --name-only | grep -q "^st_control/src-tauri/"; then
+  echo "==> cargo fmt --check (staged Rust changes)"
+  (cd st_control/src-tauri && cargo fmt --check)
+fi
+# 后续可在此追加更快的检查（如暂存文件的空白校验）

@@ -11,6 +11,7 @@ import type {
   DocView,
   DownloadDocumentResult,
   FetchUrlResult,
+  HighlightSegment,
   JobItem,
   JobLogItem,
   HousekeepingResult,
@@ -21,9 +22,11 @@ import type {
   ModelSettingsResult,
   QaMessageItem,
   QaSessionItem,
+  RagAnswer,
   RecommendItem,
   ReprocessResult,
   RetrievedChunk,
+  RoleItem,
   SearchLogItem,
   WikiDir,
   WikiVersionItem,
@@ -195,6 +198,18 @@ export const kbApi = {
     invoke<{ ragId?: number }>('kb_rag_stream', { input, onChunk }),
   /** 请求取消指定 RAG 流式生成（用户点击「停止生成」）；传入 ragId 精准取消，不传则取消最新活跃请求 */
   ragCancel: (ragId?: number) => invoke<void>('kb_rag_cancel', { ragId: ragId ?? null }),
+  /** RAG 非流式问答（返回完整答案 + 引用上下文） */
+  rag: (input: KbRagInput) => invoke<RagAnswer>('kb_rag', { input }),
+  /** 文本高亮：返回命中/未命中分段 */
+  highlight: (content: string, query: string) => invoke<HighlightSegment[]>('kb_highlight', { content, query }),
+
+  // ── 分块设置 ──
+  getChunkSettings: () => invoke<{ strategy: string; size: number; overlap: number; vectorScanCap?: number }>('kb_get_chunk_settings'),
+  setChunkSettings: (args: { strategy: string; size: number; overlap: number; vectorScanCap?: number | null }) => invoke<void>('kb_set_chunk_settings', args),
+
+  // ── 埋点 ──
+  trackEvent: (input: { eventType: string; kbId?: number | null; docId?: number | null; pageId?: number | null; sessionId?: number | null; detail?: string | null }) =>
+    invoke<void>('kb_track_event', { input }),
 
   // ── 统计 / 分析 / 任务 ──
   getStats: () => invoke<KbStats>('kb_get_stats'),
@@ -231,7 +246,14 @@ export const kbApi = {
   wikiRestoreVersion: (pageId: number, versionId: number) => invoke<void>('kb_wiki_restore_version', { pageId, versionId }),
 
   // ── 用户 / 成员管理 ──
+  currentUser: () => invoke<CurrentUser | null>('kb_current_user'),
   listUsers: () => invoke<UserItem[]>('kb_list_users'),
+  createUser: (args: { username: string; displayName?: string | null; password: string }) => invoke<number>('kb_create_user', args),
+  changePassword: (args: { oldPassword: string; newPassword: string }) => invoke<void>('kb_change_password', args),
+  deleteUser: (userId: number) => invoke<void>('kb_delete_user', { userId }),
+  resetPassword: (args: { userId: number; newPassword: string }) => invoke<void>('kb_reset_password', args),
+  setAdmin: (args: { userId: number; isAdmin: boolean }) => invoke<void>('kb_set_admin', args),
+  listRoles: () => invoke<RoleItem[]>('kb_list_roles'),
   listMembers: (kbId: number) => invoke<MemberItem[]>('kb_list_members', { kbId }),
   addMember: (kbId: number, userId: number, role: string) =>
     invoke<void>('kb_add_member', { kbId, userId, role }),
